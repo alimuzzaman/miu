@@ -386,6 +386,27 @@ input.credit.wide { width: 260px; max-width: 100%; }
 .v.ok, .v.tested { color: var(--ok); } .v.partial, .v.inconclusive, .v.no_result, .v.waiting, .v.stale, .v.stopped, .v.stalled { color: var(--warn); } .v.not_ok { color: var(--bad); } .v.bugs { color: var(--warn); } .v.already_fixed { color: var(--muted); } .v.running, .v.queued { color: var(--run); } .v.untested, .v.skipped { color: var(--muted); font-weight: 500; }
 .banner { background: var(--bad-bg); color: var(--bad); padding: 10px 14px; border-radius: 10px; margin-top: 14px; font-size: 13px; }
 .banner.held { background: var(--warn-bg); color: var(--warn); }
+/* The queue's switches (auto/manual, pause) and what is picked to start. */
+.qbar { display: flex; align-items: center; gap: 10px 12px; flex-wrap: wrap; margin-top: 14px; padding: 8px 12px; border: 1px solid var(--line2); border-radius: 10px; font-size: 13px; }
+.qbar.paused { background: var(--warn-bg); border-color: transparent; }
+.qbar .qtext { color: var(--ink2); min-width: 0; flex: 1 1 260px; }
+.qbar.paused .qtext { color: var(--warn); font-weight: 500; }
+.qbar .qci { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.prrow .t input.pick { margin: 0 8px 0 0; vertical-align: -2px; accent-color: var(--run); cursor: pointer; }
+.selbar { position: sticky; bottom: 12px; z-index: 3; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0 0; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line2); border-radius: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.18); font-size: 13px; }
+.selbar .sp { flex: 1; }
+.selbar .muted { color: var(--muted); }
+.cichip { font-size: 12px; }
+.cichip.passed { color: var(--ok); } .cichip.failed { color: var(--bad); } .cichip.running, .cichip.queued, .cichip.detecting { color: var(--run); } .cichip.not_run { color: var(--warn); }
+.cihead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; font-size: 13px; color: var(--ink2); }
+.cihead .sp { flex: 1; }
+.cirow { display: grid; grid-template-columns: 88px minmax(0, 1fr) auto auto; gap: 4px 14px; align-items: center; padding: 9px 2px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.cirow .cil small { display: block; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.cirow .cid { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.cirow a { color: var(--run); white-space: nowrap; }
+.cist { font-weight: 600; font-size: 12.5px; display: inline-flex; gap: 6px; align-items: center; }
+.cist.passed { color: var(--ok); } .cist.failed { color: var(--bad); } .cist.running, .cist.queued { color: var(--run); } .cist.not_run { color: var(--warn); } .cist.skipped { color: var(--muted); font-weight: 500; }
+@media (max-width: 600px) { .cirow { grid-template-columns: 76px minmax(0, 1fr); } .cirow .cid, .cirow .cilog { grid-column: 2; } }
 .verdict p a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
 .waitlist { margin: 10px 0 0; padding-left: 18px; color: var(--ink2); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .banner a { color: inherit; text-decoration: underline; }
@@ -691,7 +712,7 @@ const route = () => location.hash.slice(1);
 }
 const repoOf = (full) => (full || '').split('/')[1];
 
-const ui = { f: null, pw: Math.min(75, Math.max(25, Number(store.get('qa-pw', 50)) || 50)), runs: [], prs: null, models: [], data: null, key: '', sideKey: '', tab: 'summary', q: '', find: '', repo: store.get('qa-repo', ''), filter: store.get('qa-filter', 'all'), recentsOpen: store.get('qa-recents', true), panel: store.get('qa-panel', true), view: store.get('qa-view', 'full'), mobPanel: false, full: false, efforts: [], conns: null, connForm: null, connTest: {}, ov: null, open: new Set() };
+const ui = { f: null, pw: Math.min(75, Math.max(25, Number(store.get('qa-pw', 50)) || 50)), runs: [], prs: null, models: [], data: null, key: '', sideKey: '', tab: 'summary', q: '', find: '', repo: store.get('qa-repo', ''), filter: store.get('qa-filter', 'all'), recentsOpen: store.get('qa-recents', true), panel: store.get('qa-panel', true), view: store.get('qa-view', 'full'), mobPanel: false, full: false, efforts: [], conns: null, connForm: null, connTest: {}, ov: null, open: new Set(), sel: new Set() };
 if (!store.get('qa-side', true)) $('#app').classList.add('noside');
 
 /* ---------- sidebar ---------- */
@@ -778,6 +799,29 @@ const menuBtn = '<button class="iconbtn mobmenu" data-act="menu" aria-label="Sho
 const MIU_MARK = '<svg class="m" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><mask id="miu-show" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64"><rect width="64" height="64" fill="#fff"/><g fill="#000"><rect x="20.9" y="29.6" width="5.2" height="8.6" rx="2.6"/><rect x="37.9" y="29.6" width="5.2" height="8.6" rx="2.6"/><path d="M26.6 44.4 L30.2 48 L37 41.2" fill="none" stroke="#000" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/></g></mask></defs><path d="M12.5 26 C11 20 12 13 14.2 8.6 Q15.2 6.6 17.2 7.9 L26 14.6 Q32 12.8 38 14.6 L46.8 7.9 Q48.8 6.6 49.8 8.6 C52 13 53 20 51.5 26 C55 31 55.5 36 54.5 41 C52.5 51.5 43 56 32 56 C21 56 11.5 51.5 9.5 41 C8.5 36 9 31 12.5 26 Z" fill="#ffffff" mask="url(#miu-show)"/></svg>';
 const showSideBtn = () => $('#app').classList.contains('noside') ? '<button class="iconbtn showside" data-act="side" title="Show the sidebar" aria-label="Show the sidebar">' + MIU_MARK + '<span class="x">' + I.side + '</span></button>' : '';
 
+// Auto or manual, and pause: the whole queue's switches (lib/queuectl.mjs), kept by the server across restarts.
+function queueBar(v) {
+  const c = v.control;
+  if (!c) return '';
+  const waiting = c.queue.filter((q) => q.waits === 'manual').length;
+  const text = c.paused ? 'Paused' + (c.pausedBy ? ' by ' + c.pausedBy : '') + (c.pausedAt ? ', ' + ago(Date.parse(c.pausedAt)) : '') + '. Nothing new starts, tests or CI; what is running goes on. Resume picks up the line where it is.'
+    : c.mode === 'manual' ? 'Manual: Miu lines up new pull requests and new commits' + (waiting ? ' (' + waiting + ' waiting)' : '') + ', and runs only the ones you start. Tick pull requests to start them.'
+    : 'Auto: new pull requests and new commits are tested on their own, one at a time, with their CI.';
+  return '<div class="qbar' + (c.paused ? ' paused' : '') + '" aria-label="Queue controls"><span class="seg" role="group" aria-label="Testing mode">' +
+    [['auto', 'Auto'], ['manual', 'Manual']].map(([m, l]) => '<button data-qmode="' + m + '" class="' + (c.mode === m ? 'on' : '') + '" aria-pressed="' + (c.mode === m) + '" title="' + (m === 'auto' ? 'Test new pull requests and commits on their own' : 'Line them up; test only what a person starts') + '">' + l + '</button>').join('') + '</span>' +
+    '<button class="btn" data-qpause="' + (c.paused ? '0' : '1') + '" title="' + (c.paused ? 'Let the queue start tests and CI again' : 'Start nothing new until resumed; what is running goes on') + '">' + (c.paused ? 'Resume' : 'Pause') + '</button>' +
+    '<span class="qtext" role="status">' + esc(text) + '</span><span class="qci" title="CI jobs in Miu\'s Sandbox CI containers, up to ' + c.ci.parallel + ' at once">CI ' + c.ci.running + ' running' + (c.ci.queued ? ', ' + c.ci.queued + ' queued' : '') + '</span></div>';
+}
+// The pull requests ticked in the list, to start together.
+function selBar(v) {
+  const keys = [...ui.sel].filter((k) => v.prs.some((p) => p.repo + '#' + p.number === k));
+  if (!keys.length) return '';
+  return '<div class="selbar" role="region" aria-label="Selected pull requests"><b>' + keys.length + ' selected</b><span class="muted">' + (v.control?.paused ? 'The queue is paused: they go first and start when you resume.' : 'They go first in the line, with their CI.') + '</span><span class="sp"></span>' +
+    '<button class="btn" data-startsel data-full="1" title="Test every claim again, not only what changed">Full test</button><button class="btn primary" data-startsel>Start now</button><button class="linkbtn" data-selclear>Clear</button></div>';
+}
+const CI_WORD = { passed: 'CI passed', failed: 'CI failed', running: 'CI running', queued: 'CI queued', not_run: 'CI not run', none: 'No CI', no_jobs: 'No CI Miu can run', detecting: 'Reading CI' };
+const ciChip = (c) => (c && CI_WORD[c.state] ? '<span class="cichip ' + esc(c.state) + '" title="' + esc(c.reason || (c.total != null ? c.passed + ' of ' + c.total + ' passed' + (c.failed ? ', ' + c.failed + ' failed' : '') + (c.running ? ', ' + c.running + ' running' : '') + (c.queued ? ', ' + c.queued + ' queued' : '') + (c.skipped ? ', ' + c.skipped + ' not run here' : '') : '')) + '">' + CI_WORD[c.state] + (c.total ? ' ' + (c.passed + c.failed) + '/' + c.total : '') + '</span>' : '');
+
 function renderPrs(force) {
   if (qdrag.key || qdrag.hold) return;
   const v = ui.prs;
@@ -787,7 +831,7 @@ function renderPrs(force) {
   const groups = { all: () => true, todo: (p) => ['untested', 'stale', 'retest', 'waiting'].includes(p.state), active: (p) => ['running', 'queued', 'person_testing'].includes(p.state) || p.fix?.state === 'running', tested: (p) => ['tested', 'tested_by_person'].includes(p.state), conflict: (p) => p.state === 'conflict' };
   const shown = inRepo.filter(groups[ui.filter] || groups.all);
   const n = Object.fromEntries(Object.entries(groups).map(([k, f]) => [k, inRepo.filter(f).length]));
-  const key = JSON.stringify([v.prs.map((p) => [p.repo, p.number, p.state, p.sha, p.run?.verdict, p.run?.last]), v.queue, v.queueHeld, v.disk?.usedPct >= 90, v.error, ui.filter, ui.repo, ui.find, ui.f, $('#app').className, Math.floor(Date.now() / 60000)]);
+  const key = JSON.stringify([v.prs.map((p) => [p.repo, p.number, p.state, p.sha, p.run?.verdict, p.run?.last, p.waits, p.ci]), v.queue, v.queueHeld, v.control, [...ui.sel], v.disk?.usedPct >= 90, v.error, ui.filter, ui.repo, ui.find, ui.f, $('#app').className, Math.floor(Date.now() / 60000)]);
   if (!force && key === ui.key && $('#prlist')) return;
   ui.key = key;
   const scroll = $('.scroll')?.scrollTop;
@@ -801,6 +845,7 @@ function renderPrs(force) {
     (v.error ? '<div class="banner">' + esc(v.error) + '</div>' : '') +
     (v.disk && v.disk.usedPct >= 90 ? '<div class="banner">The disk is ' + v.disk.usedPct + '% full (' + v.disk.freeGB + ' GB free). A run needs several GB; free some space before the next test.</div>' : '') +
     (v.queueHeld && v.queue.length ? '<div class="banner held">' + v.queue.length + ' queued, on hold. ' + esc(v.queueHeld) + ' <a href="#settings">Open Settings</a></div>' : '') +
+    queueBar(v) +
     '<div class="filters">' +
     '<div class="fbar"><label class="fsearch"><svg class="ico" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg><input id="pq" type="search" placeholder="Search, or author: label: is: result: repo:" value="' + esc(ui.f.q) + '" aria-label="Search pull requests" autocomplete="off" spellcheck="false"></label>' +
     FILTERS.map((k) => fbtn(k)).join('') + '</div>' +
@@ -808,6 +853,7 @@ function renderPrs(force) {
     '<span class="sp"></span><span class="upd">Updated ' + (v.fetchedAt ? ago(v.fetchedAt) : 'never') + '</span></div>' +
     chipsHtml() + '</div>' +
     '<div id="prlist">' + (shown.length ? shown.map(prRow).join('') : '<div class="blank">' + (v.prs.length ? (filtersOn() ? 'No pull requests match these filters. <button class="linkbtn" data-fclear>Clear filters</button>' : 'No pull requests here.') : 'No open pull requests.') + '</div>') + '</div>' +
+    selBar(v) +
     '</div></div>';
   if (scroll) $('.scroll').scrollTop = scroll;
   if (typing) { const q = $('#pq'); q.focus(); q.setSelectionRange(typing[0], typing[1]); }
@@ -1234,7 +1280,7 @@ function renderSettings(force) {
         fixes: () => fixesPanel(cfg),
         rules: () =>
     '<p class="ssub">Whether Miu picks up pull requests on its own.</p><div class="settings one"><div class="sgroup">' +
-    srow({ cfg: 'autoTest', on: cfg.autoTest, title: 'Test new pull requests automatically', help: cfg.autoTest ? 'New pull requests and new commits, one at a time.' + (backlog ? ' The ' + backlog + ' open before only when you press Test.' : '') : 'Nothing runs on its own; press Test on a pull request.' }) +
+    srow({ cfg: 'autoTest', on: cfg.autoTest, title: 'Test new pull requests automatically', help: cfg.autoTest ? 'New pull requests and new commits, one at a time.' + (backlog ? ' The ' + backlog + ' open before only when you press Test.' : '') : 'Manual mode: Miu lines up new pull requests and commits, and tests only those a person starts (Test, or tick them and Start now). The Auto/Manual switch is also on the Pull requests page.' }) +
     srow({ cfg: 'testConflicts', on: cfg.testConflicts, title: 'Test pull requests with merge conflicts', help: cfg.testConflicts ? 'Miu tests the branch as it is. The result may change once the conflicts are resolved.' : 'Miu asks the author to resolve the conflicts and tests the next commit.' }) +
     '</div></div>' + rulesPanel(cfg),
       }[tab]();
@@ -1496,15 +1542,24 @@ document.addEventListener('dragend', () => { qdrag.hold = false; clearDrop(); do
 
 // The ⋯ on a queued row: the dashboard's own menu, with the moves that make sense here.
 const DOTS = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>';
-function queueMenu(id, pos, n) {
-  const opts = [pos > 1 && { id: 'top', label: 'Run next' }, pos > 1 && { id: 'up', label: 'Move up' }, pos < n && { id: 'down', label: 'Move down' }, { id: 'remove', label: 'Remove from queue' }].filter(Boolean);
+function queueMenu(id, pos, n, waits) {
+  const opts = [waits !== 'paused' && { id: 'start', label: 'Start now' }, pos > 1 && { id: 'top', label: 'Run next' }, pos > 1 && { id: 'up', label: 'Move up' }, pos < n && { id: 'down', label: 'Move down' }, waits === 'held' ? { id: 'release', label: 'Release' } : { id: 'hold', label: 'Hold' }, { id: 'remove', label: 'Remove from queue' }].filter(Boolean);
   return '<span class="csel qmenu" data-qact="' + esc(id) + '" data-value="" data-options="' + esc(JSON.stringify(opts)) + '"><button type="button" class="csel-btn" aria-haspopup="listbox" aria-expanded="false" aria-label="Queue actions">' + DOTS + '</button></span>';
 }
+document.addEventListener('change', (e) => {
+  const k = e.target.matches?.('input[data-pick]') && e.target.dataset.pick;
+  if (!k) return;
+  if (e.target.checked) ui.sel.add(k); else ui.sel.delete(k);
+  ui.key = ''; renderPrs(true);
+});
 document.addEventListener('change', async (e) => {
   const key = e.target.matches?.('[data-qact]') && e.target.dataset.qact;
   if (!key) return;
   const [repo, pr] = key.split('#'), to = e.target.dataset.value;
-  const r = to === 'remove' ? await post('/api/unqueue', { repo, pr: Number(pr) }) : await post('/api/queue/move', { repo, pr: Number(pr), to });
+  const r = to === 'remove' ? await post('/api/unqueue', { repo, pr: Number(pr) })
+    : to === 'start' ? await post('/api/queue/start', { prs: [{ repo, pr: Number(pr) }] })
+    : to === 'hold' || to === 'release' ? await post('/api/queue/hold', { repo, pr: Number(pr), held: to === 'hold' })
+    : await post('/api/queue/move', { repo, pr: Number(pr), to });
   if (r.error) await tell('Not changed', r.error);
   if (r.queue) { ui.prs.queue = r.queue; ui.key = ''; renderPrs(true); }
   refreshPrs();
@@ -1601,9 +1656,11 @@ function prRow(p) {
   else if (p.state === 'running') lab = '<span class="v running" style="display:inline-flex;gap:6px;align-items:center"><span class="spin"></span>Test running</span>' + (run?.phase ? '<small>' + esc(run.phase) + (run.startedAt ? ', ' + Math.max(1, Math.round((Date.now() - Date.parse(run.startedAt)) / 60000)) + ' min' : '') + (p.pair && p.pair.length ? ', with ' + esc(p.pair.join(' and ')) : '') + '</small>' : '');
   else if (p.state === 'queued') {
     const pos = ui.prs.queue.indexOf(p.repo + '#' + p.number) + 1, n = ui.prs.queue.length, full = (ui.prs.queueFull || []).includes(p.repo + '#' + p.number);
-    lab = '<span class="v queued">Queued' + (full ? ', full test' : '') + '</span>' + (pos ? '<small>' + (pos === 1 ? 'next' : pos + ' of ' + n) + '</small>' : '');
-    // One quiet menu for the line: run it next, move it, or take it out.
-    action = queueMenu(id, pos, n);
+    // Why it is not starting, if it is not: the queue is paused, it is held, or manual mode waits for a person.
+    const wait = { paused: ['Queued, paused', 'starts when the queue resumes'], held: ['Held', 'kept in the line; release it to run'], manual: ['Waiting for you', 'manual mode: start it to test'] }[p.waits];
+    lab = '<span class="v ' + (wait ? 'waiting' : 'queued') + '">' + (wait ? wait[0] : 'Queued') + (full ? ', full test' : '') + '</span><small>' + (wait ? wait[1] + (pos ? ', ' + pos + ' of ' + n : '') : pos ? (pos === 1 ? 'next' : pos + ' of ' + n) : '') + '</small>';
+    // One quiet menu for the line: start it, hold it, move it, or take it out.
+    action = (p.waits === 'manual' || p.waits === 'held' ? '<button class="btn primary" data-startone="' + id + '" title="Start this test now, with its CI">Start</button>' : '') + queueMenu(id, pos, n, p.waits);
   }
   else if (p.state === 'stale') { lab = '<span class="v stale">New commits</span><small>last test: ' + esc(run.verdict ? VERDICT[run.verdict] : STATE[run.state]) + '</small>'; action = (run.verdict && !['inconclusive', 'no_result'].includes(run.verdict) ? '<button class="btn" data-test="' + id + '" data-full="1" title="Test every claim again, not only what changed">Full test</button><button class="btn primary" data-test="' + id + '" title="Test what changed since the last round, plus regressions">Test changes</button>' : '<button class="btn primary" data-test="' + id + '">Test</button>'); }
   else if (p.state === 'tested_by_person') { const r = p.qa.lastPerson; lab = '<span class="v ' + esc(r.verdict) + '">' + esc(r.kind === 'label' ? (r.verdict === 'ok' ? 'Ready for merge' : 'Reported bugs') : (VERDICT[r.verdict] || 'Tested')) + '</span><small>by ' + esc(r.by) + ', ' + ago(Date.parse(r.at)) + (r.url ? ' · <a href="' + esc(r.url) + '" target="_blank" rel="noopener" data-ext>report</a>' : r.kind === 'label' ? ' · label' : '') + '</small>'; action = '<button class="btn" data-test="' + id + '" title="Miu tests it as well">Test with Miu</button>'; }
@@ -1622,9 +1679,9 @@ function prRow(p) {
   const open = run ? run.name : 'pr/' + p.repo.split('/')[1] + '/' + p.number;
   // In Running and queued, a queued row can be dragged to its place in the line.
   const drag = p.state === 'queued' && ui.filter === 'active' && (ui.prs.queue || []).length > 1;
-  return '<div class="prrow link' + (drag ? ' qdrag' : '') + '" data-open="' + esc(open) + '"' + (drag ? ' draggable="true" data-qkey="' + esc(p.repo + '#' + p.number) + '"' : '') + ' title="' + (drag ? 'Drag to change its place in the line' : run ? 'Open the latest run' : 'Open the pull request') + '">' + (drag ? '<span class="grip" aria-hidden="true">⠿</span>' : '') + '<span class="dot ' + esc(dot) + '"></span><span class="t">' + esc(p.title) + '</span>' +
+  return '<div class="prrow link' + (drag ? ' qdrag' : '') + '" data-open="' + esc(open) + '"' + (drag ? ' draggable="true" data-qkey="' + esc(p.repo + '#' + p.number) + '"' : '') + ' title="' + (drag ? 'Drag to change its place in the line' : run ? 'Open the latest run' : 'Open the pull request') + '">' + (drag ? '<span class="grip" aria-hidden="true">⠿</span>' : '') + '<span class="dot ' + esc(dot) + '"></span><span class="t">' + (p.state === 'running' || p.state === 'in_pair' ? '' : '<input type="checkbox" class="pick" data-pick="' + id + '"' + (ui.sel.has(p.repo + '#' + p.number) ? ' checked' : '') + ' aria-label="Choose ' + esc(p.title) + ' to start">') + esc(p.title) + '</span>' +
     '<div class="r"><div class="lab">' + lab + '</div>' + action + '</div>' +
-    '<div class="m"><span class="repo">' + esc(REPO[repoOf(p.repo)]) + ' #' + p.number + '</span><span class="who">' + avatar(p.author, null, 'av-sm') + esc(p.author || '') + '</span><span>updated ' + ago(Date.parse(p.updatedAt)) + '</span><span class="mono">' + esc((p.sha || '').slice(0, 7)) + '</span>' + (p.runs > 1 ? '<span>' + p.runs + ' runs</span>' : '') + (p.fix?.state === 'pushed' && p.fix.pushed === p.sha ? '<span class="fixtag">Miu\'s fix</span>' : '') + (p.pair && p.pair.length ? '<span title="Tested together in one run">with ' + esc(p.pair.join(' + ')) + '</span>' : '') + '<a href="#pr/' + esc(repoOf(p.repo)) + '/' + p.number + '" data-ext>History</a><a href="' + esc(p.url) + '" target="_blank" rel="noopener" data-ext>View on GitHub</a></div></div>';
+    '<div class="m"><span class="repo">' + esc(REPO[repoOf(p.repo)]) + ' #' + p.number + '</span><span class="who">' + avatar(p.author, null, 'av-sm') + esc(p.author || '') + '</span><span>updated ' + ago(Date.parse(p.updatedAt)) + '</span><span class="mono">' + esc((p.sha || '').slice(0, 7)) + '</span>' + ciChip(p.ci) + (p.runs > 1 ? '<span>' + p.runs + ' runs</span>' : '') + (p.fix?.state === 'pushed' && p.fix.pushed === p.sha ? '<span class="fixtag">Miu\'s fix</span>' : '') + (p.pair && p.pair.length ? '<span title="Tested together in one run">with ' + esc(p.pair.join(' + ')) + '</span>' : '') + '<a href="#pr/' + esc(repoOf(p.repo)) + '/' + p.number + '" data-ext>History</a><a href="' + esc(p.url) + '" target="_blank" rel="noopener" data-ext>View on GitHub</a></div></div>';
 }
 
 /* ---------- run view ---------- */
@@ -1857,9 +1914,37 @@ function runTab(d) {
     '<dt>Model</dt><dd>' + esc(models(d.status.model) || 'unknown') + '</dd>' +
     '<dt>Depth</dt><dd>' + esc(t.depth || 'not set') + ', ' + esc(t.files) + ' files' + (t.changed_lines != null ? ', ' + esc(t.changed_lines) + ' lines' : '') + ', round ' + esc(t.round) + '</dd>' +
     '<dt>Tested with</dt><dd>' + esc((t.pair && t.pair.length ? t.pair.join(' + ') + ', in one paired run' : '') || t.companion || 'no related PR') + '</dd><dt>Builds</dt><dd>' + (d.builds.map((b) => (b.ok ? '✓ ' : '✗ ') + esc(b.label) + (b.version ? ' ' + esc(b.version) : '')).join(', ') || 'none') + '</dd><dt>Folder</dt><dd class="mono">runs/' + esc(d.name) + '</dd></dl>' +
-    (d.fast ? '<details class="fold" style="margin-top:16px"><summary>Repo test suites</summary><div class="md">' + md(d.fast) + '</div></details>' : '') +
     (d.notes ? '<details class="fold"><summary>Agent notes</summary><div class="md">' + md(d.notes) + '</div></details>' : '') +
     '<details class="fold"><summary>Run log</summary><pre>' + esc(d.log) + '</pre></details>';
+}
+
+// The CI of the commit this run tested: each workflow job Miu ran in its
+// Sandbox CI containers (lib/ci.mjs), and the repo's own test suites the QA
+// run ran (context/fast-checks.md). Nothing here runs on GitHub.
+const CI_STATUS = { passed: 'Passed', failed: 'Failed', running: 'Running', queued: 'Queued', not_run: 'Not run', skipped: 'Not run here' };
+const ord = (n) => n + (n % 10 === 1 && n % 100 !== 11 ? 'st' : n % 10 === 2 && n % 100 !== 12 ? 'nd' : n % 10 === 3 && n % 100 !== 13 ? 'rd' : 'th');
+function ciJob(c, j) {
+  const t = j.status === 'running' ? fmtMin(Date.now() - j.startedAt) + ' so far' : j.finishedAt && j.startedAt ? fmtMin(j.finishedAt - j.startedAt) : '';
+  const note = j.status === 'queued' ? (c.paused ? 'the queue is paused' : j.place ? ord(j.place) + ' in the CI line' : 'in the CI line') + (j.waitReason ? '; ' + j.waitReason : '') : j.reason || '';
+  return '<div class="cirow"><span class="cist ' + esc(j.status) + '">' + (j.status === 'running' ? '<span class="spin" style="width:10px;height:10px"></span>' : '') + esc(CI_STATUS[j.status] || j.status) + '</span>' +
+    '<span class="cil"><b>' + esc(j.label) + '</b><small>' + esc(j.workflow + (j.job ? ', job ' + j.job : '')) + (note ? ' · ' + esc(note) : '') + '</small></span>' +
+    '<span class="cid">' + esc(t) + '</span><span class="cilog">' + (j.hasLog ? '<a href="/api/ci/log?key=' + encodeURIComponent(c.key) + '&n=' + j.n + '" target="_blank" rel="noopener" data-ext>Log</a>' : '') + '</span></div>';
+}
+function ciTab(d) {
+  const c = d.ci;
+  const fast = d.fast ? '<details class="fold" style="margin-top:16px"' + (c ? '' : ' open') + '><summary>Repo test suites (run inside the QA run)</summary><div class="md">' + md(d.fast) + '</div></details>' : '';
+  if (!c) return '<div class="blank">This run names no pull request to read CI from.</div>' + fast;
+  const key = esc(c.repo) + '#' + c.pr;
+  const again = c.state !== 'detecting' && !(c.jobs || []).some((j) => j.status === 'running') ? '<button class="btn" data-ci-run="' + key + '" title="Read the workflows at the pull request\'s head and run them again in Miu\'s Sandbox CI">' + (c.state === 'not_started' ? 'Run CI' : 'Run CI again') + '</button>' : '';
+  const s = c.summary;
+  const line = { not_started: 'CI has not started for this commit. It starts when Miu tests the pull request, or now with Run CI.', detecting: 'Reading the workflows at this commit…', none: 'No CI in this repo. ' + (c.reason || ''), not_run: 'CI did not run: ' + (c.reason || 'unknown reason') }[c.state]
+    || (s.state === 'no_jobs' ? 'This repo has workflows, but no job Miu\'s Sandbox CI can run. Each one says why below.'
+      : s.passed + ' of ' + s.total + ' passed' + (s.failed ? ', ' + s.failed + ' failed' : '') + (s.running ? ', ' + s.running + ' running' : '') + (s.queued ? ', ' + s.queued + ' queued' + (c.paused ? ' (the queue is paused)' : '') : '') + (s.not_run ? ', ' + s.not_run + ' not run' : '') + '.');
+  const at = (c.sha || '').slice(0, 7);
+  return '<div class="cihead"><span><b>CI at ' + esc(at) + '</b>, ' + esc(line) + '</span><span class="sp"></span>' + again +
+    (c.checksUrl ? '<a class="btn" href="' + esc(c.checksUrl) + '" target="_blank" rel="noopener" data-ext title="GitHub\'s own checks, read only">GitHub checks</a>' : '') + '</div>' +
+    (c.jobs && c.jobs.length ? '<div class="cijobs">' + c.jobs.map((j) => ciJob(c, j)).join('') + '</div>' : '') +
+    '<p class="h" style="margin-top:10px">Jobs run in Miu\'s Sandbox CI containers on this server, up to ' + esc(c.parallel) + ' at once across all pull requests, never on GitHub Actions. A pull request that changes .github/ is not run here.</p>' + fast;
 }
 
 async function renderRun(force, cached) {
@@ -1869,11 +1954,11 @@ async function renderRun(force, cached) {
   // minute (a review or a post can still change it); a live one every tick.
   // Each fetch is the whole run (well over 100 KB), so this is most of the page's traffic.
   // A run with a fix going is live too: its control bar follows the fix.
-  const ended = ui.data && ui.dataName === name && ui.data.status?.state !== 'running' && (ui.data.fixes || [])[0]?.state !== 'running';
+  const ended = ui.data && ui.dataName === name && ui.data.status?.state !== 'running' && (ui.data.fixes || [])[0]?.state !== 'running' && !['detecting', 'running', 'queued'].includes(ui.data.ci?.summary?.state ?? ui.data.ci?.state);
   const fresh = ui.dataAt && Date.now() - ui.dataAt < 60000;
   const d = (cached || (ended && fresh && !force)) && ui.data && ui.dataName === name ? ui.data : await fetch('/api/runs/' + encodeURIComponent(name)).then((r) => r.ok ? r.json() : null);
   if (!d) { $('#main').innerHTML = '<div class="topbar">' + menuBtn + '<h1>Run not found</h1></div><div class="blank"><a href="#" style="color:var(--run)">Back to pull requests</a></div>'; return; }
-  const key = JSON.stringify([name, ui.tab, ui.q, ui.view, ui.panel, ui.mobPanel, d.log, $('#app').className, d.status, d.activity.length, d.activity.at(-1)?.status, d.evidence.length, d.shots.length, !!d.report, d.usage?.calls, d.reviews, d.fixes, d.steer]);
+  const key = JSON.stringify([name, ui.tab, ui.q, ui.view, ui.panel, ui.mobPanel, d.log, $('#app').className, d.status, d.activity.length, d.activity.at(-1)?.status, d.evidence.length, d.shots.length, !!d.report, d.usage?.calls, d.reviews, d.fixes, d.steer, d.ci, d.control]);
   if (!force && key === ui.key) return;
   ui.key = key; ui.data = d; if (ui.dataName !== name || d !== ui.dataPrev) ui.dataAt = Date.now(); ui.dataName = name; ui.dataPrev = d;
   if (ui.ov != null) return;
@@ -1886,11 +1971,11 @@ async function renderRun(force, cached) {
   if (sd) ui.steerDraft = { name, v: sd.value, f: document.activeElement === sd, a: sd.selectionStart, b: sd.selectionEnd };
   const st = d.status, pr = d.pr || {};
   const pill = st.state === 'running' ? '<span class="pill running"><span class="spin" style="width:10px;height:10px"></span>Test running</span>' : '<span class="pill ' + esc(st.verdict || st.state) + '">' + esc(st.verdict ? VERDICT[st.verdict] : STATE[st.state]) + '</span>';
-  const tabs = [['summary', 'Summary'], ['report', 'Report'], ['shots', 'Screenshots', d.shots.length], ['evidence', 'Evidence', d.evidence.length], ['history', 'History'], ['run', 'Run']];
-  const body = (ui.tab === 'summary' ? fixCard(d) : '') + { summary: summaryTab, report: reportTab, shots: shotsTab, evidence: evidenceTab, history: historyTab, run: runTab }[ui.tab](d);
+  const tabs = [['summary', 'Summary'], ['report', 'Report'], ['shots', 'Screenshots', d.shots.length], ['evidence', 'Evidence', d.evidence.length], ['history', 'History'], ['ci', 'CI'], ['run', 'Run']];
+  const body = (ui.tab === 'summary' ? fixCard(d) : '') + ({ summary: summaryTab, report: reportTab, shots: shotsTab, evidence: evidenceTab, history: historyTab, ci: ciTab, run: runTab }[ui.tab] || summaryTab)(d);
   const idx = Math.max(-1, ...st.reached.map((id) => d.stages.findIndex((s) => s.id === id)));
   $('#main').innerHTML =
-    '<div class="topbar">' + menuBtn + showSideBtn() + '<span class="title">' + esc(pr.title || d.name) + '</span><span class="sub">' + esc(REPO[(pr.url || '').split('/')[4]] || '') + ' #' + esc(pr.number) + (st.model ? ' · ' + esc(models(st.model)) : '') + (d.usage ? ' · ' + fmtMin(d.usage.wallMs) : '') + '</span>' + runPicker(d) + '<span class="sp"></span>' + pill +
+    '<div class="topbar">' + menuBtn + showSideBtn() + '<span class="title">' + esc(pr.title || d.name) + '</span><span class="sub">' + esc(REPO[(pr.url || '').split('/')[4]] || '') + ' #' + esc(pr.number) + (st.model ? ' · ' + esc(models(st.model)) : '') + (d.usage ? ' · ' + fmtMin(d.usage.wallMs) : '') + (d.control ? ' · ' + (d.control.mode === 'manual' ? 'Manual mode' : 'Auto mode') + (d.control.paused ? ', queue paused' : '') + (d.control.waits === 'manual' ? ', a new commit waits for you' : d.control.waits === 'held' ? ', next test held' : d.control.inLine ? ', next test queued' : '') : '') + '</span>' + runPicker(d) + '<span class="sp"></span>' + pill +
     (d.comment ? '<button class="btn wide" data-act="copy">Copy PR comment</button>' : '') +
     (st.posted ? '<a class="btn wide" href="' + esc(st.posted.url) + '" target="_blank" rel="noopener" title="Posted ' + esc(new Date(st.posted.at).toLocaleString()) + '. Labels: ' + esc((st.posted.labels || []).join(', ')) + '">Posted on PR</a>' : '') +
     fixBtn(d) +
@@ -1959,10 +2044,28 @@ document.addEventListener('click', async (e) => {
   if (rv) { rv.disabled = true; const r = await post('/api/runs/' + encodeURIComponent(route()) + '/review', { key: rv.dataset.review, state: rv.dataset.state || null, title: rv.dataset.title }); if (r.error) await tell('Not saved', r.error); else if (r.pr && r.pr !== 'updated') await tell('Saved here only', 'The PR comment was ' + r.pr + '.'); ui.key = ''; return tick(); }
   const testBtn = t.closest('[data-test]');
   if (testBtn) { const [repo, pr] = testBtn.dataset.test.split('#'); testBtn.disabled = true; testBtn.textContent = 'Queuing…'; const r = await post('/api/test', { repo, pr: Number(pr), full: testBtn.dataset.full === '1', force: testBtn.dataset.force === '1' }); if (r.error) await tell('Not queued', r.error); return refreshPrs(); }
+  // The queue's switches, and starting what was chosen (lib/queuectl.mjs on the server).
+  const qm = t.closest('[data-qmode]');
+  if (qm) { if (qm.classList.contains('on')) return; const r = await post('/api/queue/control', { mode: qm.dataset.qmode }); if (r.error) await tell('Not changed', r.error); return refreshPrs(); }
+  const qp = t.closest('[data-qpause]');
+  if (qp) { qp.disabled = true; const r = await post('/api/queue/control', { paused: qp.dataset.qpause === '1' }); if (r.error) await tell('Not changed', r.error); return refreshPrs(); }
+  const one = t.closest('[data-startone]');
+  if (one) { const [repo, pr] = one.dataset.startone.split('#'); one.disabled = true; const r = await post('/api/queue/start', { prs: [{ repo, pr: Number(pr) }] }); if (r.error) await tell('Not started', r.error); return refreshPrs(); }
+  if (t.closest('[data-selclear]')) { ui.sel.clear(); ui.key = ''; return renderPrs(true); }
+  const ss = t.closest('[data-startsel]');
+  if (ss) {
+    const prs = [...ui.sel].map((k) => { const i = k.lastIndexOf('#'); return { repo: k.slice(0, i), pr: Number(k.slice(i + 1)) }; });
+    ss.disabled = true;
+    const r = await post('/api/queue/start', { prs, full: ss.dataset.full === '1' });
+    if (r.error) await tell('Not started', r.error); else ui.sel.clear();
+    return refreshPrs();
+  }
+  const cr = t.closest('[data-ci-run]');
+  if (cr) { const [repo, pr] = cr.dataset.ciRun.split('#'); cr.disabled = true; const r = await post('/api/ci/run', { repo, pr: Number(pr) }); if (r.error) await tell('CI not started', r.error); ui.key = ''; return renderRun(true); }
   const unq = t.closest('[data-unqueue]');
   if (unq) { const [repo, pr] = unq.dataset.unqueue.split('#'); unq.disabled = true; await post('/api/unqueue', { repo, pr: Number(pr) }); return refreshPrs(); }
   const row = t.closest('[data-open]');
-  if (row && !t.closest('a, button')) { location.hash = row.dataset.open; return; }
+  if (row && !t.closest('a, button, input')) { location.hash = row.dataset.open; return; }
   const repo = t.closest('[data-repo]');
   if (repo) { ui.repo = repo.dataset.repo; store.set('qa-repo', ui.repo); writeUrl(); ui.sideKey = ''; ui.key = ''; $('#app').classList.remove('sideopen'); if (route()) location.hash = ''; else { renderSide(); renderPrs(true); } return; }
   const filter = t.closest('[data-filter]');

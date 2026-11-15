@@ -2,7 +2,8 @@
 // qa-dashboard [--port 4747] [--runs DIR]
 //
 // Local page for QA runs. Lists the open pull requests in the three repos,
-// tests new ones and new commits automatically (one at a time), lets you
+// tests new ones and new commits automatically (one at a time) or only
+// those a person starts (manual mode), runs their CI beside the test, lets you
 // watch the agent, switch its model mid-run, and read the result. Reads and writes only the run
 // directories bin/qa-run uses. Listens on 127.0.0.1 only.
 import http from 'node:http';
@@ -34,6 +35,11 @@ import * as steer from '../lib/steer.mjs';
 import * as auth from '../lib/auth.mjs';
 import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
+import { createCi } from '../lib/ci.mjs';
+import { runSandboxCi, changesCiDefinition } from '../lib/sandboxci.mjs';
+import { ensureRepo } from '../lib/worktrees.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -354,6 +360,10 @@ function detail(name) {
     stages: STAGES.map(({ id, label }) => ({ id, label })),
     log: runLog(dir, name),
     fast: read(path.join(dir, 'context/fast-checks.md')),
+    // The queue's switches, and whether this pull request is in the line again.
+    control: (() => { const pr = readJson(path.join(dir, 'context/pr.json')); const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); const q = m && queue.find((x) => x.repo === m[1] && x.pr === Number(m[2])); return { ...queueState(), inLine: !!q, waits: q ? holdReason(q, queueState()) : null }; })(),
+    // The CI of the commit this run tested (lib/ci.mjs), and where GitHub shows its own checks.
+    ci: (() => { const pr = readJson(path.join(dir, 'context/pr.json')); const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); return m ? { ...(ci.view(ci.get(m[1], Number(m[2]), pr.headRefOid)) ?? { state: 'not_started', repo: m[1], pr: Number(m[2]), sha: pr.headRefOid, jobs: [] }), checksUrl: `${pr.url}/checks`, paused: queueState().paused, parallel: ciParallel() } : null; })(),
     notes: read(path.join(dir, 'notes.md')),
     prompt: read(path.join(dir, 'prompt.md')),
     comment: rewire(read(path.join(dir, 'comment.md'))),
@@ -519,6 +529,82 @@ const pairMoved = (run, heads) => (run?.pairOthers ?? []).filter((o) => heads.ha
 const QUEUE_FILE = path.join(RUNS, '.queue.json');
 const queue = readJson(QUEUE_FILE) ?? [];
 const saveQueue = () => { try { fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 2)); } catch { /* runs dir missing */ } };
+
+// ---- the queue's two switches: auto or manual, and paused (lib/queuectl.mjs)
+const queueState = () => { const c = getConfig(); return { mode: modeOf(c), paused: !!c.paused }; };
+// Who changed them and when, for the dashboard's "paused by" line.
+async function setQueueState({ mode, paused }, by) {
+  if (mode !== undefined && !['auto', 'manual'].includes(mode)) throw new Error('The mode is auto or manual.');
+  if (paused !== undefined && typeof paused !== 'boolean') throw new Error('paused is true or false.');
+  if (mode !== undefined && mode !== queueState().mode) await setConfig({ autoTest: mode === 'auto' });
+  if (paused !== undefined && paused !== queueState().paused) {
+    const next = { ...(readJson(CONFIG_FILE) ?? {}), paused, pausedBy: paused ? by : null, pausedAt: paused ? new Date().toISOString() : null };
+    fs.mkdirSync(RUNS, { recursive: true });
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2));
+  }
+  console.log(`queue: ${mode !== undefined ? `mode ${mode}` : ''}${mode !== undefined && paused !== undefined ? ', ' : ''}${paused !== undefined ? (paused ? 'paused' : 'resumed') : ''} by ${by}`);
+  if (paused === false || mode === 'auto') { pump(); ciScan(); }
+  return queueStatus();
+}
+const queueStatus = () => {
+  const st = queueState(), c = getConfig();
+  return {
+    ...st, pausedBy: st.paused ? c.pausedBy ?? null : null, pausedAt: st.paused ? c.pausedAt ?? null : null, live: liveRun(), held: queueHeld,
+    queue: queue.map((q) => ({ key: `${q.repo}#${q.pr}`, by: q.by ?? 'auto', held: !!q.held, waits: holdReason(q, st), why: q.why, full: !!q.full })),
+    ci: { running: ci.running(), queued: ci.queued(), parallel: ciParallel() },
+  };
+};
+
+// ---- CI beside the test (lib/ci.mjs): the pull request's own GitHub Actions
+// jobs, run in Miu's Sandbox CI containers on this server, never on GitHub.
+const CI_DIR = path.join(RUNS, '.ci');
+const ciParallel = () => Math.max(1, Math.min(8, Number(getConfig().ciParallel) || 2));
+const TOKENS = /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,})\b/g;
+const ciScrub = (t) => conn.scrub(String(t ?? '')).replace(TOKENS, '[secret removed]');
+const gitAsync = (args, env) => new Promise((resolve, reject) => execFile('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 5 * 60 * 1000, ...(env ? { env: { ...process.env, ...env } } : {}) }, (e, out) => (e ? reject(new Error(String(e.stderr || e.message).trim().split('\n').pop())) : resolve(out.trim()))));
+// The commit, its base and its workflow files, from the bare clone runs use
+// (lib/worktrees.mjs), under refs of CI's own so a run's fetch is not in the way.
+async function ciPrepare(repo, pr, sha) {
+  const auth = await gh.gitAuthEnv(repo).catch(() => null);
+  const fallback = await gh.gitAuthEnv(repo, { fallback: true }).catch(() => null);
+  const bare = ensureRepo(repo, auth, fallback);
+  const p = prCache.list.find((x) => x.repo === repo && x.number === pr);
+  const base = p?.baseRefName ?? profiles().find((x) => x.repo === repo)?.base_branch ?? 'main';
+  if (!/^[\w./-]+$/.test(base) || base.includes('..')) throw new Error('the base branch name is not plain');
+  const fetch = async (env) => gitAsync(['-C', bare, 'fetch', '--quiet', '--force', `https://github.com/${repo}.git`, `+refs/pull/${pr}/head:refs/miu-ci/pr-${pr}`, `+refs/heads/${base}:refs/miu-ci/base-${base}`], env);
+  try { await fetch(auth); } catch (e) { if (!fallback) throw e; await fetch(fallback); }
+  await gitAsync(['-C', bare, 'cat-file', '-e', `${sha}^{commit}`]).catch(() => { throw new Error(`commit ${sha.slice(0, 7)} is not on the pull request any more`); });
+  const changed = (await gitAsync(['-C', bare, 'diff', '--name-only', `refs/miu-ci/base-${base}...${sha}`])).split('\n').filter(Boolean);
+  const names = (await gitAsync(['-C', bare, 'ls-tree', '--name-only', sha, '.github/workflows/']).catch(() => '')).split('\n').filter((f) => /^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(f)).slice(0, 50);
+  const workflows = [];
+  for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${sha}:${f}`])).slice(0, 512 * 1024) });
+  return { gitDir: bare, sha, workflows, changesCi: changesCiDefinition(changed) };
+}
+fs.mkdirSync(RUNS, { recursive: true });
+const ci = createCi({
+  dir: CI_DIR, prepare: ciPrepare, parallel: ciParallel, isPaused: () => queueState().paused, scrub: ciScrub,
+  coveredBy: (repo) => profiles().find((p) => p.repo === repo)?.fast_checks ?? [],
+  runJob: (check, gitDir, sha, { onStart }) => runSandboxCi(check, gitDir, process.env, { ref: sha, onStart }),
+  log: (m) => console.log(m),
+});
+// A pull request's CI at its head, lined up once per commit.
+function ciFor(repo, pr, { again = false, by = 'auto' } = {}) {
+  const sha = prCache.list.find((p) => p.repo === repo && p.number === pr)?.headRefOid;
+  return sha ? ci.ensure(repo, pr, sha, { again, by }) : null;
+}
+// What gets CI: the run going now, and what in the queue may start (all of it
+// in auto mode, what a person picked in manual mode). Paused: nothing new.
+function ciScan() {
+  if (queueState().paused) return;
+  const st = queueState();
+  for (const q of queue) if (!holdReason(q, st)) ciFor(q.repo, q.pr);
+  const live = liveRun();
+  const pr = live && readJson(path.join(RUNS, live, 'context/pr.json'));
+  const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+  if (m && pr.headRefOid) ci.ensure(m[1], Number(m[2]), pr.headRefOid);
+  ci.tick();
+}
+setInterval(() => { try { ciScan(); } catch (e) { console.error('ci:', e.message); } }, 10 * 1000);
 // Why automatic testing leaves a PR alone, or null: a draft, qa:skip, or the
 // rules in Settings (lib/prrules.mjs). The Test button and /miu ignore this.
 const skipReason = (p) => {
@@ -541,7 +627,7 @@ function prView() {
     // How many open PRs each rule matches now, for the Settings page.
     ruleHits: (getConfig().rules ?? []).map((r) => list.filter((p) => prRules.matches(r, p)).length),
     labelRoles: LABEL_ROLES,
-    error, fetchedAt: at, config: (({ baseline, ...c }) => c)(getConfig()), queue: queue.map((q) => `${q.repo}#${q.pr}`), queueHeld, disk: diskState(), queueFull: queue.filter((q) => q.full).map((q) => `${q.repo}#${q.pr}`),
+    error, fetchedAt: at, config: (({ baseline, ...c }) => c)(getConfig()), queue: queue.map((q) => `${q.repo}#${q.pr}`), queueHeld, control: queueStatus(), disk: diskState(), queueFull: queue.filter((q) => q.full).map((q) => `${q.repo}#${q.pr}`),
     prs: list.map((p) => {
       const all = runs.get(`${p.repo}#${p.number}`) ?? [];
       const atHead = all.find((r) => r.sha === p.headRefOid);
@@ -590,7 +676,10 @@ function prView() {
         why = needsRetestLabel && !(lastSignal?.stale) ? L().retest : src ? `new commits since ${src.by}'s ${src.kind === 'label' ? `"${src.label}"` : `report (${src.verdict})`}` : L().retest;
       }
       else if (latest) state = 'stale';
+      const inLine = queue.find((q) => q.repo === p.repo && q.pr === p.number);
       return {
+        waits: inLine ? holdReason(inLine, queueState()) : null, by: inLine?.by ?? null,
+        ci: ci.summary(ci.get(p.repo, p.number, p.headRefOid)),
         repo: p.repo, number: p.number, title: p.title, author: p.author?.login, sha: p.headRefOid, branch: p.headRefName, url: p.url,
         updatedAt: p.updatedAt, createdAt: p.createdAt, labels: p.labels, isDraft: p.isDraft, skip: skipReason(p), state,
         backlog: getConfig().baseline?.[`${p.repo}#${p.number}`] === p.headRefOid,
@@ -604,19 +693,25 @@ function prView() {
 }
 
 // full: test every claim again instead of only what changed since the last
-// round. note: what a reviewer asked for in a /miu comment.
-function enqueue(repo, pr, why, { full = false, note = '', force = false } = {}) {
+// round. note: what a reviewer asked for in a /miu comment. by: who asked
+// (lib/queuectl.mjs); in manual mode only a person's entry starts.
+function enqueue(repo, pr, why, { full = false, note = '', force = false, by = 'auto' } = {}) {
   const have = queue.find((q) => q.repo === repo && q.pr === pr);
-  if (have) { if (full) have.full = true; if (force) have.force = true; if (note) have.note = note; saveQueue(); return { ok: true, queued: true }; }
-  queue.push({ repo, pr, why, full, force, note, at: Date.now() });
+  if (have) {
+    if (full) have.full = true; if (force) have.force = true; if (note) have.note = note;
+    if (by === 'person') { have.by = 'person'; have.held = false; } else if (by === 'github' && have.by !== 'person') have.by = 'github';
+    saveQueue(); pump(); return { ok: true, queued: true, waits: holdReason(have, queueState()) };
+  }
+  const q = { repo, pr, why, by, held: false, full, force, note, at: Date.now() };
+  queue.push(q);
   saveQueue();
   pump();
-  return { ok: true, queued: true };
+  return { ok: true, queued: true, waits: holdReason(q, queueState()) };
 }
 
 // Queue a PR unless another PR of its pair is already queued or running: one
 // paired run tests them all.
-async function enqueuePair(repo, pr, why) {
+async function enqueuePair(repo, pr, why, by = 'auto') {
   let keys = [];
   try { keys = Object.values(await partnersOf(repo, pr)).map((x) => `${x.repo}#${x.number}`); } catch (e) { console.error('pair lookup:', e.message); }
   const live = liveRun();
@@ -624,16 +719,16 @@ async function enqueuePair(repo, pr, why) {
   const own = dir && readJson(path.join(dir, 'context/pr.json'))?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
   const liveKeys = dir ? [own && `${own[1]}#${own[2]}`, ...(readJson(path.join(dir, 'context/pair.json')) ?? []).map((x) => `${x.repo}#${x.number}`)].filter(Boolean) : [];
   if (keys.some((k) => queue.some((q) => `${q.repo}#${q.pr}` === k) || liveKeys.includes(k))) return { ok: true, queued: false, pairedWith: keys };
-  return enqueue(repo, pr, why);
+  return enqueue(repo, pr, why, { by });
 }
 
-// Start the next queued run when nothing is running.
+// Start the next queued run that may start (lib/queuectl.mjs) when nothing is running.
 // A queued run waits, rather than failing on its first turn, while the
 // model's engine is not signed in (lib/connections.mjs); queueHeld says why.
 let queueHeld = null;
 let pumping = false;
 async function pump() {
-  if (!queue.length || liveRun() || pumping) return;
+  if (nextIndex(queue, queueState()) < 0 || liveRun() || pumping) return;
   pumping = true;
   try {
     const cfg = getConfig();
@@ -657,25 +752,106 @@ async function pump() {
     }
     queueHeld = null;
   } catch (e) { console.error('queue check:', e.message); } finally { pumping = false; }
-  if (!queue.length || liveRun()) return;
-  const next = queue.shift();
+  const at = nextIndex(queue, queueState());
+  if (at < 0 || liveRun()) return;
+  const [next] = queue.splice(at, 1);
   saveQueue();
   const cfg = getConfig();
   const r = startRun({ repo: next.repo, pr: next.pr, model: cfg.model, dryRun: !cfg.post, full: next.full, force: next.force, note: next.note, slack: cfg.post && cfg.slack });
   if (r.error) console.error(`Could not start ${next.repo}#${next.pr}: ${r.error}`);
+  // Its CI starts beside it, if it has not already.
+  else ciFor(next.repo, next.pr);
 }
 
-// New pull requests and new commits get queued while auto-test is on.
+// Start the chosen pull requests now: first in the line, as a person's pick,
+// so they start in auto and manual mode alike (one QA run at a time; their CI
+// starts at once, beside whatever runs). Paused: they wait at the front.
+function startPicked(prs, { full = false, by = 'someone' } = {}) {
+  if (!Array.isArray(prs) || !prs.length || prs.length > 20) throw new Error('Choose from 1 to 20 pull requests.');
+  const picks = prs.map((x) => ({ repo: x?.repo, pr: Number(x?.pr) }));
+  const bad = picks.find((x) => !repos().includes(x.repo) || !Number.isInteger(x.pr) || x.pr < 1);
+  if (bad) throw new Error(`${String(bad.repo).slice(0, 60)}#${bad.pr} is not a pull request Miu tests.`);
+  const front = pick(queue, picks, { full });
+  for (const q of front) q.why = `started by ${by}`;
+  saveQueue();
+  for (const q of front) ciFor(q.repo, q.pr, { by: 'person' });
+  console.log(`queue: ${front.map((q) => `${q.repo}#${q.pr}`).join(', ')} started by ${by}`);
+  pump();
+  return { ok: true, started: front.map((q) => `${q.repo}#${q.pr}`), ...queueStatus() };
+}
+
+// ---- the same controls from a terminal on this server (bin/miu-queue).
+// The command writes a request into runs/.inbox and reads the answer there.
+// Only Miu's own account can write that folder (0700, and the agent account
+// has no way in), so it needs no sign-in and no network port.
+const INBOX = path.join(RUNS, '.inbox');
+async function inboxAction(r) {
+  const key = (s) => { const m = String(s ?? '').match(/^([\w.-]+\/[\w.-]+)#(\d+)$/); if (!m) throw new Error(`${String(s).slice(0, 60)} is not owner/repo#number`); return { repo: m[1], pr: Number(m[2]) }; };
+  const by = `${r.by ? String(r.by).replace(/[^\w.@-]/g, '').slice(0, 40) : 'someone'} (terminal)`;
+  switch (r.action) {
+    case 'status': return queueStatus();
+    case 'auto': case 'manual': return setQueueState({ mode: r.action }, by);
+    case 'pause': return setQueueState({ paused: true }, by);
+    case 'resume': return setQueueState({ paused: false }, by);
+    case 'start': return startPicked((r.prs ?? []).map(key), { full: r.full === true, by });
+    case 'hold': case 'release': {
+      const { repo, pr } = key(r.pr);
+      const q = queue.find((x) => x.repo === repo && x.pr === pr);
+      if (!q) throw new Error(`${repo}#${pr} is not in the queue`);
+      q.held = r.action === 'hold'; saveQueue(); if (!q.held) pump();
+      console.log(`queue: ${repo}#${pr} ${q.held ? 'held' : 'released'} by ${by}`);
+      return queueStatus();
+    }
+    case 'unqueue': { const { repo, pr } = key(r.pr); const i = queue.findIndex((x) => x.repo === repo && x.pr === pr); if (i > -1) { queue.splice(i, 1); saveQueue(); } return queueStatus(); }
+    case 'ci': { const { repo, pr } = key(r.pr); if (!repos().includes(repo)) throw new Error(`${repo} is not a repo Miu tests`); const rec = ciFor(repo, pr, { again: r.again === true, by: 'person' }); if (!rec) throw new Error(`Miu does not know the head of ${repo}#${pr} yet`); return ci.view(rec); }
+    case 'stop': { if (!safeName(String(r.run ?? ''))) throw new Error('Name the run to stop'); const x = stopRun(String(r.run)); if (x.error) throw new Error(x.error); return x; }
+    default: throw new Error(`Unknown action ${String(r.action).slice(0, 30)}`);
+  }
+}
+async function readInbox() {
+  fs.mkdirSync(INBOX, { recursive: true, mode: 0o700 });
+  fs.chmodSync(INBOX, 0o700);
+  for (const f of fs.readdirSync(INBOX)) {
+    const file = path.join(INBOX, f);
+    let st; try { st = fs.lstatSync(file); } catch { continue; }
+    if (/\.reply$/.test(f)) { if (Date.now() - st.mtimeMs > 10 * 60 * 1000) fs.rmSync(file, { force: true }); continue; }
+    const id = f.match(/^([\w-]{8,64})\.json$/)?.[1];
+    if (!id) continue;
+    // Only a plain file of Miu's own account is a request.
+    if (!st.isFile() || (process.getuid && st.uid !== process.getuid())) { fs.rmSync(file, { force: true }); continue; }
+    let req = null; try { req = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* not JSON */ }
+    fs.rmSync(file, { force: true });
+    let reply;
+    try { reply = { ok: true, result: await inboxAction(req ?? {}) }; } catch (e) { reply = { ok: false, error: e.message }; }
+    const tmp = path.join(INBOX, `.${id}.tmp`);
+    fs.writeFileSync(tmp, JSON.stringify(reply, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, path.join(INBOX, `${id}.reply`));
+  }
+}
+// Made at start, so the command finds it before the first poll.
+fs.mkdirSync(INBOX, { recursive: true, mode: 0o700 });
+fs.chmodSync(INBOX, 0o700);
+let inboxBusy = false;
+setInterval(() => { if (inboxBusy) return; inboxBusy = true; readInbox().catch((e) => console.error('inbox:', e.message)).finally(() => { inboxBusy = false; }); }, 1500);
+
+// New pull requests and new commits get queued, in either mode: in auto mode
+// they start on their own, in manual mode they wait for a person.
 async function autoScan() {
   let cfg = getConfig();
-  if (cfg.autoTest && !cfg.baseline) {
+  if (!cfg.baseline) {
     // First start: remember today's heads instead of testing the whole backlog.
     fs.mkdirSync(RUNS, { recursive: true });
     fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...cfg, baseline: await snapshotHeads() }, null, 2));
     cfg = getConfig();
   }
-  if (cfg.autoTest) {
-    const { list } = await refreshPrs();
+  {
+    const { list, error } = await refreshPrs();
+    // An entry Miu queued for a pull request that is closed now goes; a person's stays until it starts.
+    if (!error && list.length) {
+      const open = new Set(list.map((p) => `${p.repo}#${p.number}`));
+      const gone = queue.filter((q) => q.by !== 'person' && !open.has(`${q.repo}#${q.pr}`));
+      if (gone.length) { for (const q of gone) queue.splice(queue.indexOf(q), 1); saveQueue(); }
+    }
     const runs = runsByPr();
     const heads = new Map(list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid]));
     for (const p of list) {
@@ -693,7 +869,7 @@ async function autoScan() {
         // this commit is enough: a new commit, or a person, asks again.
         const empty = (runs.get(`${p.repo}#${p.number}`) ?? []).filter((r) => r.sha === p.headRefOid && ['no_result', 'inconclusive'].includes(r.verdict)).length;
         if (empty >= 2) continue;
-        if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${p.labels.find((l) => asks.includes(l))}`);
+        if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${p.labels.find((l) => asks.includes(l))}`, 'github');
         continue;
       }
       if (skipReason(p)) continue;
@@ -1084,7 +1260,7 @@ async function scanCommands() {
       const rest = m[2].trim();
       const full = /^full\b/i.test(rest);
       const note = (full ? rest.replace(/^full\b/i, '') : rest).trim();
-      enqueue(repo, pr, `/miu from ${c.user.login}`, { full, note: note ? `${c.user.login}: ${note}` : '' });
+      enqueue(repo, pr, `/miu from ${c.user.login}`, { full, note: note ? `${c.user.login}: ${note}` : '', by: 'github' });
       await gh.rest('POST', `repos/${repo}/issues/comments/${c.id}/reactions`, { body: { content: 'eyes' } }).catch(() => {});
       console.log(`queued ${repo}#${pr} from /miu by ${c.user.login}${full ? ' (full)' : ''}`);
     }
@@ -1488,6 +1664,20 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (url.pathname === '/api/prs') return json(prView());
+    if (url.pathname === '/api/queue') return json(queueStatus());
+    if (url.pathname === '/api/ci') {
+      const repo = url.searchParams.get('repo'), pr = Number(url.searchParams.get('pr')), sha = url.searchParams.get('sha');
+      if (!gh.validRepo(repo) || !Number.isInteger(pr)) return json({ error: 'Unknown pull request' });
+      return json(ci.view(sha ? ci.get(repo, pr, sha) : ci.latest(repo, pr)));
+    }
+    // One CI job's log, as text. Secrets were taken out when it was written (lib/ci.mjs).
+    if (url.pathname === '/api/ci/log') {
+      const key = url.searchParams.get('key') ?? '', n = Number(url.searchParams.get('n'));
+      const text = safeName(key) ? ci.readLog(key, n) : null;
+      if (text == null) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('No log for that job.'); }
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Content-Disposition': 'inline' });
+      return res.end(text);
+    }
     if (url.pathname === '/api/history') {
       const repo = url.searchParams.get('repo'), n = Number(url.searchParams.get('pr'));
       if (!repos().includes(repo) || !Number.isInteger(n)) return json({ error: 'Unknown pull request' });
@@ -1577,7 +1767,7 @@ const server = http.createServer((req, res) => {
       if (url.pathname === '/api/test') {
         // "Test now" from the list: queue it; it starts at once when nothing runs.
         if (!repos().includes(data.repo) || !Number.isInteger(Number(data.pr))) return json({ error: 'Unknown pull request' });
-        return json(enqueue(data.repo, Number(data.pr), 'asked from the dashboard', { full: data.full === true, force: data.force === true }));
+        return json(enqueue(data.repo, Number(data.pr), 'asked from the dashboard', { full: data.full === true, force: data.force === true, by: 'person' }));
       }
       // Change the order of the line: a pull request that matters more can go first.
       if (url.pathname === '/api/queue/move') {
@@ -1591,6 +1781,25 @@ const server = http.createServer((req, res) => {
         saveQueue();
         console.log(`queue: ${data.repo}#${data.pr} moved from ${i + 1} to ${queue.indexOf(item) + 1} by ${me?.name ?? 'the local user'}`);
         return json({ ok: true, queue: queue.map((q) => `${q.repo}#${q.pr}`) });
+      }
+      const who = session?.login ?? me?.name ?? localName;
+      // Auto or manual, pause or resume the whole queue.
+      if (url.pathname === '/api/queue/control') { setQueueState({ mode: data.mode, paused: data.paused }, who).then(json, (e) => json({ error: e.message })); return; }
+      // Start the chosen pull requests now (with their CI), in either mode.
+      if (url.pathname === '/api/queue/start') { try { return json(startPicked(data.prs, { full: data.full === true, by: who })); } catch (e) { return json({ error: e.message }); } }
+      // Set one queued pull request aside, or let it go again.
+      if (url.pathname === '/api/queue/hold') {
+        const q = queue.find((x) => x.repo === data.repo && x.pr === Number(data.pr));
+        if (!q) return json({ error: 'It is not in the queue any more: it started or was removed.' });
+        q.held = data.held !== false; saveQueue(); if (!q.held) pump();
+        console.log(`queue: ${q.repo}#${q.pr} ${q.held ? 'held' : 'released'} by ${who}`);
+        return json(queueStatus());
+      }
+      // Run a pull request's CI (again) at its head, without a QA run.
+      if (url.pathname === '/api/ci/run') {
+        if (!repos().includes(data.repo) || !Number.isInteger(Number(data.pr))) return json({ error: 'Unknown pull request' });
+        const r = ciFor(data.repo, Number(data.pr), { again: true, by: 'person' });
+        return json(r ? ci.view(r) : { error: 'Miu does not know this pull request\'s head yet. Refresh the list and try again.' });
       }
       if (url.pathname === '/api/unqueue') {
         const i = queue.findIndex((q) => q.repo === data.repo && q.pr === Number(data.pr));

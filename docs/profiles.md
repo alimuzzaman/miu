@@ -72,6 +72,12 @@ A fast check can run one of the repository's GitHub Actions workflows instead of
 
 The result goes in the same place as the other fast checks, and a failure is run again on the base branch. These are reported as "not run", never as a failure of the pull request: Sandbox not set up, a job that could not start or ran out of time, and a pull request that changes `.github/` or `.actrc`. Miu does not run a workflow a pull request has edited, because the workflow decides what runs on the server. Steps that look like a deploy or a publish are skipped. A workflow is refused, and reported as not run, if the job (or a job it needs) does not name `ubuntu-latest` or `ubuntu-22.04` in `runs-on` directly, or if its job containers or services mount folders, set Docker options other than `--health-*`, or call a reusable workflow, if the job needs another job and either one has an `if`, or if `.github` holds a symbolic link. The workflow runs on its own: Miu does not start a Sandbox WordPress site for it, because that would run the repository's own Docker setup with the server's Docker access.
 
+## CI on every pull request
+
+With Sandbox set up on the server, every pull request Miu tests also gets its CI, without a profile entry. Miu reads `.github/workflows` at the pull request's head. Each workflow that runs on `pull_request` (or, failing that, `push`) adds its jobs, one for each matrix combination. Each job runs with the same worker and the same rules as a `sandbox_ci` fast check. A job those rules refuse is listed as "not run here", with the reason, and is not run. A job that a `sandbox_ci` fast check already covers is not run twice: its result is under the repo's test suites.
+
+CI starts when the pull request's test starts, or as soon as it is queued in auto mode. It runs beside the QA run and beside the CI of other pull requests. Two jobs run at a time by default; set `ciParallel` (1 to 8) in `runs/.config.json` to change that. The worker on the server keeps its own memory and CPU caps (`miu-ci.slice`). When the server has no room, a job waits in the line and tries again every minute, for up to two hours. A pull request that changes `.github/` or `.actrc` gets no CI here. The run page's **CI** tab shows each job: its status, how long it took and its log. Secrets Miu knows are taken out of the log. Nothing is triggered on GitHub Actions. The tab links to GitHub's own checks, read only.
+
 ## A plugin and its add-on
 
 Give the add-on its own profile with `"role": "addon"`, and point each profile at the other with `sibling`:

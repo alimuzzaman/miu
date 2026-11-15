@@ -401,3 +401,24 @@ test('a pull request cannot choose what the server runs', () => {
   assert.equal(changesCiDefinition(['.actrc']), true);
   assert.equal(changesCiDefinition(['src/a.php', 'docs/.github-notes.md']), false);
 });
+
+test('ref sends that commit from a bare clone, and every job\'s output comes back as the log', async () => {
+  const src = repo();
+  const first = git(src, 'rev-parse', 'HEAD').stdout.trim();
+  fs.writeFileSync(path.join(src, 'later.php'), '<?php\n');
+  git(src, 'add', '-A'); git(src, 'commit', '-qm', 'later');
+  const bare = fs.mkdtempSync(path.join(tmp, 'bare-'));
+  spawnSync('git', ['clone', '-q', '--bare', src, bare]);
+  const dir = fs.mkdtempSync(path.join(tmp, 'worker-'));
+  const worker = path.join(dir, 'worker');
+  script(worker, `tar -t | LC_ALL=C sort > "${dir}/files"\necho '${report([{ label: 'a', status: 'passed', exit_code: 0, output: 'step one\n[t/a]   🏁  Job succeeded' }]).trim()}'`);
+  let pid = null;
+  const r = await runSandboxCi(check, bare, server({ worker }).env, { ref: first, onStart: (p) => { pid = p; } });
+  assert.equal(r.status, 0);
+  assert.ok(Number.isInteger(pid));
+  const files = fs.readFileSync(path.join(dir, 'files'), 'utf8');
+  assert.match(files, /code\.php/);
+  assert.doesNotMatch(files, /later\.php/);
+  assert.match(r.log, /## a \(passed, exit 0\)\nstep one/);
+  assert.deepEqual(await runSandboxCi(check, bare, server({ worker }).env, { ref: 'main; rm -rf /' }), { notRun: 'not a commit to run' });
+});

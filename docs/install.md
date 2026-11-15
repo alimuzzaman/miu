@@ -64,7 +64,11 @@ Workflow steps run the pull request's code in Docker containers on this server, 
 5. **Sign-in for the team.** On the GitHub page, add the App's client secret so people can sign in with GitHub. Then invite them under **Settings → Members**.
 6. **Optional.** Set `CLOUDINARY_URL` under Settings so screenshots show inside the comment. To post the full report to agent-notes, set `AGENT_NOTES_TOKEN` and `AGENT_NOTES_MCP_URL` in `/home/miu/.config/miu/env`.
 
-Auto-test is on from the start, for pull requests opened or pushed after the install. Pull requests that already existed wait until you press **Test** on them. Posting to GitHub starts off: reports show only on the dashboard until you turn on posting under Settings. Read a few reports first, then turn it on.
+Auto-test is on from the start, for pull requests opened or pushed after the install. Pull requests that already existed wait until you press **Test** on them.
+
+The Pull requests page has the queue's switches. **Auto** tests new pull requests and new commits on their own, one at a time. **Manual** still lines them up, but they wait ("Waiting for you") until a person starts them. To start some, tick them and press **Start now**, or press **Start** or **Test** on a row. They go first in the line, with their CI, in either mode. **Pause** starts nothing new, tests or CI, until **Resume**; what is running goes on. The ⋯ menu on a queued row can **Hold** it (it keeps its place and does not start) and **Release** it. A running test cannot be paused safely, because its sites, sign-ins and the agent's session keep going: **Stop** cancels it, and **Test again** runs it anew. The mode and the pause survive a restart. Any member can use these switches; viewers cannot.
+
+The same controls work from a terminal on the server, as Miu's account and with no network port: `sudo -u miu /opt/miu/node/bin/node /srv/miu/bin/miu-queue status` (also `auto`, `manual`, `pause`, `resume`, `start owner/repo#12 ...`, `hold`, `release`, `unqueue`, `ci owner/repo#12 --again`, `stop <run>`). The dashboard's API has them too, behind sign-in: `GET /api/queue`, `POST /api/queue/control` `{ "mode": "manual" }` or `{ "paused": true }`, `POST /api/queue/start` `{ "prs": [{ "repo": "owner/repo", "pr": 12 }] }`, `POST /api/queue/hold` `{ "repo", "pr", "held" }`, `POST /api/ci/run` `{ "repo", "pr" }`, `GET /api/ci?repo=&pr=`. Posting to GitHub starts off: reports show only on the dashboard until you turn on posting under Settings. Read a few reports first, then turn it on.
 
 ## Updating
 
