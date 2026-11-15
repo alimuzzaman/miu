@@ -618,6 +618,8 @@ async function runFastChecks() {
   for (const c of profile.fast_checks ?? []) {
     if (!prSrc) { fastLines.set(c.label, `- ${c.label}: not run (no PR checkout)`); continue; }
     if (mode !== 'full' || !touches(c.when)) { fastLines.set(c.label, `- ${c.label}: not run (diff does not touch it)`); continue; }
+    // Like GitHub: a fork's or Dependabot's pull request gets none of the server's CI secrets, so its workflow does not run here.
+    if (c.sandbox_ci && (String(prData.headRepo ?? '').toLowerCase() !== repo.toLowerCase() || prData.author?.login === 'dependabot[bot]')) { fastLines.set(c.label, `- ${c.label}: not run (a pull request from a fork or from Dependabot does not get the server's CI secrets)`); continue; }
     if (c.sandbox_ci && changesCiDefinition(files)) { fastLines.set(c.label, `- ${c.label}: not run (this PR changes the CI definition, and a PR must not choose what runs on the server)`); continue; }
     log(`check ${c.label}: running`);
     fastLines.set(c.label, `- ${c.label}: running`); writeFast(false);

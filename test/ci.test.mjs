@@ -57,7 +57,7 @@ test('a matrix becomes one check per combination, with exclude and include', () 
 test('reads YAML, with `on` kept as a key', { skip: hasYaml ? false : 'needs python3 with PyYAML' }, async () => {
   const [w] = await parseWorkflows([{ path: '.github/workflows/ci.yml', text: 'on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        php: [8.0, 8.1, "8.2"]\n' }]);
   assert.deepEqual(w.doc.on, ['pull_request']);
-  assert.deepEqual(w.doc.jobs.a.strategy.matrix.php, ['8.0', '8.1', '8.2'], 'a float keeps its .0');
+  assert.deepEqual(w.doc.jobs.a.strategy.matrix.php, [{ wholeFloat: '8.0' }, '8.1', '8.2'], 'a whole float is marked; others keep their text');
   const [bad] = await parseWorkflows([{ path: 'x.yml', text: 'a: [' }]);
   assert.ok(bad.error && !bad.doc);
 });
@@ -235,4 +235,35 @@ test('the busy limit counts from the first busy answer, not from the time in the
   l.clock.t += 3 * 3600 * 1000; // waited three hours in Miu's own line
   l.started[0].resolve({ notRun: 'not run: this server is busy (1.0 GB memory and 0.5 CPUs free); try again later' }); await settle();
   assert.equal(l.ci.view(l.ci.get('o/r', 1, SHA)).jobs[0].status, 'queued');
+});
+
+test('filter patterns follow GitHub: **/ matches no folder too, ? and + work on the character before', () => {
+  assert.equal(filterMatch(['**/README.md'], 'README.md'), true);
+  assert.equal(filterMatch(['docs/**/*.md'], 'docs/README.md'), true);
+  assert.equal(filterMatch(['**/docs/**'], 'docs/hello.md'), true);
+  assert.equal(filterMatch(['**/*.php'], 'plugin.php'), true);
+  assert.equal(filterMatch(['*.jsx?'], 'page.js'), true);
+  assert.equal(filterMatch(['*.jsx?'], 'page.jsx'), true);
+  assert.equal(filterMatch(['*.jsx?'], 'page.ts'), false);
+  assert.equal(filterMatch(['v[12].*'], 'v2.x'), true);
+  assert.equal(filterMatch(['src/[unclosed'], 'anything'), true, 'a pattern Miu cannot read lets the workflow run');
+});
+
+test('an include row with none of the matrix names joins every combination; a whole float is not run here', () => {
+  assert.deepEqual(expandMatrix({ php: ['7.4', '8.2'], include: [{ coverage: 'none' }] }).cells, [{ php: '7.4' }, { php: '8.2' }]);
+  assert.match(expandMatrix({ php: ['7.4', { wholeFloat: '8.0' }] }).error, /8\.0 unquoted.*write "8\.0"/);
+});
+
+test('service options split like a shell; a workflow on both pull_request and push runs if either would', () => {
+  const ok = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { a: ubuntu({ services: { db: { image: 'mysql', options: '--health-cmd "mysqladmin ping -h localhost" --health-interval 10s' } } }) } });
+  assert.ok(ok[0].check, ok[0].skip);
+  assert.deepEqual(triggerOf({ pull_request: { branches: ['main'] }, push: {} }, { base: 'dev' }), { event: 'push' });
+  assert.match(triggerOf({ pull_request: { branches: ['main'] }, push: { branches: ['main'] } }, { base: 'dev' }).skip, /into main, not dev/);
+});
+
+test('act running nothing is "not run" unless the job has its own condition', async () => {
+  const l = line({ workflows: { '.github/workflows/ci.yml': { on: 'pull_request', jobs: { a: ubuntu() } } } });
+  l.ci.ensure('o/r', 1, SHA); await settle();
+  l.started[0].resolve({ notRun: 'a: act reported success, but no job ran' }); await settle();
+  assert.equal(l.ci.view(l.ci.get('o/r', 1, SHA)).jobs[0].status, 'not_run');
 });

@@ -553,7 +553,7 @@ const queueStatus = () => {
   const st = queueState(), c = getConfig();
   return {
     ...st, pausedBy: st.paused ? c.pausedBy ?? null : null, pausedAt: st.paused ? c.pausedAt ?? null : null, live: liveRun(), held: queueHeld,
-    queue: queue.map((q) => ({ key: `${q.repo}#${q.pr}`, by: q.by ?? 'auto', held: !!q.held, waits: holdReason(q, st), why: q.why, full: !!q.full })),
+    queue: queue.map((q) => ({ key: `${q.repo}#${q.pr}`, by: q.by ?? 'earlier', held: !!q.held, waits: holdReason(q, st), why: q.why, full: !!q.full })),
     ci: { running: ci.running(), queued: ci.queued(), parallel: ciParallel() },
   };
 };
@@ -580,22 +580,29 @@ async function prepareNow(repo, pr, sha) {
   const p = prCache.list.find((x) => x.repo === repo && x.number === pr);
   // Whose branch it is comes from the open pull request list; without it, try again later.
   if (!p) throw new Error('it is not in the open pull request list yet');
-  if (p.headRepo !== repo) return { fork: true };
+  if (String(p.headRepo ?? '').toLowerCase() !== repo.toLowerCase()) return { fork: true };
+  // GitHub gives Dependabot's pull requests none of the usual secrets either: a new dependency's install scripts run in them.
+  if (p.author?.login === 'dependabot[bot]') return { fork: 'dependabot' };
   const auth = await gh.gitAuthEnv(repo).catch(() => null);
   const fallback = await gh.gitAuthEnv(repo, { fallback: true }).catch(() => null);
   const bare = ensureRepo(repo, auth, fallback);
   const trusted = profiles().find((x) => x.repo === repo)?.base_branch ?? 'main';
   const base = p?.baseRefName ?? trusted;
   for (const b of [trusted, base]) if (!/^[\w./-]+$/.test(b) || b.includes('..')) throw new Error('a base branch name is not plain');
-  const specs = [`+refs/pull/${pr}/head:refs/miu-ci/pr-${pr}`, ...new Set([trusted, base].map((b) => `+refs/heads/${b}:refs/miu-ci/base-${b}`))];
+  // Branch names as hex in the local ref, so that release and release/2.1 can both be kept.
+  const ref = (b) => `refs/miu-ci/base-${Buffer.from(b).toString('hex')}`;
+  const specs = [`+refs/pull/${pr}/head:refs/miu-ci/pr-${pr}`, ...new Set([trusted, base].map((b) => `+refs/heads/${b}:${ref(b)}`))];
   const fetch = async (env) => gitAsync(['-C', bare, 'fetch', '--quiet', '--force', `https://github.com/${repo}.git`, ...specs], env);
-  try { await fetch(auth); } catch (e) { if (!fallback) throw e; await fetch(fallback); }
+  try { await fetch(auth); } catch (e) {
+    if (!fallback) throw new Error(`could not fetch the pull request or ${trusted}: ${e.message}`);
+    await fetch(fallback).catch((e2) => { throw new Error(`could not fetch the pull request or ${trusted}: ${e2.message}`); });
+  }
   await gitAsync(['-C', bare, 'cat-file', '-e', `${sha}^{commit}`]).catch(() => { throw new Error(`commit ${sha.slice(0, 7)} is not on the pull request any more`); });
   const objectAt = (ref, f) => gitAsync(['-C', bare, 'rev-parse', '--verify', '--quiet', `${ref}:${f}`]).catch(() => 'none');
   let changesCi = false;
-  for (const f of ['.github', '.actrc']) if (await objectAt(sha, f) !== await objectAt(`refs/miu-ci/base-${trusted}`, f)) changesCi = true;
+  for (const f of ['.github', '.actrc']) if (await objectAt(sha, f) !== await objectAt(ref(trusted), f)) changesCi = true;
   if (changesCi) return { gitDir: bare, sha, workflows: [], changesCi, trustedBase: trusted };
-  const changed = (await gitAsync(['-C', bare, 'diff', '--name-only', `refs/miu-ci/base-${base}...${sha}`]).catch(() => null))?.split('\n').filter(Boolean) ?? null;
+  const changed = (await gitAsync(['-C', bare, 'diff', '--name-only', `${ref(base)}...${sha}`]).catch(() => null))?.split('\n').filter(Boolean) ?? null;
   const names = (await gitAsync(['-C', bare, 'ls-tree', '--name-only', sha, '.github/workflows/']).catch(() => '')).split('\n').filter((f) => /^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(f)).slice(0, 50);
   const workflows = [];
   for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${sha}:${f}`])).slice(0, 512 * 1024) });
@@ -784,6 +791,20 @@ async function pump() {
   else ciFor(next.repo, next.pr);
 }
 
+// Take a pull request out of the line. One Miu lined up by itself stays out
+// at this commit (its head joins the baseline), or the next scan would put it back.
+function unqueue(repo, pr) {
+  const i = queue.findIndex((q) => q.repo === repo && q.pr === pr);
+  if (i < 0) return;
+  const [q] = queue.splice(i, 1);
+  saveQueue();
+  const head = prCache.list.find((p) => p.repo === repo && p.number === pr)?.headRefOid;
+  if (q.by === 'auto' && head) {
+    const c = readJson(CONFIG_FILE) ?? {};
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...c, baseline: { ...(c.baseline ?? {}), [`${repo}#${pr}`]: head } }, null, 2));
+  }
+}
+
 // Start the chosen pull requests now: first in the line, as a person's pick,
 // so they start in auto and manual mode alike (one QA run at a time; their CI
 // starts at once, beside whatever runs). Paused: they wait at the front.
@@ -825,7 +846,7 @@ async function inboxAction(r) {
       console.log(`queue: ${repo}#${pr} ${q.held ? 'held' : 'released'} by ${by}`);
       return queueStatus();
     }
-    case 'unqueue': { const { repo, pr } = key(r.pr); const i = queue.findIndex((x) => x.repo === repo && x.pr === pr); if (i > -1) { queue.splice(i, 1); saveQueue(); } return queueStatus(); }
+    case 'unqueue': { const { repo, pr } = key(r.pr); unqueue(repo, pr); return queueStatus(); }
     case 'ci': { const { repo, pr } = key(r.pr); if (!repos().includes(repo)) throw new Error(`${repo} is not a repo Miu tests`); const rec = ciFor(repo, pr, { again: r.again === true, by: 'person' }); if (!rec) throw new Error(`Miu does not know the head of ${repo}#${pr} yet`); return ci.view(rec); }
     case 'stop': { if (!safeName(String(r.run ?? ''))) throw new Error('Name the run to stop'); const x = stopRun(String(r.run)); if (x.error) throw new Error(x.error); return x; }
     default: throw new Error(`Unknown action ${String(r.action).slice(0, 30)}`);
@@ -1832,11 +1853,7 @@ const server = http.createServer((req, res) => {
         const r = ciFor(data.repo, Number(data.pr), { again: true, by: 'person' });
         return json(r ? ci.view(r) : { error: 'Miu does not know this pull request\'s head yet. Refresh the list and try again.' });
       }
-      if (url.pathname === '/api/unqueue') {
-        const i = queue.findIndex((q) => q.repo === data.repo && q.pr === Number(data.pr));
-        if (i > -1) { queue.splice(i, 1); saveQueue(); }
-        return json({ ok: true });
-      }
+      if (url.pathname === '/api/unqueue') { unqueue(data.repo, Number(data.pr)); return json({ ok: true }); }
       if (url.pathname === '/api/start') return json(startRun({ repo: data.repo, pr: Number(data.pr), model: data.model, dryRun: data.dryRun !== false }));
       const rv = url.pathname.match(/^\/api\/runs\/([^/]+)\/review$/);
       if (rv && safeName(rv[1])) { setReview(rv[1], data, session?.login ?? localName).then(json, (e) => json({ error: e.message })); return; }
