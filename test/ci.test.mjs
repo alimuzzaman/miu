@@ -63,14 +63,14 @@ test('reads YAML, with `on` kept as a key', { skip: hasYaml ? false : 'needs pyt
 });
 
 // A CI line with stand-ins: workflows come as JSON, jobs finish when the test says.
-function line({ workflows = {}, changesCi = false, parallel = 2, paused = { v: false }, covered = [], prCi, runSha, dir = fs.mkdtempSync(path.join(tmp, 'ci-')) } = {}) {
+function line({ workflows = {}, changesCi = false, parallel = 2, paused = { v: false }, covered = [], prCi, runSha, changed, dir = fs.mkdtempSync(path.join(tmp, 'ci-')) } = {}) {
   const clock = { t: 1000 };
   const started = [];
   const ci = createCi({
     dir, parallel: () => parallel, isPaused: () => paused.v, now: () => clock.t, coveredBy: () => covered, prCiFor: () => prCi,
     scrub: (t) => String(t).replace(/s3cret/g, '[secret removed]'),
     parse: (files) => files.map((f) => ({ path: f.path, doc: JSON.parse(f.text) })),
-    prepare: async () => ({ gitDir: '/bare', runSha, workflowsFrom: 'dev@1234567', workflows: Object.entries(workflows).map(([p, d]) => ({ path: p, text: JSON.stringify(d) })), changesCi }),
+    prepare: async () => ({ gitDir: '/bare', runSha, workflowsFrom: 'dev@1234567', base: 'dev', changed, workflows: Object.entries(workflows).map(([p, d]) => ({ path: p, text: JSON.stringify(d) })), changesCi }),
     runJob: (check, gitDir, sha, { onStart }) => new Promise((resolve) => { onStart(999999999); started.push({ check, gitDir, sha, resolve }); }),
   });
   return { ci, clock, started, dir, paused };
@@ -185,7 +185,7 @@ test('a commit\'s CI older than 30 days goes when the line is read again', async
 });
 
 test('a pull_request trigger\'s filters decide, as on GitHub', () => {
-  assert.deepEqual(triggerOf({ pull_request: { types: ['closed'] } }), { skip: 'it runs on pull requests only when closed' });
+  assert.deepEqual(triggerOf({ pull_request: { types: ['closed'] } }), { skip: 'it runs on pull requests only when closed', kind: 'trigger' });
   assert.deepEqual(triggerOf({ pull_request: { types: ['opened', 'labeled'] } }), { event: 'pull_request' });
   assert.match(triggerOf({ pull_request: { branches: ['main'] } }, { base: 'dev' }).skip, /into main, not dev/);
   assert.deepEqual(triggerOf({ pull_request: { branches: ['release/**', 'dev'] } }, { base: 'release/2.1' }), { event: 'pull_request' });
@@ -209,11 +209,11 @@ test('what the worker refuses for a whole file is not lined up at all', () => {
 });
 
 test('a job another job needs runs as part of it, not on its own', () => {
-  const jobs = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { build: ubuntu(), test: ubuntu({ needs: 'build' }), deploy: ubuntu({ needs: ['test'] }) } });
+  const jobs = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { build: ubuntu(), test: ubuntu({ needs: 'build' }), e2e: ubuntu({ needs: ['test'] }) } });
   const by = Object.fromEntries(jobs.map((j) => [j.job, j]));
-  assert.ok(by.deploy.check);
-  assert.match(by.build.skip, /part of deploy/);
-  assert.match(by.test.skip, /part of deploy/);
+  assert.ok(by.e2e.check);
+  assert.match(by.build.skip, /part of e2e/);
+  assert.match(by.test.skip, /part of e2e/);
 });
 
 test('a fork\'s pull request gets no CI here; a job its condition left out is not counted as not run', async () => {
@@ -295,7 +295,7 @@ test('a listed workflow runs with workflow_dispatch, only its listed jobs and ma
 
 test('Miu runs tests only: deploy, release, notify and write jobs are refused, even when listed', () => {
   const all = jobsOf('.github/workflows/ci.yml', manualCi, { listed: { workflow: '.github/workflows/ci.yml' } });
-  assert.match(all.find((j) => j.job === 'notify').skip, /tests only.*posts/);
+  assert.match(all.find((j) => j.job === 'notify').skip, /tests only, and (its name says|a step posts)/);
   for (const f of ['deploy.yml', 'website-sync.yml', 'close-issues-on-dev-merge.yml', 'pr-summary.yml', 'slack-release.yml', 'announce-release.yml', 'release-tag.yml']) {
     const j = jobsOf(`.github/workflows/${f}`, { on: { workflow_dispatch: {} }, jobs: { a: ubuntu() } }, { listed: { workflow: `.github/workflows/${f}` } });
     assert.match(j[0].skip, /release, deploy or notification/, f);
@@ -369,6 +369,7 @@ test('the run commit is the pull request\'s files with the trusted branch\'s .gi
   const trusted = g('rev-parse', 'HEAD');
   g('checkout', '-qb', 'pr');
   put('.github/workflows/ci.yml', 'evil'); put('.github/workflows/extra.yml', 'evil'); fs.rmSync(path.join(repo, '.actrc')); put('src/a.php', 'new'); put('b space.txt', 'x');
+  put('.input', 'jobs=js'); put('.vars', 'X=1'); put('.secrets', 'S=1'); put('.env', 'E=1'); put('.gitattributes', '.github/** export-ignore');
   g('add', '-A'); g('commit', '-qm', 'pr');
   const sha = g('rev-parse', 'HEAD');
   const git = (args, e, input) => new Promise((resolve, reject) => {
@@ -383,4 +384,50 @@ test('the run commit is the pull request\'s files with the trusted branch\'s .gi
   assert.equal(g('show', `${run}:b space.txt`), 'x');
   assert.equal(g('ls-tree', '--name-only', `${run}:.github/workflows`), 'ci.yml');
   assert.equal(g('rev-parse', `${run}^`), sha);
+  assert.equal(g('ls-tree', '--name-only', run).split('\n').filter((f) => f.startsWith('.')).join(' '), '.actrc .github', 'the pull request\'s .input, .vars, .secrets, .env and .gitattributes are not in it');
+});
+
+test('a pull request that changes what act reads is not run', async () => {
+  const { changesCiDefinition } = await import('../lib/sandboxci.mjs');
+  for (const f of ['.input', '.vars', '.secrets', '.env', '.gitattributes', '.actrc', '.github/workflows/ci.yml']) assert.equal(changesCiDefinition(['src/a.php', f]), true, f);
+  assert.equal(changesCiDefinition(['src/.env', 'tests/.input']), false);
+});
+
+test('a record lined up under older rules starts nothing after a restart, and is read again when asked', async () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'ci-'));
+  const key = `r-1-${SHA.slice(0, 12)}`;
+  fs.writeFileSync(path.join(dir, `${key}.json`), JSON.stringify({ key, repo: 'o/r', pr: 1, sha: SHA, at: 1000, state: 'ready', jobs: [{ n: 0, label: 'pr-summary', status: 'queued', check: { label: 'x', sandbox_ci: { workflow: '.github/workflows/pr-summary.yml', job: 'a' } } }] }));
+  const l = line({ workflows: { '.github/workflows/ci.yml': manualCi }, prCi: [{ workflow: '.github/workflows/ci.yml', jobs: ['js'] }], dir });
+  l.ci.tick(); await settle();
+  assert.equal(l.started.length, 0, 'the old queued job does not run');
+  assert.equal(l.ci.get('o/r', 1, SHA).state, 'not_run');
+  l.ci.ensure('o/r', 1, SHA); await settle();
+  assert.deepEqual(l.started.map((x) => x.check.sandbox_ci.job), ['js']);
+});
+
+test('path and branch filters are not "No PR CI"; a listed push-to-branch deploy is not run; pr_ci [] or invalid', async () => {
+  const f = line({ changed: ['docs/a.md'], workflows: { '.github/workflows/ci.yml': { on: { pull_request: { paths: ['src/**'] } }, jobs: { a: ubuntu() } } } });
+  f.ci.ensure('o/r', 1, SHA); await settle();
+  assert.notEqual(f.ci.get('o/r', 1, SHA).state, 'none');
+  assert.equal(summaryOf(f.ci.get('o/r', 1, SHA)).state, 'no_jobs');
+  assert.match(jobsOf('.github/workflows/b.yml', { on: { push: { branches: ['main'] }, workflow_dispatch: {} }, jobs: { a: ubuntu() } }, { listed: { workflow: '.github/workflows/b.yml' } })[0].skip, /pushes to certain branches or tags, as a release or deploy/);
+  assert.match(jobsOf('.github/workflows/s.yml', { on: { schedule: [{ cron: '0 0 * * *' }] }, jobs: { a: ubuntu() } }, { listed: { workflow: '.github/workflows/s.yml' } })[0].skip, /only on schedule/);
+  const e = line({ workflows: three, prCi: [] });
+  e.ci.ensure('o/r', 1, SHA); await settle();
+  assert.match(e.ci.get('o/r', 1, SHA).reason, /pr_ci is empty/);
+  const bad = line({ workflows: three, prCi: { workflow: 'x' } });
+  bad.ci.ensure('o/r', 1, SHA); await settle();
+  assert.match(bad.ci.get('o/r', 1, SHA).reason, /pr_ci is not valid/);
+  assert.equal(bad.ci.get('o/r', 1, SHA).transient, undefined);
+});
+
+test('more ways a job posts, publishes or deploys are refused', () => {
+  const refused = (job, doc = {}) => jobsOf('.github/workflows/ci.yml', { on: 'pull_request', ...doc, jobs: { t: ubuntu(job) } })[0].skip;
+  assert.match(refused({ steps: [{ run: 'curl -sS \\\n  -d @p.json "$HOOK"' }] }), /posts/);
+  for (const run of ['curl --request POST "$U"', 'curl -d@f "$U"', 'curl -T f "$U"', 'curl --json @f "$U"', 'wget --post-data=x "$U"', 'npm run deploy', 'npx semantic-release', 'pnpm publish', 'docker push x', 'aws s3 sync . s3://b', 'wrangler deploy', 'kubectl apply -f k.yml']) assert.match(refused({ steps: [{ run }] }) ?? '', /posts/, run);
+  assert.match(refused({ steps: [{ uses: 'codecov/codecov-action@v4' }] }), /codecov/);
+  assert.match(refused({}, { permissions: { contents: 'write' } }), /write access/);
+  assert.match(jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { deploy: ubuntu() } })[0].skip, /name says/);
+  assert.match(refused({ steps: [{ name: 'Post comment', run: 'node c.js' }] }), /named Post comment/);
+  assert.equal(refused({ steps: [{ run: 'curl -fsSL https://x/y -o y && npm ci && npm test -- --json' }] }), undefined, 'a download and a test run are fine');
 });

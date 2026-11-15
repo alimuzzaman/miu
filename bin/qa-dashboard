@@ -566,16 +566,18 @@ const TOKENS = /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A
 const ciScrub = (t) => conn.scrub(String(t ?? '')).replace(TOKENS, '[secret removed]');
 const gitAsync = (args, env, input) => new Promise((resolve, reject) => {
   const child = execFile('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 5 * 60 * 1000, ...(env ? { env: { ...process.env, ...env } } : {}) }, (e, out) => (e ? reject(new Error(String(e.stderr || e.message).trim().split('\n').pop())) : resolve(out.trim())));
-  if (input !== undefined) child.stdin.end(input);
+  // git can exit before it has read everything; its exit code tells.
+  if (input !== undefined) { child.stdin.on('error', () => {}); child.stdin.end(input); }
 });
 // The commit, its workflow files and what it changed, from the bare clone runs
 // use (lib/worktrees.mjs), under refs of CI's own so a run's fetch is not in
 // the way. The workflows are those of the branch the profile names (not the
 // pull request's, and not the base the pull request chose): a pull request
 // must not choose what runs on the server. A pull request whose own changes
-// touch .github/ or .actrc is not run at all. What the worker gets is a commit
-// of Miu's own: the pull request's files with that branch's .github/ and
-// .actrc. One repo's prepares go one at a time (they share refs).
+// touch .github/, .actrc, .env, .vars, .input, .secrets or .gitattributes is
+// not run at all. What the worker gets is a commit of Miu's own: the pull
+// request's files with that branch's copies of those. One repo's prepares go
+// one at a time (they share refs).
 const prepChains = new Map();
 const ciPrepare = (repo, pr, sha) => {
   const next = (prepChains.get(repo) ?? Promise.resolve()).catch(() => {}).then(() => prepareNow(repo, pr, sha));
@@ -615,7 +617,7 @@ async function prepareNow(repo, pr, sha) {
   for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${tip}:${f}`])).slice(0, 512 * 1024) });
   const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, tip, `Miu CI: ${sha.slice(0, 12)} with the workflows of ${workflowsFrom}`);
   // Kept under a ref so a gc of the clone does not take it while it waits.
-  await gitAsync(['-C', bare, 'update-ref', `refs/miu-ci/run-${pr}`, runSha]);
+  await gitAsync(['-C', bare, 'update-ref', `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`, runSha]);
   return { gitDir: bare, sha, runSha, workflows, workflowsFrom, changesCi: false, base, changed };
 }
 fs.mkdirSync(RUNS, { recursive: true });
