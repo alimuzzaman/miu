@@ -355,7 +355,7 @@ test('a commit read under older rules is read again', async () => {
   const now = line({ workflows: { '.github/workflows/ci.yml': manualCi }, prCi: [{ workflow: '.github/workflows/ci.yml', jobs: ['js'] }], dir });
   now.ci.ensure('o/r', 1, SHA); await settle();
   assert.equal(now.started.length, 1);
-  assert.equal(now.ci.get('o/r', 1, SHA).rules, 2);
+  assert.equal(now.ci.get('o/r', 1, SHA).rules, 3);
 });
 
 test('the run commit is the pull request\'s files with the trusted branch\'s .github and .actrc', async () => {
@@ -389,8 +389,8 @@ test('the run commit is the pull request\'s files with the trusted branch\'s .gi
 
 test('a pull request that changes what act reads is not run', async () => {
   const { changesCiDefinition } = await import('../lib/sandboxci.mjs');
-  for (const f of ['.input', '.vars', '.secrets', '.env', '.gitattributes', '.actrc', '.github/workflows/ci.yml']) assert.equal(changesCiDefinition(['src/a.php', f]), true, f);
-  assert.equal(changesCiDefinition(['src/.env', 'tests/.input']), false);
+  for (const f of ['.input', '.vars', '.secrets', '.env', '.actrc', '.github/workflows/ci.yml']) assert.equal(changesCiDefinition(['src/a.php', f]), true, f);
+  assert.equal(changesCiDefinition(['src/.env', 'tests/.input', '.gitattributes']), false, '.gitattributes is swapped, not refused');
 });
 
 test('a record lined up under older rules starts nothing after a restart, and is read again when asked', async () => {
@@ -403,6 +403,26 @@ test('a record lined up under older rules starts nothing after a restart, and is
   assert.equal(l.ci.get('o/r', 1, SHA).state, 'not_run');
   l.ci.ensure('o/r', 1, SHA); await settle();
   assert.deepEqual(l.started.map((x) => x.check.sandbox_ci.job), ['js']);
+});
+
+test('records of rules 2, or read with another pr_ci, are read again', async () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'ci-'));
+  const key = `r-1-${SHA.slice(0, 12)}`;
+  fs.writeFileSync(path.join(dir, `${key}.json`), JSON.stringify({ key, repo: 'o/r', pr: 1, sha: SHA, at: 1000, rules: 2, state: 'ready', jobs: [{ n: 0, label: 'x', status: 'queued', check: { label: 'x', sandbox_ci: { workflow: '.github/workflows/x.yml', job: 'a' } } }] }));
+  const l = line({ workflows: { '.github/workflows/ci.yml': manualCi }, prCi: [{ workflow: '.github/workflows/ci.yml', jobs: ['js'] }], dir });
+  l.ci.tick(); await settle();
+  assert.equal(l.started.length, 0);
+  const list = { v: [{ workflow: '.github/workflows/ci.yml', jobs: ['js'] }] };
+  const dir2 = fs.mkdtempSync(path.join(tmp, 'ci-'));
+  const started = [];
+  const ci = createCi({ dir: dir2, prCiFor: () => list.v, now: () => 1000, parse: (fs2) => fs2.map((f) => ({ path: f.path, doc: JSON.parse(f.text) })),
+    prepare: async () => ({ gitDir: '/bare', workflows: [{ path: '.github/workflows/ci.yml', text: JSON.stringify(manualCi) }] }),
+    runJob: (check) => new Promise((resolve) => { started.push(check.sandbox_ci.job); resolve({ status: 0, out: '' }); }) });
+  ci.ensure('o/r', 1, SHA); await settle();
+  assert.equal(ci.ensure('o/r', 1, SHA), ci.get('o/r', 1, SHA), 'the same list: not read again');
+  list.v = [{ workflow: '.github/workflows/ci.yml', jobs: ['php'], matrix: { php: ['8.3'] } }];
+  ci.ensure('o/r', 1, SHA); await settle();
+  assert.deepEqual(started, ['js', 'php']);
 });
 
 test('path and branch filters are not "No PR CI"; a listed push-to-branch deploy is not run; pr_ci [] or invalid', async () => {
@@ -428,6 +448,11 @@ test('more ways a job posts, publishes or deploys are refused', () => {
   assert.match(refused({ steps: [{ uses: 'codecov/codecov-action@v4' }] }), /codecov/);
   assert.match(refused({}, { permissions: { contents: 'write' } }), /write access/);
   assert.match(jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { deploy: ubuntu() } })[0].skip, /name says/);
-  assert.match(refused({ steps: [{ name: 'Post comment', run: 'node c.js' }] }), /named Post comment/);
+  assert.match(refused({ steps: [{ uses: 'stefanzweifel/git-auto-commit-action@v5' }] }), /auto-commit/);
+  // Test jobs that only sound like it run.
+  const runs = (id, job) => jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { [id]: ubuntu(job) } })[0].check;
+  assert.ok(runs('site', { name: 'Website + release notes', steps: [{ run: 'npm ci && npm test' }] }));
+  assert.ok(runs('release_check', { steps: [{ name: 'Test release service in Chromium', run: 'npm test' }, { name: 'Comment out xdebug', run: 'sed -i s/^z/;z/ x.ini' }, { name: 'Verify Core Comment Disabling Functionality', run: 'wp eval-file t.php' }] }));
+  for (const run of ['wrangler deploy --dry-run', 'curl -f -sSL https://getcomposer.org/installer | php', 'curl -D - https://x/y', 'wget -T 30 -t 3 https://x/y', 'docker compose up -d', 'cargo build --release']) assert.ok(runs('t', { steps: [{ run }] }), run);
   assert.equal(refused({ steps: [{ run: 'curl -fsSL https://x/y -o y && npm ci && npm test -- --json' }] }), undefined, 'a download and a test run are fine');
 });

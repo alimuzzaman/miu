@@ -617,8 +617,9 @@ async function prepareNow(repo, pr, sha) {
   for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${tip}:${f}`])).slice(0, 512 * 1024) });
   const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, tip, `Miu CI: ${sha.slice(0, 12)} with the workflows of ${workflowsFrom}`);
   // Kept under a ref so a gc of the clone does not take it while it waits.
-  await gitAsync(['-C', bare, 'update-ref', `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`, runSha]);
-  return { gitDir: bare, sha, runSha, workflows, workflowsFrom, changesCi: false, base, changed };
+  const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
+  await gitAsync(['-C', bare, 'update-ref', runRef, runSha]);
+  return { gitDir: bare, sha, runSha, runRef, workflows, workflowsFrom, changesCi: false, base, changed };
 }
 fs.mkdirSync(RUNS, { recursive: true });
 const ci = createCi({
