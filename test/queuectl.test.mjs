@@ -11,13 +11,13 @@ test('auto-test on is auto mode, off is manual', () => {
   assert.equal(modeOf({ autoTest: false }), 'manual');
 });
 
-test('auto mode starts what Miu queued; manual mode only what a person picked', () => {
+test('auto mode starts what Miu queued; manual mode holds only that', () => {
   const line = [{ repo: 'a/b', pr: 1, by: 'auto' }, { repo: 'a/b', pr: 2, by: 'github' }, { repo: 'a/b', pr: 3, by: 'person' }, { repo: 'a/b', pr: 4 }];
   assert.equal(nextIndex(line, auto), 0);
-  assert.equal(nextIndex(line, manual), 2);
+  assert.equal(nextIndex(line, manual), 1, 'a team member\'s /miu asks, like a person on the dashboard');
   assert.equal(holdReason(line[0], manual), 'manual');
-  assert.equal(holdReason(line[3], manual), 'manual', 'an entry saved before "by" existed counts as Miu\'s own');
   assert.equal(holdReason(line[2], manual), null);
+  assert.equal(holdReason(line[3], manual), null, 'an entry saved before "by" existed was asked for (auto-test off queued nothing)');
 });
 
 test('paused starts nothing, a person\'s pick included; a held entry waits in either mode', () => {

@@ -38,7 +38,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
 import { createCi } from '../lib/ci.mjs';
-import { runSandboxCi, changesCiDefinition } from '../lib/sandboxci.mjs';
+import { runSandboxCi } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -415,9 +415,12 @@ setTimeout(refreshReady, 3000);
 setInterval(refreshReady, 5 * 60 * 1000);
 const snapshotHeads = async () => Object.fromEntries((await refreshPrs()).list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid]));
 async function setConfig(patch) {
+  // The slow part first: what is read after it is the latest, so a change
+  // made meanwhile (a pause, say) is not written back over.
+  const heads = patch.autoTest === true && !getConfig().autoTest ? await snapshotHeads() : null;
   const next = { ...getConfig() };
   if (typeof patch.autoTest === 'boolean') {
-    if (patch.autoTest && !next.autoTest) next.baseline = await snapshotHeads();
+    if (heads && !next.autoTest) next.baseline = heads;
     next.autoTest = patch.autoTest;
   }
   for (const k of ['post', 'slack', 'commands', 'testConflicts']) if (typeof patch[k] === 'boolean') next[k] = patch[k];
@@ -562,23 +565,41 @@ const ciParallel = () => Math.max(1, Math.min(8, Number(getConfig().ciParallel) 
 const TOKENS = /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,})\b/g;
 const ciScrub = (t) => conn.scrub(String(t ?? '')).replace(TOKENS, '[secret removed]');
 const gitAsync = (args, env) => new Promise((resolve, reject) => execFile('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 5 * 60 * 1000, ...(env ? { env: { ...process.env, ...env } } : {}) }, (e, out) => (e ? reject(new Error(String(e.stderr || e.message).trim().split('\n').pop())) : resolve(out.trim()))));
-// The commit, its base and its workflow files, from the bare clone runs use
-// (lib/worktrees.mjs), under refs of CI's own so a run's fetch is not in the way.
-async function ciPrepare(repo, pr, sha) {
+// The commit, its workflow files and what it changed, from the bare clone runs
+// use (lib/worktrees.mjs), under refs of CI's own so a run's fetch is not in
+// the way. .github/ and .actrc must be those of the branch the profile names
+// (not the base the pull request chose): a pull request must not choose what
+// runs on the server. One repo's prepares go one at a time (they share refs).
+const prepChains = new Map();
+const ciPrepare = (repo, pr, sha) => {
+  const next = (prepChains.get(repo) ?? Promise.resolve()).catch(() => {}).then(() => prepareNow(repo, pr, sha));
+  prepChains.set(repo, next);
+  return next;
+};
+async function prepareNow(repo, pr, sha) {
+  const p = prCache.list.find((x) => x.repo === repo && x.number === pr);
+  // Whose branch it is comes from the open pull request list; without it, try again later.
+  if (!p) throw new Error('it is not in the open pull request list yet');
+  if (p.headRepo !== repo) return { fork: true };
   const auth = await gh.gitAuthEnv(repo).catch(() => null);
   const fallback = await gh.gitAuthEnv(repo, { fallback: true }).catch(() => null);
   const bare = ensureRepo(repo, auth, fallback);
-  const p = prCache.list.find((x) => x.repo === repo && x.number === pr);
-  const base = p?.baseRefName ?? profiles().find((x) => x.repo === repo)?.base_branch ?? 'main';
-  if (!/^[\w./-]+$/.test(base) || base.includes('..')) throw new Error('the base branch name is not plain');
-  const fetch = async (env) => gitAsync(['-C', bare, 'fetch', '--quiet', '--force', `https://github.com/${repo}.git`, `+refs/pull/${pr}/head:refs/miu-ci/pr-${pr}`, `+refs/heads/${base}:refs/miu-ci/base-${base}`], env);
+  const trusted = profiles().find((x) => x.repo === repo)?.base_branch ?? 'main';
+  const base = p?.baseRefName ?? trusted;
+  for (const b of [trusted, base]) if (!/^[\w./-]+$/.test(b) || b.includes('..')) throw new Error('a base branch name is not plain');
+  const specs = [`+refs/pull/${pr}/head:refs/miu-ci/pr-${pr}`, ...new Set([trusted, base].map((b) => `+refs/heads/${b}:refs/miu-ci/base-${b}`))];
+  const fetch = async (env) => gitAsync(['-C', bare, 'fetch', '--quiet', '--force', `https://github.com/${repo}.git`, ...specs], env);
   try { await fetch(auth); } catch (e) { if (!fallback) throw e; await fetch(fallback); }
   await gitAsync(['-C', bare, 'cat-file', '-e', `${sha}^{commit}`]).catch(() => { throw new Error(`commit ${sha.slice(0, 7)} is not on the pull request any more`); });
-  const changed = (await gitAsync(['-C', bare, 'diff', '--name-only', `refs/miu-ci/base-${base}...${sha}`])).split('\n').filter(Boolean);
+  const objectAt = (ref, f) => gitAsync(['-C', bare, 'rev-parse', '--verify', '--quiet', `${ref}:${f}`]).catch(() => 'none');
+  let changesCi = false;
+  for (const f of ['.github', '.actrc']) if (await objectAt(sha, f) !== await objectAt(`refs/miu-ci/base-${trusted}`, f)) changesCi = true;
+  if (changesCi) return { gitDir: bare, sha, workflows: [], changesCi, trustedBase: trusted };
+  const changed = (await gitAsync(['-C', bare, 'diff', '--name-only', `refs/miu-ci/base-${base}...${sha}`]).catch(() => null))?.split('\n').filter(Boolean) ?? null;
   const names = (await gitAsync(['-C', bare, 'ls-tree', '--name-only', sha, '.github/workflows/']).catch(() => '')).split('\n').filter((f) => /^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(f)).slice(0, 50);
   const workflows = [];
   for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${sha}:${f}`])).slice(0, 512 * 1024) });
-  return { gitDir: bare, sha, workflows, changesCi: changesCiDefinition(changed) };
+  return { gitDir: bare, sha, workflows, changesCi: false, base, changed };
 }
 fs.mkdirSync(RUNS, { recursive: true });
 const ci = createCi({
@@ -782,8 +803,10 @@ function startPicked(prs, { full = false, by = 'someone' } = {}) {
 
 // ---- the same controls from a terminal on this server (bin/miu-queue).
 // The command writes a request into runs/.inbox and reads the answer there.
-// Only Miu's own account can write that folder (0700, and the agent account
-// has no way in), so it needs no sign-in and no network port.
+// The folder is 0700 and Miu's own: the agent account (miu-agent) has no way
+// in, so it needs no sign-in and no network port. Code that already runs as
+// Miu's account (a profile's fast-check command) could write a request too,
+// but such code can change Miu's files anyway.
 const INBOX = path.join(RUNS, '.inbox');
 async function inboxAction(r) {
   const key = (s) => { const m = String(s ?? '').match(/^([\w.-]+\/[\w.-]+)#(\d+)$/); if (!m) throw new Error(`${String(s).slice(0, 60)} is not owner/repo#number`); return { repo: m[1], pr: Number(m[2]) }; };
@@ -838,10 +861,13 @@ setInterval(() => { if (inboxBusy) return; inboxBusy = true; readInbox().catch((
 // they start on their own, in manual mode they wait for a person.
 async function autoScan() {
   let cfg = getConfig();
-  if (!cfg.baseline) {
-    // First start: remember today's heads instead of testing the whole backlog.
+  // First start, or the first scan in manual mode since manual mode lines up
+  // pull requests (before, auto-test off queued nothing and its baseline could
+  // be months old): remember today's heads instead of lining up the backlog.
+  if (!cfg.baseline || (!cfg.autoTest && !cfg.manualListing)) {
+    const heads = await snapshotHeads();
     fs.mkdirSync(RUNS, { recursive: true });
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...cfg, baseline: await snapshotHeads() }, null, 2));
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...(readJson(CONFIG_FILE) ?? {}), baseline: heads, manualListing: true }, null, 2));
     cfg = getConfig();
   }
   {
@@ -1121,6 +1147,9 @@ async function fixScan() {
     fs.writeFileSync(mark, new Date().toISOString());
     await enqueuePair(f.repo, f.pr, 'Miu pushed a fix');
   }
+  // Paused or manual mode: Miu starts no fix by itself either (the Fix button still works).
+  const qs = queueState();
+  if (qs.paused || qs.mode === 'manual') return;
   if (!cfg.fix.on || !cfg.fix.authors.length || liveFix()) return;
   const authors = new Set(cfg.fix.authors.map((a) => a.toLowerCase()));
   const runs = runsByPr();
@@ -1784,6 +1813,8 @@ const server = http.createServer((req, res) => {
       }
       const who = session?.login ?? me?.name ?? localName;
       // Auto or manual, pause or resume the whole queue.
+      // Pause is for any member; the mode decides what Miu spends on its own, so it is an admin's, as auto-test was.
+      if (url.pathname === '/api/queue/control' && data.mode !== undefined && cfg.required && !admin) return deny('Only a Miu admin can switch between auto and manual. Members can pause and start tests.');
       if (url.pathname === '/api/queue/control') { setQueueState({ mode: data.mode, paused: data.paused }, who).then(json, (e) => json({ error: e.message })); return; }
       // Start the chosen pull requests now (with their CI), in either mode.
       if (url.pathname === '/api/queue/start') { try { return json(startPicked(data.prs, { full: data.full === true, by: who })); } catch (e) { return json({ error: e.message }); } }

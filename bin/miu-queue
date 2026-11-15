@@ -47,9 +47,10 @@ fs.writeFileSync(tmp, JSON.stringify(req), { mode: 0o600 });
 fs.renameSync(tmp, path.join(inbox, `${id}.json`));
 
 const replyFile = path.join(inbox, `${id}.reply`);
-const until = Date.now() + 20000;
+// Switching to auto reads every open pull request's head first, which can take a while.
+const until = Date.now() + 90000;
 while (!fs.existsSync(replyFile)) {
-  if (Date.now() > until) { fs.rmSync(path.join(inbox, `${id}.json`), { force: true }); console.error('The dashboard did not answer in 20 seconds. Is miu.service running?'); process.exit(1); }
+  if (Date.now() > until) { fs.rmSync(path.join(inbox, `${id}.json`), { force: true }); console.error('The dashboard did not answer in 90 seconds. Is miu.service running? (If it took the request late, it may still have acted: check with miu-queue status.)'); process.exit(1); }
   await new Promise((r) => setTimeout(r, 250));
 }
 const reply = JSON.parse(fs.readFileSync(replyFile, 'utf8'));

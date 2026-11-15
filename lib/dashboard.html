@@ -2046,7 +2046,13 @@ document.addEventListener('click', async (e) => {
   if (testBtn) { const [repo, pr] = testBtn.dataset.test.split('#'); testBtn.disabled = true; testBtn.textContent = 'Queuing…'; const r = await post('/api/test', { repo, pr: Number(pr), full: testBtn.dataset.full === '1', force: testBtn.dataset.force === '1' }); if (r.error) await tell('Not queued', r.error); return refreshPrs(); }
   // The queue's switches, and starting what was chosen (lib/queuectl.mjs on the server).
   const qm = t.closest('[data-qmode]');
-  if (qm) { if (qm.classList.contains('on')) return; const r = await post('/api/queue/control', { mode: qm.dataset.qmode }); if (r.error) await tell('Not changed', r.error); return refreshPrs(); }
+  if (qm) {
+    if (qm.classList.contains('on')) return;
+    // What waited in manual mode starts once it is auto: say so first.
+    const waiting = (ui.prs?.control?.queue || []).filter((q) => q.waits === 'manual').length;
+    if (qm.dataset.qmode === 'auto' && waiting && !(await ask({ title: 'Switch to auto?', body: waiting + ' pull request' + (waiting === 1 ? ' waits' : 's wait') + ' in the line. In auto mode ' + (waiting === 1 ? 'it starts' : 'they start') + ' one at a time, with CI. Remove any you do not want tested first.', ok: 'Switch to auto' }))) return;
+    const r = await post('/api/queue/control', { mode: qm.dataset.qmode }); if (r.error) await tell('Not changed', r.error); return refreshPrs();
+  }
   const qp = t.closest('[data-qpause]');
   if (qp) { qp.disabled = true; const r = await post('/api/queue/control', { paused: qp.dataset.qpause === '1' }); if (r.error) await tell('Not changed', r.error); return refreshPrs(); }
   const one = t.closest('[data-startone]');

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { jobsOf, expandMatrix, parseWorkflows, createCi, summaryOf } from '../lib/ci.mjs';
+import { jobsOf, expandMatrix, parseWorkflows, createCi, summaryOf, triggerOf, filterMatch } from '../lib/ci.mjs';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-ci-'));
 const hasYaml = spawnSync('python3', ['-c', 'import yaml']).status === 0;
@@ -18,7 +18,9 @@ test('a workflow on pull_request gives one check per job', () => {
 });
 
 test('push-only workflows run as push; release and schedule-only workflows are not CI for a pull request', () => {
-  assert.equal(jobsOf('.github/workflows/a.yml', { on: { push: { branches: ['main'] } }, jobs: { a: ubuntu() } })[0].check.sandbox_ci.event, 'push');
+  assert.equal(jobsOf('.github/workflows/a.yml', { on: 'push', jobs: { a: ubuntu() } })[0].check.sandbox_ci.event, 'push');
+  assert.match(jobsOf('.github/workflows/a.yml', { on: { push: { branches: ['main'] } }, jobs: { a: ubuntu() } })[0].skip, /certain branches or tags/);
+  assert.match(jobsOf('.github/workflows/t.yml', { on: { push: { tags: ['*'] } }, jobs: { a: ubuntu() } })[0].skip, /certain branches or tags/);
   assert.deepEqual(jobsOf('.github/workflows/r.yml', { on: { release: {} }, jobs: { a: ubuntu() } }), []);
   assert.deepEqual(jobsOf('.github/workflows/s.yml', { on: 'schedule', jobs: { a: ubuntu() } }), []);
 });
@@ -26,7 +28,6 @@ test('push-only workflows run as push; release and schedule-only workflows are n
 test('what the worker refuses is listed with the reason, not run', () => {
   const jobs = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: {
     mac: { 'runs-on': 'macos-latest' },
-    reuse: { uses: './.github/workflows/x.yml' },
     after: ubuntu({ needs: 'mac' }),
     cond: ubuntu({ needs: 'ok', if: 'always()' }),
     ok: ubuntu(),
@@ -34,7 +35,6 @@ test('what the worker refuses is listed with the reason, not run', () => {
   } });
   const by = Object.fromEntries(jobs.map((j) => [j.job, j]));
   assert.match(by.mac.skip, /runs on macos-latest/);
-  assert.match(by.reuse.skip, /calls another workflow/);
   assert.match(by.after.skip, /the job it needs, mac,/);
   assert.match(by.cond.skip, /condition/);
   assert.match(by.expr.skip, /expression/);
@@ -46,16 +46,19 @@ test('a matrix becomes one check per combination, with exclude and include', () 
   assert.deepEqual(m.cells, [{ php: '8.2', wp: 6.5 }, { php: '7.4', wp: '6.0' }]);
   assert.deepEqual(expandMatrix(undefined).cells, [{}]);
   assert.deepEqual(expandMatrix({ include: [{ a: 1 }] }).cells, [{ a: 1 }]);
+  assert.deepEqual(expandMatrix({ include: [{ php: '7.4', wp: '5.9' }, { php: '8.2', wp: 'latest' }] }).cells, [{ php: '7.4', wp: '5.9' }, { php: '8.2', wp: 'latest' }], 'every include-only row is a run');
+  assert.deepEqual(expandMatrix({ php: ['7.4'], include: [{ php: '8.2', wp: '6.4' }, { php: '8.2', wp: '6.5' }] }).cells, [{ php: '7.4' }, { php: '8.2', wp: '6.4' }, { php: '8.2', wp: '6.5' }], 'include rows are not matched against each other');
   assert.match(expandMatrix({ on: [true] }).error, /not plain/);
   const jobs = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { t: ubuntu({ strategy: { matrix: { php: ['8.2', '8.3'] } } }) } });
   assert.deepEqual(jobs.map((j) => j.check.sandbox_ci.matrix), [{ php: '8.2' }, { php: '8.3' }]);
   assert.deepEqual(jobs.map((j) => j.label), [': t (8.2)', ': t (8.3)'].map((x) => 'ci.yml' + x));
 });
 
-test('reads YAML, with `on` kept as a key', { skip: hasYaml ? false : 'needs python3 with PyYAML' }, () => {
-  const [w] = parseWorkflows([{ path: '.github/workflows/ci.yml', text: 'on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n' }]);
+test('reads YAML, with `on` kept as a key', { skip: hasYaml ? false : 'needs python3 with PyYAML' }, async () => {
+  const [w] = await parseWorkflows([{ path: '.github/workflows/ci.yml', text: 'on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        php: [8.0, 8.1, "8.2"]\n' }]);
   assert.deepEqual(w.doc.on, ['pull_request']);
-  const [bad] = parseWorkflows([{ path: 'x.yml', text: 'a: [' }]);
+  assert.deepEqual(w.doc.jobs.a.strategy.matrix.php, ['8.0', '8.1', '8.2'], 'a float keeps its .0');
+  const [bad] = await parseWorkflows([{ path: 'x.yml', text: 'a: [' }]);
   assert.ok(bad.error && !bad.doc);
 });
 
@@ -179,4 +182,57 @@ test('a commit\'s CI older than 30 days goes when the line is read again', async
   const old = line({ dir: l.dir });
   assert.equal(old.ci.get('o/r', 1, SHA), null);
   assert.equal(fs.existsSync(path.join(l.dir, `r-1-${SHA.slice(0, 12)}`)), false);
+});
+
+test('a pull_request trigger\'s filters decide, as on GitHub', () => {
+  assert.deepEqual(triggerOf({ pull_request: { types: ['closed'] } }), { skip: 'it runs on pull requests only when closed' });
+  assert.deepEqual(triggerOf({ pull_request: { types: ['opened', 'labeled'] } }), { event: 'pull_request' });
+  assert.match(triggerOf({ pull_request: { branches: ['main'] } }, { base: 'dev' }).skip, /into main, not dev/);
+  assert.deepEqual(triggerOf({ pull_request: { branches: ['release/**', 'dev'] } }, { base: 'release/2.1' }), { event: 'pull_request' });
+  assert.match(triggerOf({ pull_request: { 'branches-ignore': ['dev'] } }, { base: 'dev' }).skip, /branches-ignore/);
+  assert.match(triggerOf({ pull_request: { paths: ['src/**'] } }, { changed: ['docs/a.md'] }).skip, /paths/);
+  assert.deepEqual(triggerOf({ pull_request: { paths: ['src/**', '!src/vendor/**'] } }, { changed: ['src/a/b.php'] }), { event: 'pull_request' });
+  assert.match(triggerOf({ pull_request: { 'paths-ignore': ['**.md'] } }, { changed: ['README.md', 'docs/x.md'] }).skip, /paths-ignore/);
+  assert.deepEqual(triggerOf({ pull_request: { paths: ['src/**'] } }, {}), { event: 'pull_request' }, 'changed files unknown: no path filter');
+  assert.equal(triggerOf({ workflow_dispatch: {} }), null);
+  assert.equal(filterMatch(['*.php'], 'a/b.php'), false);
+  assert.equal(filterMatch(['**.php'], 'a/b.php'), true);
+});
+
+test('what the worker refuses for a whole file is not lined up at all', () => {
+  const jobs = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { a: ubuntu(), r: { uses: './.github/workflows/x.yml' } } });
+  assert.ok(jobs.every((j) => j.skip && /refuses this workflow: job r calls another workflow/.test(j.skip)));
+  const svc = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { a: ubuntu({ services: { db: { image: 'mysql', options: '--privileged' } } }) } });
+  assert.match(svc[0].skip, /option --privileged/);
+  const ok = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { a: ubuntu({ services: { db: { image: 'mysql', options: '--health-cmd "mysqladmin ping"' } } }) } });
+  assert.ok(ok[0].check);
+});
+
+test('a job another job needs runs as part of it, not on its own', () => {
+  const jobs = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { build: ubuntu(), test: ubuntu({ needs: 'build' }), deploy: ubuntu({ needs: ['test'] }) } });
+  const by = Object.fromEntries(jobs.map((j) => [j.job, j]));
+  assert.ok(by.deploy.check);
+  assert.match(by.build.skip, /part of deploy/);
+  assert.match(by.test.skip, /part of deploy/);
+});
+
+test('a fork\'s pull request gets no CI here; a job its condition left out is not counted as not run', async () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'ci-'));
+  const ci = createCi({ dir, prepare: async () => ({ fork: true }), runJob: () => { throw new Error('ran'); }, parse: () => [] });
+  ci.ensure('o/r', 1, SHA); await settle();
+  assert.equal(ci.get('o/r', 1, SHA).state, 'not_run');
+  assert.match(ci.get('o/r', 1, SHA).reason, /fork/);
+  const l = line({ workflows: { '.github/workflows/ci.yml': { on: 'pull_request', jobs: { a: ubuntu({ if: "github.event_name == 'push'" }) } } } });
+  l.ci.ensure('o/r', 1, SHA); await settle();
+  l.started[0].resolve({ notRun: 'a: act reported success, but no job ran' }); await settle();
+  assert.equal(l.ci.view(l.ci.get('o/r', 1, SHA)).jobs[0].status, 'skipped');
+  assert.equal(summaryOf(l.ci.get('o/r', 1, SHA)).state, 'no_jobs');
+});
+
+test('the busy limit counts from the first busy answer, not from the time in the line', async () => {
+  const l = line({ workflows: { '.github/workflows/ci.yml': { on: 'pull_request', jobs: { a: ubuntu() } } }, parallel: 1 });
+  l.ci.ensure('o/r', 1, SHA); await settle();
+  l.clock.t += 3 * 3600 * 1000; // waited three hours in Miu's own line
+  l.started[0].resolve({ notRun: 'not run: this server is busy (1.0 GB memory and 0.5 CPUs free); try again later' }); await settle();
+  assert.equal(l.ci.view(l.ci.get('o/r', 1, SHA)).jobs[0].status, 'queued');
 });
