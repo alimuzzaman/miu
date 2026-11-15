@@ -37,8 +37,8 @@ import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, 
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
-import { createCi } from '../lib/ci.mjs';
-import { runSandboxCi } from '../lib/sandboxci.mjs';
+import { createCi, ciRunCommit } from '../lib/ci.mjs';
+import { runSandboxCi, changesCiDefinition } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -564,12 +564,18 @@ const CI_DIR = path.join(RUNS, '.ci');
 const ciParallel = () => Math.max(1, Math.min(8, Number(getConfig().ciParallel) || 2));
 const TOKENS = /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,})\b/g;
 const ciScrub = (t) => conn.scrub(String(t ?? '')).replace(TOKENS, '[secret removed]');
-const gitAsync = (args, env) => new Promise((resolve, reject) => execFile('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 5 * 60 * 1000, ...(env ? { env: { ...process.env, ...env } } : {}) }, (e, out) => (e ? reject(new Error(String(e.stderr || e.message).trim().split('\n').pop())) : resolve(out.trim()))));
+const gitAsync = (args, env, input) => new Promise((resolve, reject) => {
+  const child = execFile('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 5 * 60 * 1000, ...(env ? { env: { ...process.env, ...env } } : {}) }, (e, out) => (e ? reject(new Error(String(e.stderr || e.message).trim().split('\n').pop())) : resolve(out.trim())));
+  if (input !== undefined) child.stdin.end(input);
+});
 // The commit, its workflow files and what it changed, from the bare clone runs
 // use (lib/worktrees.mjs), under refs of CI's own so a run's fetch is not in
-// the way. .github/ and .actrc must be those of the branch the profile names
-// (not the base the pull request chose): a pull request must not choose what
-// runs on the server. One repo's prepares go one at a time (they share refs).
+// the way. The workflows are those of the branch the profile names (not the
+// pull request's, and not the base the pull request chose): a pull request
+// must not choose what runs on the server. A pull request whose own changes
+// touch .github/ or .actrc is not run at all. What the worker gets is a commit
+// of Miu's own: the pull request's files with that branch's .github/ and
+// .actrc. One repo's prepares go one at a time (they share refs).
 const prepChains = new Map();
 const ciPrepare = (repo, pr, sha) => {
   const next = (prepChains.get(repo) ?? Promise.resolve()).catch(() => {}).then(() => prepareNow(repo, pr, sha));
@@ -598,20 +604,25 @@ async function prepareNow(repo, pr, sha) {
     await fetch(fallback).catch((e2) => { throw new Error(`could not fetch the pull request or ${trusted}: ${e2.message}`); });
   }
   await gitAsync(['-C', bare, 'cat-file', '-e', `${sha}^{commit}`]).catch(() => { throw new Error(`commit ${sha.slice(0, 7)} is not on the pull request any more`); });
-  const objectAt = (ref, f) => gitAsync(['-C', bare, 'rev-parse', '--verify', '--quiet', `${ref}:${f}`]).catch(() => 'none');
-  let changesCi = false;
-  for (const f of ['.github', '.actrc']) if (await objectAt(sha, f) !== await objectAt(ref(trusted), f)) changesCi = true;
-  if (changesCi) return { gitDir: bare, sha, workflows: [], changesCi, trustedBase: trusted };
-  const changed = (await gitAsync(['-C', bare, 'diff', '--name-only', `${ref(base)}...${sha}`]).catch(() => null))?.split('\n').filter(Boolean) ?? null;
-  const names = (await gitAsync(['-C', bare, 'ls-tree', '--name-only', sha, '.github/workflows/']).catch(() => '')).split('\n').filter((f) => /^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(f)).slice(0, 50);
+  // What the pull request itself changes, from where it left its base.
+  const changed = (await gitAsync(['-C', bare, 'diff', '--no-renames', '--name-only', `${ref(base)}...${sha}`])
+    .catch((e) => { throw new Error(`could not tell what the pull request changes: ${e.message}`); })).split('\n').filter(Boolean);
+  if (changesCiDefinition(changed)) return { gitDir: bare, sha, workflows: [], changesCi: true, trustedBase: trusted };
+  const tip = await gitAsync(['-C', bare, 'rev-parse', '--verify', `${ref(trusted)}^{commit}`]);
+  const workflowsFrom = `${trusted}@${tip.slice(0, 7)}`;
+  const names = (await gitAsync(['-C', bare, 'ls-tree', '--name-only', tip, '.github/workflows/']).catch(() => '')).split('\n').filter((f) => /^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(f)).slice(0, 50);
   const workflows = [];
-  for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${sha}:${f}`])).slice(0, 512 * 1024) });
-  return { gitDir: bare, sha, workflows, changesCi: false, base, changed };
+  for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${tip}:${f}`])).slice(0, 512 * 1024) });
+  const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, tip, `Miu CI: ${sha.slice(0, 12)} with the workflows of ${workflowsFrom}`);
+  // Kept under a ref so a gc of the clone does not take it while it waits.
+  await gitAsync(['-C', bare, 'update-ref', `refs/miu-ci/run-${pr}`, runSha]);
+  return { gitDir: bare, sha, runSha, workflows, workflowsFrom, changesCi: false, base, changed };
 }
 fs.mkdirSync(RUNS, { recursive: true });
 const ci = createCi({
   dir: CI_DIR, prepare: ciPrepare, parallel: ciParallel, isPaused: () => queueState().paused, scrub: ciScrub,
   coveredBy: (repo) => profiles().find((p) => p.repo === repo)?.fast_checks ?? [],
+  prCiFor: (repo) => profiles().find((p) => p.repo === repo)?.pr_ci,
   runJob: (check, gitDir, sha, { onStart }) => runSandboxCi(check, gitDir, process.env, { ref: sha, onStart }),
   log: (m) => console.log(m),
 });

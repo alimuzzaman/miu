@@ -819,7 +819,7 @@ function selBar(v) {
   return '<div class="selbar" role="region" aria-label="Selected pull requests"><b>' + keys.length + ' selected</b><span class="muted">' + (v.control?.paused ? 'The queue is paused: they go first and start when you resume.' : 'They go first in the line, with their CI.') + '</span><span class="sp"></span>' +
     '<button class="btn" data-startsel data-full="1" title="Test every claim again, not only what changed">Full test</button><button class="btn primary" data-startsel>Start now</button><button class="linkbtn" data-selclear>Clear</button></div>';
 }
-const CI_WORD = { passed: 'CI passed', failed: 'CI failed', running: 'CI running', queued: 'CI queued', not_run: 'CI not run', none: 'No CI', no_jobs: 'No CI Miu can run', detecting: 'Reading CI' };
+const CI_WORD = { passed: 'CI passed', failed: 'CI failed', running: 'CI running', queued: 'CI queued', not_run: 'CI not run', none: 'No PR CI', no_jobs: 'No PR CI Miu can run', detecting: 'Reading CI' };
 const ciChip = (c) => (c && CI_WORD[c.state] ? '<span class="cichip ' + esc(c.state) + '" title="' + esc(c.reason || (c.total != null ? c.passed + ' of ' + c.total + ' passed' + (c.failed ? ', ' + c.failed + ' failed' : '') + (c.running ? ', ' + c.running + ' running' : '') + (c.queued ? ', ' + c.queued + ' queued' : '') + (c.skipped ? ', ' + c.skipped + ' not run here' : '') : '')) + '">' + CI_WORD[c.state] + (c.total ? ' ' + (c.passed + c.failed) + '/' + c.total : '') + '</span>' : '');
 
 function renderPrs(force) {
@@ -1935,16 +1935,17 @@ function ciTab(d) {
   const fast = d.fast ? '<details class="fold" style="margin-top:16px"' + (c ? '' : ' open') + '><summary>Repo test suites (run inside the QA run)</summary><div class="md">' + md(d.fast) + '</div></details>' : '';
   if (!c) return '<div class="blank">This run names no pull request to read CI from.</div>' + fast;
   const key = esc(c.repo) + '#' + c.pr;
-  const again = c.state !== 'detecting' && !(c.jobs || []).some((j) => j.status === 'running') ? '<button class="btn" data-ci-run="' + key + '" title="Read the workflows at the pull request\'s head and run them again in Miu\'s Sandbox CI">' + (c.state === 'not_started' ? 'Run CI' : 'Run CI again') + '</button>' : '';
+  const again = c.state !== 'detecting' && !(c.jobs || []).some((j) => j.status === 'running') ? '<button class="btn" data-ci-run="' + key + '" title="Read the base branch\'s workflows again and run them on the pull request\'s head in Miu\'s Sandbox CI">' + (c.state === 'not_started' ? 'Run CI' : 'Run CI again') + '</button>' : '';
   const s = c.summary;
-  const line = { not_started: 'CI has not started for this commit. It starts when Miu tests the pull request, or now with Run CI.', detecting: 'Reading the workflows at this commit…', none: 'No CI in this repo. ' + (c.reason || ''), not_run: 'CI did not run: ' + (c.reason || 'unknown reason') }[c.state]
-    || (s.state === 'no_jobs' ? 'This repo has workflows, but no job Miu\'s Sandbox CI can run. Each one says why below.'
+  const line = { not_started: 'CI has not started for this commit. It starts when Miu tests the pull request, or now with Run CI.', detecting: 'Reading the workflows…', none: 'No PR CI in this repo. ' + (c.reason || ''), not_run: 'CI did not run: ' + (c.reason || 'unknown reason') }[c.state]
+    || (s.state === 'no_jobs' ? 'No PR CI Miu can run here: each job says why below.'
       : s.passed + ' of ' + s.total + ' passed' + (s.failed ? ', ' + s.failed + ' failed' : '') + (s.running ? ', ' + s.running + ' running' : '') + (s.queued ? ', ' + s.queued + ' queued' + (c.paused ? ' (the queue is paused)' : '') : '') + (s.not_run ? ', ' + s.not_run + ' not run' : '') + '.');
   const at = (c.sha || '').slice(0, 7);
-  return '<div class="cihead"><span><b>CI at ' + esc(at) + '</b>, ' + esc(line) + '</span><span class="sp"></span>' + again +
+  const from = c.workflowsFrom ? ' Workflows from ' + c.workflowsFrom + (c.listed ? ', as the profile lists them' : '') + '.' : '';
+  return '<div class="cihead"><span><b>CI at ' + esc(at) + '</b>, ' + esc(line + from) + '</span><span class="sp"></span>' + again +
     (c.checksUrl ? '<a class="btn" href="' + esc(c.checksUrl) + '" target="_blank" rel="noopener" data-ext title="GitHub\'s own checks, read only">GitHub checks</a>' : '') + '</div>' +
     (c.jobs && c.jobs.length ? '<div class="cijobs">' + c.jobs.map((j) => ciJob(c, j)).join('') + '</div>' : '') +
-    '<p class="h" style="margin-top:10px">Jobs run in Miu\'s Sandbox CI containers on this server, up to ' + esc(c.parallel) + ' at once across all pull requests, never on GitHub Actions. A pull request that changes .github/ is not run here.</p>' + fast;
+    '<p class="h" style="margin-top:10px">Jobs run in Miu\'s Sandbox CI containers on this server, up to ' + esc(c.parallel) + ' at once across all pull requests, never on GitHub Actions. The workflows come from the profile\'s base branch, not the pull request; a pull request that changes .github/ is not run here, and Miu never runs a job that deploys, publishes, comments or notifies.</p>' + fast;
 }
 
 async function renderRun(force, cached) {
