@@ -713,8 +713,9 @@ test('a run that then reads nothing with a token gets a stand-in for the token i
   assert.equal(r.status, 0, JSON.stringify(r));
   assert.deepEqual(app.calls.mint, []);
   assert.deepEqual(app.calls.revoked, []);
-  assert.equal(s.head(), 'miu-ci-secrets 2 mirrors=Acme/licensing');
-  assert.deepEqual(s.secrets(), [`FREE_REPO_TOKEN=${NO_TOKEN}`, `GITHUB_TOKEN=${NO_TOKEN}`]);
+  // Never GITHUB_TOKEN: act fetches public actions with it.
+  assert.equal(s.head(), 'miu-ci-secrets 1 mirrors=Acme/licensing');
+  assert.deepEqual(s.secrets(), [`FREE_REPO_TOKEN=${NO_TOKEN}`]);
   // Composer takes it as a github-oauth token; it opens nothing.
   assert.match(NO_TOKEN, /^[.A-Za-z0-9_]+$/);
 });
@@ -761,6 +762,7 @@ project="$6"; cat > /dev/null
 cp "$project/.env" "${home}/env" 2>/dev/null || true
 git -C "$project" status --porcelain > "${home}/status"
 git -C "$project" ls-files | grep -c '^.miu-ci/' > "${home}/committed-copy"
+cp "$project/composer.lock" "${home}/lock" 2>/dev/null || true
 ( set -a; . "$project/.env"; set +a; env -u GIT_SSH_COMMAND git clone -q git@github.com:Acme/licensing.git "${home}/cloned" && git -C "${home}/cloned" rev-parse HEAD > "${home}/cloned-sha" ) 2> "${home}/clone-err"
 { grep -rlF -- "$(sed -n 2p "${key}")" "$project" ; grep -rlF -- "${key}" "$project"; } > "${home}/key-seen" 2>/dev/null
 git -C "$project/.miu-ci/mirrors/acme/licensing.git" remote > "${home}/copy-remotes" 2>&1
@@ -897,4 +899,23 @@ test('a worker note goes at the top of a passing run\'s log', async () => {
   assert.equal(r.status, 0);
   assert.match(r.log, /^Note: could not fetch Acme\/lib with its deploy key; the job read the copy from 2026-11-15 10:00 UTC\n\n/);
   assert.doesNotMatch(r.log, /other noise/);
+});
+
+test('the job\'s composer.lock loses the dist of a deploy-key package only, so Composer clones it from the mirror', needsYaml, () => {
+  const k = keyedServer();
+  k.commit('one');
+  const pkg = (name, url) => ({ name, version: 'dev-main', source: { type: 'git', url, reference: 'abc' }, dist: { type: 'zip', url: `https://api.github.com/repos/${name}/zipball/abc` } });
+  const lock = { 'content-hash': 'h', packages: [pkg('acme/licensing', 'git@github.com:ACME/licensing.git'), pkg('acme/other', 'https://github.com/Acme/other.git')], 'packages-dev': [pkg('acme/lic-dev', 'https://github.com/acme/licensing')] };
+  const r = k.run(undefined, { 'composer.lock': JSON.stringify(lock) });
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(k.read('lock'));
+  assert.equal(out.packages[0].dist, undefined);
+  assert.deepEqual(out.packages[0].source, lock.packages[0].source);
+  assert.deepEqual(out.packages[1].dist, lock.packages[1].dist);
+  assert.equal(out['packages-dev'][0].dist, undefined);
+  assert.equal(out['content-hash'], 'h');
+  assert.equal(k.read('status'), '');
+  const bad = k.run(undefined, { 'composer.lock': '{not json' });
+  assert.equal(bad.status, 2);
+  assert.match(bad.stderr, /refused: composer.lock is not readable JSON/);
 });

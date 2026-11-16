@@ -382,6 +382,32 @@ if [ -n "$mirror_list" ]; then
   if [ -f "$root/.env" ] && [ $(( $(tr -cd '"' < "$root/.env" | wc -c) % 2 )) -ne 0 ]; then
     die "refused: the base branch's .env has an unclosed double quote"
   fi
+  # Composer installs a locked package from its dist, a zip from GitHub's API,
+  # which a deploy key cannot open; and it does not fall back to the git
+  # source then. The job's copy of composer.lock drops the dist of each
+  # deploy-key package, so Composer clones it, and git reads the mirror. Only
+  # this run's tree changes: composer.json and the content hash stay.
+  if [ -f "$root/composer.lock" ] && [ ! -L "$root/composer.lock" ]; then
+    bounded 60 python3 -I - "$root/composer.lock" "${mirror_repos[@]}" <<'LOCK' || die "refused: composer.lock is not readable JSON"
+import json, re, sys
+path, repos = sys.argv[1], [r.lower() for r in sys.argv[2:]]
+def mirrored(url):
+    m = re.match(r'^(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)([^/]+/[^/]+?)(?:\.git)?/?$', str(url or ''), re.I)
+    return bool(m) and m.group(1).lower() in repos
+with open(path, encoding="utf-8") as f:
+    lock = json.load(f)
+changed = False
+for key in ("packages", "packages-dev"):
+    for p in lock.get(key) or []:
+        if isinstance(p, dict) and isinstance(p.get("source"), dict) and mirrored(p["source"].get("url")) and "dist" in p:
+            del p["dist"]
+            changed = True
+if changed:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(lock, f, indent=4, ensure_ascii=False)
+        f.write("\n")
+LOCK
+  fi
   [ ! -s "$root/.env" ] || [ -z "$(tail -c1 "$root/.env")" ] || echo >> "$root/.env"
   {
     echo "GIT_CONFIG_COUNT=$(( ${#mirror_config[@]} / 2 ))"
