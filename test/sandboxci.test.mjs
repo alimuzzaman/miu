@@ -673,7 +673,7 @@ test('the sibling ships at the ref its checkout asks for; an expression picks th
   const none = async (args) => (args[0] === 'ls-remote' ? '' : '');
   await assert.rejects(shipSibling({ git: none, siblingRepo: 'Acme/free', headRef: 'dev', docs: at('release/9'), auth: null }), /no branch or tag release\/9/);
   const two = [{ jobs: { a: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: 'free', ref: 'a' } }] }, b: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: 'free', ref: 'b' } }] } } }];
-  await assert.rejects(shipSibling({ git: none, siblingRepo: 'Acme/free', headRef: 'dev', docs: two, auth: null }), /ask for different refs/);
+  await assert.rejects(shipSibling({ git: none, siblingRepo: 'Acme/free', headRef: 'dev', docs: two, auth: null }), /at different refs: workflow 1 job (a|b) asks for (a|b), workflow 1 job (a|b) for (a|b)/);
   assert.equal(await shipSibling({ git: none, siblingRepo: 'Acme/other', headRef: 'dev', docs: at('main'), auth: null }), null);
 });
 
