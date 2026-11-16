@@ -86,6 +86,16 @@ test(`at ${CAP}, the oldest idle one is evicted before the next is added`, async
   assert.ok(s.calls.some((c) => c[0] === 'add' && c[1] === `wp-pr-free-${CAP + 1}`), 'then it is added');
 });
 
+test('a failed add is removed when its PR closes (the follow may exist)', async () => {
+  const s = setup({ answers: { add: { code: 1, out: '{"ok":false,"code":"server_cli_acceptance_unknown"}' } } });
+  s.st.want('WPDevelopers/xspeed', 5, 'free', pr(5));
+  await s.st.scan({ open: new Map([['WPDevelopers/xspeed#5', 'sha5']]) });
+  assert.equal(s.st.view('WPDevelopers/xspeed#5').state, 'failed');
+  await s.st.scan({ open: new Map() });
+  assert.deepEqual(s.calls.filter((c) => c[0] === 'remove'), [['remove', 'wp-pr-free-5']]);
+  assert.equal(s.st.view('WPDevelopers/xspeed#5').state, 'removed');
+});
+
 test('fromStatus: ready, building, failed, licensing key missing', () => {
   assert.deepEqual(
     (({ applied, appliedHead, attemptRunning, failed }) => ({ applied, appliedHead, attemptRunning, failed }))(fromStatus({ ok: true, applied: { free: 'a', pro: 'b' }, attempt: { status: 'succeeded' } }, 'free')),

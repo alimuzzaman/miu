@@ -112,6 +112,27 @@ test('remove of a follow already gone still takes the stack down (safe to repeat
   assert.deepEqual(h.calls().at(-1).slice(0, 3), ['host', 'stack', 'down']);
 });
 
+test('remove of a stack already gone (reaped, taken down) finishes: no retry loop', () => {
+  const h = harness({ fail: 'stack down:stack_not_found' });
+  fs.mkdirSync(path.join(h.root, 'work', 'pr-hub-5'), { recursive: true });
+  assert.equal(h.run('remove', 'pr-hub-5').status, 0);
+  assert.equal(fs.existsSync(path.join(h.root, 'work', 'pr-hub-5')), false);
+});
+
+test('any other stack down failure is reported and asked again', () => {
+  const h = harness({ fail: 'stack down:host_target_busy' });
+  const r = h.run('remove', 'pr-hub-6');
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /host_target_busy/);
+});
+
+test('under sudo the test-only paths are ignored', () => {
+  const h = harness();
+  const r = spawnSync('bash', [WORKER, 'status', 'pr-hub-7'], { encoding: 'utf8', env: { ...process.env, SUDO_USER: 'miu', MIU_PR_STACK_SB: '/bin/echo-should-not-run', HOME: os.tmpdir() } });
+  assert.notEqual(r.stdout.trim(), 'host follow status --name pr-hub-7 --here --json');
+  assert.deepEqual(h.calls(), []);
+});
+
 test('a symlinked work folder is left alone', () => {
   const h = harness();
   const target = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-'));
