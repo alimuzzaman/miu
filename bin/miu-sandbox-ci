@@ -53,7 +53,8 @@ revoke_token() {
   for l in ${secret_lines[@]+"${secret_lines[@]}"}; do
     [[ $l == GITHUB_TOKEN=* ]] || continue
     printf 'header = "Authorization: token %s"\n' "${l#GITHUB_TOKEN=}" \
-      | timeout -k 5 30 curl -sS -o /dev/null -X DELETE -H 'Accept: application/vnd.github+json' -H 'User-Agent: miu' -K - https://api.github.com/installation/token >/dev/null 2>&1 || true
+      | timeout -k 5 30 curl -sS --fail --retry 2 -o /dev/null -X DELETE -H 'Accept: application/vnd.github+json' -H 'User-Agent: miu' -K - https://api.github.com/installation/token >/dev/null 2>&1 \
+      || echo "sandbox-ci: could not revoke the run's GitHub token; Miu tries too, and it expires within the hour" >&2
   done
 }
 trap revoke_token EXIT

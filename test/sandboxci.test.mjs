@@ -534,7 +534,7 @@ test('a fast check reads nothing from the pull request to grant: only its own re
   // A workflow on the branch the pull request targets is the pull request's too.
   const app = fakeApp();
   const r = await runSandboxCi(proCheck, proRepo().dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
-  assert.match(r.notRun, /^no access to Acme\/free, Acme\/pro, Acme\/tools, Acme\/hub, Acme\/licensing: a fast check gets only its own repository and the profile's sandbox_ci.repos$/);
+  assert.match(r.notRun, /^no access to Acme\/free, Acme\/pro, Acme\/tools, Acme\/hub, Acme\/licensing: a fast check gets only the repositories in the profile's sandbox_ci.repos$/);
   assert.deepEqual(app.calls.mint, []);
   const listed = { label: 'CI', sandbox_ci: { ...proCheck.sandbox_ci, repos: ['Acme/pro', 'Acme/free', 'Acme/tools', 'Acme/hub', 'Acme/licensing'] } };
   const ok = await runSandboxCi(listed, proRepo().dir, server({ home: sandboxHome({ plan: '{"jobs":[{"id":"php","cells":[{"matrix":{}}]}]}' }).home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
@@ -650,15 +650,27 @@ test('profile validation: repos is a short list of owner/name', () => {
   assert.deepEqual(j.check.sandbox_ci.repos, ['Acme/lib']);
 });
 
-test('the sibling ships at the pull request\'s branch name when it has one, else main', async () => {
-  const docs = [{ jobs: { a: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: 'free' } }] } } }];
-  for (const [head, has, want] of [['feat/x', true, 'feat/x'], ['feat/x', false, 'main'], ['dev', true, 'dev'], ['--upload-pack=x', true, 'main']]) {
+test('the sibling ships at the ref its checkout asks for; an expression picks the pull request\'s branch name, else main', async () => {
+  const at = (ref) => [{ jobs: { a: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: 'free', ...(ref === undefined ? {} : { ref }) } }] } } }];
+  const cases = [
+    [at('${{ steps.freeref.outputs.ref }}'), 'feat/x', ['refs/heads/feat/x'], 'refs/heads/feat/x'],
+    [at('${{ steps.freeref.outputs.ref }}'), 'feat/x', [], 'refs/heads/main'],
+    [at('${{ steps.freeref.outputs.ref }}'), '--upload-pack=x', ['refs/heads/x'], 'refs/heads/main'],
+    [at('release/2.1'), 'feat/x', ['refs/heads/release/2.1'], 'refs/heads/release/2.1'],
+    [at('v3.7.2'), 'feat/x', ['refs/tags/v3.7.2'], 'refs/tags/v3.7.2'],
+    [at('0123456789abcdef0123456789abcdef01234567'), 'feat/x', [], '0123456789abcdef0123456789abcdef01234567'],
+    [at(undefined), 'feat/x', [], 'HEAD'],
+  ];
+  for (const [docs, head, has, want] of cases) {
     const calls = [];
-    const git = async (args) => { calls.push(args); if (args[0] === 'ls-remote') return has ? 'abc\trefs/heads/x' : ''; return args[0] === 'rev-parse' ? '1234567890' : ''; };
+    const git = async (args) => { calls.push(args); if (args[0] === 'ls-remote') return has.filter((h) => args.slice(2).includes(h)).map((h) => `abc\t${h}`).join('\n'); return args[0] === 'rev-parse' ? '1234567890' : ''; };
     const r = await shipSibling({ git, siblingRepo: 'Acme/free', headRef: head, docs, auth: null });
-    assert.equal(r.ref, want, head);
-    assert.ok(calls.some((c) => c[0] === 'fetch' && c.includes(`+refs/heads/${want}:refs/miu-ci/sibling-${Buffer.from(want).toString('hex')}`)));
+    assert.ok(calls.some((c) => c[0] === 'fetch' && c.includes(`+${want}:refs/miu-ci/sibling-${Buffer.from(want).toString('hex')}`)), `${JSON.stringify(docs[0].jobs.a.steps[0].with.ref)} -> ${want}: ${JSON.stringify(calls)}`);
     assert.deepEqual(r.extra.map((x) => x.path), ['free']);
   }
-  assert.equal(await shipSibling({ git: async () => '', siblingRepo: 'Acme/other', headRef: 'dev', docs, auth: null }), null);
+  const none = async (args) => (args[0] === 'ls-remote' ? '' : '');
+  await assert.rejects(shipSibling({ git: none, siblingRepo: 'Acme/free', headRef: 'dev', docs: at('release/9'), auth: null }), /no branch or tag release\/9/);
+  const two = [{ jobs: { a: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: 'free', ref: 'a' } }] }, b: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: 'free', ref: 'b' } }] } } }];
+  await assert.rejects(shipSibling({ git: none, siblingRepo: 'Acme/free', headRef: 'dev', docs: two, auth: null }), /ask for different refs/);
+  assert.equal(await shipSibling({ git: none, siblingRepo: 'Acme/other', headRef: 'dev', docs: at('main'), auth: null }), null);
 });

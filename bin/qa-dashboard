@@ -615,7 +615,8 @@ async function prepareNow(repo, pr, sha) {
   const names = (await gitAsync(['-C', bare, 'ls-tree', '--name-only', tip, '.github/workflows/']).catch(() => '')).split('\n').filter((f) => /^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(f)).slice(0, 50);
   const workflows = [];
   for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${tip}:${f}`])).slice(0, 512 * 1024) });
-  const sibling = await siblingSource(repo, bare, p.headRefName, workflows).catch((e) => { console.log(`ci ${repo}#${pr}: the sibling's source is not shipped: ${e.message}`); return null; });
+  // Without the sibling the run would use whatever the pull request has at that path: tried again later instead.
+  const sibling = await siblingSource(repo, bare, p.headRefName, workflows).catch((e) => { throw new Error(`could not fetch the sibling repository's source: ${e.message}`); });
   const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, tip, `Miu CI: ${sha.slice(0, 12)} with the workflows of ${workflowsFrom}${sibling ? `, ${sibling.from} beside it` : ''}`, sibling?.extra ?? []);
   // Kept under a ref so a gc of the clone does not take it while it waits.
   const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
