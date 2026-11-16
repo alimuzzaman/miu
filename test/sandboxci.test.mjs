@@ -494,7 +494,7 @@ test('private Composer and npm dependencies on GitHub', () => {
 });
 
 test('a run gets one token for the pull request\'s repo and every one it reaches, on a pipe and never on a command line', needsYaml, async () => {
-  const sandbox = sandboxHome({ stdout: `{"ok":true,"cells":[{"label":"a","status":"passed","exit_code":0,"output":"token ${TOKEN} basic ${Buffer.from(`x-access-token:${TOKEN}`).toString('base64')}\\n[t/a]   🏁  Job succeeded"}]}` });
+  const sandbox = sandboxHome({ stdout: `{"ok":true,"cells":[{"label":"a","status":"passed","exit_code":0,"output":"token ${TOKEN} basic ${Buffer.from(`x-access-token:${TOKEN}`).toString('base64')}\\n[t/a]   🏁  Job succeeded"}]}`, plan: '{"jobs":[{"id":"php","cells":[{"matrix":{}}]}]}' });
   const s = server({ home: sandbox.home });
   const app = fakeApp();
   const { dir, base } = proRepo();
