@@ -553,7 +553,7 @@ test('no access to a repository it needs: not run, and says which', needsYaml, a
   const sandbox = sandboxHome();
   const { dir, base } = proRepo();
   const r = await runSandboxCi(proCheck, dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', trustedRef: base, ...fakeApp({ missing: ['Acme/licensing'] }) });
-  assert.deepEqual(r, { notRun: 'no access to Acme/licensing: install the Miu GitHub App there, or give this server a deploy key for it (docs/install.md)' });
+  assert.deepEqual(r, { notRun: 'no access to Acme/licensing: install the Miu GitHub App there, or give this server a deploy key for it (docs/install.md; a deploy key serves Composer, npm and git, not actions/checkout)' });
   assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
   const failed = await runSandboxCi(proCheck, dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', trustedRef: base, mint: async () => { throw new Error('GitHub: HTTP 500'); }, revoke: async () => {} });
   assert.match(failed.notRun, /^could not get access to Acme\/free, Acme\/pro/);
@@ -760,6 +760,7 @@ function keyedServer() {
 project="$6"; cat > /dev/null
 cp "$project/.env" "${home}/env" 2>/dev/null || true
 git -C "$project" status --porcelain > "${home}/status"
+git -C "$project" ls-files | grep -c '^.miu-ci/' > "${home}/committed-copy"
 ( set -a; . "$project/.env"; set +a; env -u GIT_SSH_COMMAND git clone -q git@github.com:Acme/licensing.git "${home}/cloned" && git -C "${home}/cloned" rev-parse HEAD > "${home}/cloned-sha" ) 2> "${home}/clone-err"
 { grep -rlF -- "$(sed -n 2p "${key}")" "$project" ; grep -rlF -- "${key}" "$project"; } > "${home}/key-seen" 2>/dev/null
 git -C "$project/.miu-ci/mirrors/acme/licensing.git" remote > "${home}/copy-remotes" 2>&1
@@ -771,7 +772,12 @@ echo '{"ok":true,"cells":[{"label":"a","status":"passed","exit_code":0,"output":
   fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), OK);
   // Asked in another spelling than the list's, as a composer.json may write it.
   const run = (head = 'miu-ci-secrets 0 mirrors=acme/LICENSING\n', files = {}) => {
-    for (const [n, t] of Object.entries(files)) fs.writeFileSync(path.join(src, n), t);
+    for (const [n, t] of Object.entries(files)) {
+      fs.rmSync(path.join(src, n), { recursive: true, force: true });
+      if (t && typeof t === 'object' && t.link) fs.symlinkSync(t.link, path.join(src, n));
+      else if (t && typeof t === 'object' && t.fifo) spawnSync('mkfifo', [path.join(src, n)]);
+      else if (t !== null) fs.writeFileSync(path.join(src, n), t);
+    }
     for (const f of ['cloned', 'cloned-sha', 'env']) fs.rmSync(path.join(home, f), { recursive: true, force: true });
     const tar = spawnSync('tar', ['-c', '-C', src, '.']).stdout;
     return spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from(head), tar]), env, encoding: 'utf8' });
@@ -801,7 +807,7 @@ test('the worker fetches a deploy-key repo into its mirror and the job reads a c
   fs.renameSync(k.origin, `${k.origin}.away`);
   const stale = k.run();
   assert.equal(stale.status, 0, stale.stderr);
-  assert.match(stale.stderr, /could not fetch Acme\/licensing with its deploy key; the job reads the copy from/);
+  assert.match(stale.stderr, /^sandbox-ci: note: could not fetch Acme\/licensing with its deploy key; the job read the copy from/m);
   assert.equal(k.read('cloned-sha'), second);
   fs.renameSync(`${k.origin}.away`, k.origin);
 });
@@ -846,4 +852,49 @@ test('the worker revokes only an installation token, not the stand-in', () => {
   const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from(`miu-ci-secrets 1\nGITHUB_TOKEN=${NO_TOKEN}\n`), tar]), env: s.env, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(s.curl('argv'), '');
+});
+
+test('review fixes: a planted .miu-ci, an odd .env, a .gitignore, a list line without a fingerprint, an old copy', needsYaml, () => {
+  const k = keyedServer();
+  k.commit('one');
+  // A .miu-ci link in the tar is dropped: nothing is written where it points.
+  const outside = fs.mkdtempSync(path.join(tmp, 'outside-'));
+  const linked = k.run(undefined, { '.miu-ci': { link: outside } });
+  assert.equal(linked.status, 0, linked.stderr);
+  assert.deepEqual(fs.readdirSync(outside), []);
+  assert.ok(k.read('cloned-sha'));
+  // A .gitignore cannot pull the copy into the pull request's commit.
+  const ignored = k.run(undefined, { '.miu-ci': null, '.gitignore': '!/.miu-ci/\n' });
+  assert.equal(ignored.status, 0, ignored.stderr);
+  assert.equal(k.read('committed-copy'), '0');
+  const refused = (files, why) => {
+    const r = k.run(undefined, files);
+    assert.equal(r.status, 2, r.stderr);
+    assert.match(r.stderr, why);
+  };
+  refused({ '.gitignore': null, '.env': { fifo: true } }, /refused: \.env is not a plain file/);
+  refused({ '.env': 'A="open\n' }, /refused: the base branch's .env has an unclosed double quote/);
+  // A harmless GIT_CONFIG_ name is fine.
+  assert.equal(k.run(undefined, { '.env': 'GIT_CONFIG_NOSYSTEM=1\n' }).status, 0);
+  fs.rmSync(path.join(k.src, '.env'));
+  // The list: a last line without a newline counts; one without a fingerprint does not.
+  const text = fs.readFileSync(k.conf, 'utf8');
+  fs.writeFileSync(k.conf, text.replace(/\n$/, ''));
+  assert.equal(k.run().status, 0);
+  fs.writeFileSync(k.conf, text.replace(/ SHA256:\S+/, ''));
+  refused({}, /gives no SHA256 fingerprint for Acme\/licensing/);
+  fs.writeFileSync(k.conf, text);
+  // GitHub unreachable and the copy older than a day: not run.
+  fs.renameSync(k.origin, `${k.origin}.away`);
+  spawnSync('touch', ['-d', '2 days ago', path.join(k.home, 'mirrors/acme/licensing.git')]);
+  refused({}, /could not fetch Acme\/licensing with its deploy key, and the last copy is older than 24 hours/);
+  fs.renameSync(`${k.origin}.away`, k.origin);
+});
+
+test('a worker note goes at the top of a passing run\'s log', async () => {
+  const s = fakeWorker({ stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: '[t/a]   🏁  Job succeeded' }]), stderr: 'sandbox-ci: note: could not fetch Acme/lib with its deploy key; the job read the copy from 2026-11-15 10:00 UTC\nother noise\n' });
+  const r = await runSandboxCi(check, repo(), s.env);
+  assert.equal(r.status, 0);
+  assert.match(r.log, /^Note: could not fetch Acme\/lib with its deploy key; the job read the copy from 2026-11-15 10:00 UTC\n\n/);
+  assert.doesNotMatch(r.log, /other noise/);
 });

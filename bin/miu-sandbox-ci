@@ -264,6 +264,12 @@ bounded 60 rm -rf "$root/.actrc"
 for f in .env .vars .input .secrets; do
   if [ -L "$root/$f" ]; then rm -f "$root/$f"; fi
 done
+# A FIFO would block a write, a folder fail it.
+if [ -e "$root/.env" ] && [ ! -f "$root/.env" ]; then die "refused: .env is not a plain file"; fi
+# Where this script puts deploy-key copies. One from the tar (a link above all)
+# would send them, as this account, wherever it points. Nothing else can write
+# here: the folder is this account's own until the job starts.
+bounded 60 rm -rf "$root/.miu-ci"
 # act's own settings keep the Docker socket out of jobs: with the socket a job
 # could start a container that owns this server.
 mkdir "$config/act"
@@ -292,6 +298,7 @@ known_hosts=${MIU_CI_KNOWN_HOSTS:-/usr/local/lib/miu/github-known-hosts}
 mirrors_home=${MIU_CI_MIRRORS_DIR:-$HOME/.cache/miu-ci-mirrors}
 mirror_git_host=${MIU_CI_MIRROR_HOST:-git@github.com:}
 root_uid=${MIU_CI_ROOT_UID:-0}
+max_age_minutes=${MIU_CI_MIRROR_MAX_AGE_MINUTES:-1440}
 # root's own file that only root can change, and that Miu's account may read.
 owned_by_root() { [ -f "$1" ] && [ ! -L "$1" ] && [[ $(stat -c '%u %a' "$1") =~ ^$root_uid\ [0-7][0145][45]$ ]]; }
 mirror_config=()
@@ -300,13 +307,14 @@ add_mirror() { # add_mirror owner/name: fetch it with its key, copy it into the 
   [[ $repo =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ && $repo != */. && $repo != */.. ]] || die "not run: not a repository name: $repo"
   owned_by_root "$mirrors_conf" || die "not run: $mirrors_conf is missing or not root's own file, so no deploy-key repository can be read"
   key=
-  while read -r conf_repo got fp extra; do
+  while read -r conf_repo got fp extra || [ -n "$conf_repo" ]; do
     [[ -z $conf_repo || $conf_repo == \#* ]] && continue
     [ -z "$extra" ] || die "not run: a line of $mirrors_conf has more than repository, key file and fingerprint"
     # The list's spelling, for the URLs git rewrites.
     if [ "${conf_repo,,}" = "${repo,,}" ]; then key=$got repo=$conf_repo; break; fi
   done < "$mirrors_conf"
   [ -n "$key" ] || die "not run: this server has no deploy key for $repo"
+  [[ $fp =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || die "not run: $mirrors_conf gives no SHA256 fingerprint for $repo"
   # A plain path: GIT_SSH_COMMAND is read by a shell.
   [[ $key =~ ^/[A-Za-z0-9_./-]+$ && -f $key && ! -L $key ]] || die "not run: the deploy key for $repo is not a plain file"
   # This account's own key, unreadable by anyone else, and the one the list names.
@@ -328,18 +336,22 @@ fcntl.flock(8, fcntl.LOCK_EX)
     GIT_SSH_COMMAND=$ssh bounded 300 git -C "$dir" -c core.hooksPath=/dev/null fetch --quiet --prune "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' >&2 || fetched=0
   else
     rm -rf "$dir.tmp"
-    GIT_SSH_COMMAND=$ssh bounded 300 git -c core.hooksPath=/dev/null clone --quiet --bare "$url" "$dir.tmp" >&2 && git -C "$dir.tmp" remote remove origin && mv "$dir.tmp" "$dir" || fetched=0
+    GIT_SSH_COMMAND=$ssh bounded 300 git -c core.hooksPath=/dev/null clone --quiet --bare "$url" "$dir.tmp" >&2 && git -C "$dir.tmp" -c core.hooksPath=/dev/null remote remove origin && mv "$dir.tmp" "$dir" || fetched=0
   fi
   if [ "$fetched" = 0 ]; then
     [ -d "$dir/objects" ] || die "not run: could not fetch $repo with its deploy key"
-    echo "sandbox-ci: could not fetch $repo with its deploy key; the job reads the copy from $(stat -c %y "$dir" | cut -c1-16)" >&2
+    # A key removed on GitHub must end access soon, and a run must not pass
+    # against old code for long.
+    [ -n "$(find "$dir" -maxdepth 0 -mmin "-$max_age_minutes")" ] || die "not run: could not fetch $repo with its deploy key, and the last copy is older than $((max_age_minutes / 60)) hours"
+    # Miu puts this line at the top of the run's log.
+    echo "sandbox-ci: note: could not fetch $repo with its deploy key; the job read the copy from $(stat -c %y "$dir" | cut -c1-16) UTC" >&2
   else
     touch "$dir"
   fi
   copy=$root/.miu-ci/mirrors/${repo,,}.git
   mkdir -p "${copy%/*}"
   bounded 300 git -c core.hooksPath=/dev/null clone --quiet --bare --no-hardlinks "file://$dir" "$copy" >&2 || die "not run: could not copy the $repo mirror into the job"
-  git -C "$copy" remote remove origin
+  git -C "$copy" -c core.hooksPath=/dev/null remote remove origin
   exec 8>&-
   # The job's git reads the copy for the repository's GitHub URLs. The job runs as
   # root in its container, and the copy is this account's, hence safe.directory.
@@ -363,8 +375,12 @@ if [ -n "$mirror_list" ]; then
   # act gives the job the variables in .env (the base branch's own, which Miu
   # put in the run commit). Git config through the environment adds to the
   # job's own config instead of replacing it.
-  if [ -f "$root/.env" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?GIT_CONFIG_' "$root/.env"; then
-    die "refused: the base branch's .env sets GIT_CONFIG_ variables, which Miu needs for a deploy-key repository"
+  if [ -f "$root/.env" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?GIT_CONFIG_(COUNT|KEY_|VALUE_|PARAMETERS)' "$root/.env"; then
+    die "refused: the base branch's .env sets GIT_CONFIG_COUNT, _KEY_ or _VALUE_ variables, which Miu needs for a deploy-key repository"
+  fi
+  # act reads a quoted value across lines, so an open quote would take in the lines added here.
+  if [ -f "$root/.env" ] && [ $(( $(tr -cd '"' < "$root/.env" | wc -c) % 2 )) -ne 0 ]; then
+    die "refused: the base branch's .env has an unclosed double quote"
   fi
   [ ! -s "$root/.env" ] || [ -z "$(tail -c1 "$root/.env")" ] || echo >> "$root/.env"
   {
@@ -376,7 +392,7 @@ if [ -n "$mirror_list" ]; then
   } >> "$root/.env"
 fi
 
-quiet_git add -A
+quiet_git add -A -- . ':(exclude,top).miu-ci'
 quiet_git commit -q --no-verify --no-gpg-sign --allow-empty -m "pull request"
 
 # One job and one matrix combination, so one act process. A job can write to the
