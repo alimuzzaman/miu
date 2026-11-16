@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos, deployKeyRepos, lockWithoutDists } from '../lib/sandboxci.mjs';
-import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling } from '../lib/ci.mjs';
+import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling, runningJobs } from '../lib/ci.mjs';
 
 const WORKER = fileURLToPath(new URL('../bin/miu-sandbox-ci', import.meta.url));
 const MIRROR = fileURLToPath(new URL('../bin/miu-ci-mirror', import.meta.url));
@@ -991,4 +991,34 @@ test('the deploy-key copy is made before any token: a helper that fails leaves n
   assert.deepEqual(r, { notRun: 'not run: this server has no deploy key for Acme/licensing' });
   assert.deepEqual(app.calls.mint, []);
   assert.equal(s.head(), '');
+});
+
+// xspeed-pro #246: ci.yml checks Free out at xspeed-free with the freeref
+// expression; deploy.yml, a release workflow Miu never runs, at main.
+test('only the jobs a run runs pick the sibling\'s ref: a release workflow\'s own checkout does not conflict', async () => {
+  const free = (ref) => ({ name: 'Check out Free (xspeed) as sibling', uses: 'actions/checkout@v4', with: { repository: 'Acme/free', ref, token: '${{ secrets.FREE_REPO_TOKEN || github.token }}', path: 'xspeed-free' } });
+  const job = (ref, extra = {}) => ({ 'runs-on': 'ubuntu-22.04', steps: [{ uses: 'actions/checkout@v4' }, { id: 'freeref', run: 'echo ref=main >> "$GITHUB_OUTPUT"' }, free(ref), { run: 'composer install' }], ...extra });
+  const workflows = [
+    { path: '.github/workflows/ci.yml', doc: { on: { workflow_dispatch: {}, workflow_call: {}, pull_request: {} }, jobs: { php: job('${{ steps.freeref.outputs.ref }}'), js: job('${{ steps.freeref.outputs.ref }}') } } },
+    { path: '.github/workflows/deploy.yml', doc: { on: { push: { tags: ['*'] } }, jobs: { build: job('main') } } },
+  ];
+  const fetched = [];
+  const git = async (args) => { if (args[0] === 'fetch') fetched.push(args.at(-1)); if (args[0] === 'ls-remote') return ''; return args[0] === 'rev-parse' ? '1234567890' : ''; };
+  const ship = (running) => shipSibling({ git, siblingRepo: 'Acme/free', headRef: 'feat/guided-setup-pro-plan-items-return', docs: workflows.map((w) => w.doc), names: workflows.map((w) => w.path), keep: (i, id) => running.has(`${i}:${id}`), auth: null });
+  // With the profile's pr_ci (Pro lists ci.yml's php and js), and with the default rule.
+  for (const list of [[{ workflow: '.github/workflows/ci.yml', jobs: ['php', 'js'] }], undefined]) {
+    const running = runningJobs(workflows, { list, base: 'dev', changed: ['a.php'] });
+    assert.deepEqual([...running].sort(), ['0:js', '0:php']);
+    fetched.length = 0;
+    const r = await ship(running);
+    assert.deepEqual(r.extra.map((x) => x.path), ['xspeed-free']);
+    assert.match(fetched[0], /^\+refs\/heads\/main:refs\/miu-ci\/sibling-/);
+  }
+  // Two jobs that do run and truly disagree: refused, naming both.
+  const clash = [{ path: '.github/workflows/ci.yml', doc: { on: { pull_request: {} }, jobs: { php: job('${{ steps.freeref.outputs.ref }}'), lint: job('release/2.1') } } }];
+  const running = runningJobs(clash, {});
+  await assert.rejects(shipSibling({ git, siblingRepo: 'Acme/free', headRef: 'x', docs: clash.map((w) => w.doc), names: clash.map((w) => w.path), keep: (i, id) => running.has(`${i}:${id}`), auth: null }),
+    /two jobs this run runs check Acme\/free out at xspeed-free at different refs: ci\.yml job (php|lint) asks for (an expression|release\/2\.1), ci\.yml job (php|lint) for (an expression|release\/2\.1)/);
+  // A job a running job needs counts too.
+  assert.deepEqual([...runningJobs([{ path: '.github/workflows/ci.yml', doc: { on: { pull_request: {} }, jobs: { setup: job('main'), test: { ...job('main'), needs: 'setup' } } } }], {})].sort(), ['0:setup', '0:test']);
 });

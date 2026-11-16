@@ -37,7 +37,7 @@ import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, 
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
-import { createCi, ciRunCommit, shipSibling, parseWorkflows } from '../lib/ci.mjs';
+import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem } from '../lib/ci.mjs';
 import { runSandboxCi, changesCiDefinition } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
 
@@ -616,7 +616,7 @@ async function prepareNow(repo, pr, sha) {
   const workflows = [];
   for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${tip}:${f}`])).slice(0, 512 * 1024) });
   // Without the sibling the run would use whatever the pull request has at that path: tried again later instead.
-  const sibling = await siblingSource(repo, bare, p.headRefName, workflows).catch((e) => { throw new Error(`could not fetch the sibling repository's source: ${e.message}`); });
+  const sibling = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw new Error(`could not fetch the sibling repository's source: ${e.message}`); });
   const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, tip, `Miu CI: ${sha.slice(0, 12)} with the workflows of ${workflowsFrom}${sibling ? `, ${sibling.from} beside it` : ''}`, sibling?.extra ?? []);
   // Kept under a ref so a gc of the clone does not take it while it waits.
   const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
@@ -624,11 +624,15 @@ async function prepareNow(repo, pr, sha) {
   return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, workflowsFrom, siblingFrom: sibling?.from ?? null, changesCi: false, base, changed };
 }
 // The profile's sibling (Free beside Pro), shipped in the run commit (lib/ci.mjs shipSibling).
-async function siblingSource(repo, bare, headRef, workflows) {
-  const sib = profiles().find((x) => x.repo === repo)?.sibling;
+// Only the jobs this run runs count (runningJobs): a release workflow's own
+// checkout of the sibling, at another ref, is not this run's.
+async function siblingSource(repo, bare, headRef, workflows, { base, changed }) {
+  const profile = profiles().find((x) => x.repo === repo);
+  const sib = profile?.sibling;
   if (!sib?.repo || !gh.validRepo(sib.repo)) return null;
-  const docs = (await parseWorkflows(workflows)).map((w) => w.doc);
-  return shipSibling({ git: (args, env) => gitAsync(['-C', bare, ...args], env), siblingRepo: sib.repo, headRef, docs, auth: await gh.gitAuthEnv(sib.repo).catch(() => null) });
+  const parsed = (await parseWorkflows(workflows)).map((w) => ({ path: w.path, doc: w.doc }));
+  const running = runningJobs(parsed, { list: prCiProblem(profile.pr_ci) ? undefined : profile.pr_ci, base, changed });
+  return shipSibling({ git: (args, env) => gitAsync(['-C', bare, ...args], env), siblingRepo: sib.repo, headRef, docs: parsed.map((w) => w.doc), names: parsed.map((w) => w.path), keep: (i, id) => running.has(`${i}:${id}`), auth: await gh.gitAuthEnv(sib.repo).catch(() => null) });
 }
 fs.mkdirSync(RUNS, { recursive: true });
 const ci = createCi({
