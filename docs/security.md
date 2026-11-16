@@ -54,6 +54,12 @@ Rules the code keeps:
   - **What the job gets.** A copy with no key and no remote, so pull request
     code can read the repository's code, as with a token for it, but never use
     the key.
+  - **QA runs too.** qa-run's dependency build (`ensureDeps` in
+    [lib/worktrees.mjs](../lib/worktrees.mjs)) gets the same bundle for a
+    listed package in `composer.lock`. Git reads a copy in a temp folder for the
+    package's GitHub URLs. Composer reads copies of `composer.json` and
+    `composer.lock`, the second without that package's dist. The worktree's
+    files are not changed, and no key or token goes into the build.
   - **Who can get a copy.** `miu` runs pull request code in fast checks, so
     anything that runs as `miu` can get a copy of a listed repository. List
     only what every repository Miu tests may read.
