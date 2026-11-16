@@ -28,10 +28,12 @@ Rules the code keeps:
 - **A CI run gets one GitHub token, and the pull request's code can read it.**
   [lib/sandboxci.mjs](../lib/sandboxci.mjs) has the App mint it per run
   (`ciRepoToken` in [lib/ghapp.mjs](../lib/ghapp.mjs)): `contents: read` only,
-  for the pull request's repository and the ones the workflow reaches (read
-  from the base branch's workflow, `composer.json` and `package.json`, never the
-  pull request's, so a pull request cannot widen it), GitHub's one-hour
-  expiry, never cached, revoked when the run ends. It goes to the worker on
+  for the repositories the workflow reaches (read from the base branch's
+  workflow, `composer.json` and `package.json`, never the pull request's, so a
+  pull request cannot widen it; one that needs more is not run), GitHub's
+  one-hour expiry, never cached, revoked when the run ends by Miu and by the
+  worker. A run that reaches nothing gets none: the profile's sibling is
+  shipped in the tar instead. It goes to the worker on
   stdin and to Sandbox on a pipe: never in an argument, the environment of a
   Miu process, a file Miu keeps, or the tar. Miu removes it, and its base64
   forms, from the CI log. Forks and Dependabot get no run, so no token.
