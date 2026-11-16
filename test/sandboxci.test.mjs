@@ -553,7 +553,7 @@ test('no access to a repository it needs: not run, and says which', needsYaml, a
   const sandbox = sandboxHome();
   const { dir, base } = proRepo();
   const r = await runSandboxCi(proCheck, dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', trustedRef: base, ...fakeApp({ missing: ['Acme/licensing'] }) });
-  assert.deepEqual(r, { notRun: 'no access to Acme/licensing: install the Miu GitHub App there' });
+  assert.deepEqual(r, { notRun: 'no access to Acme/licensing: install the Miu GitHub App there, or give this server a deploy key for it (docs/install.md)' });
   assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
   const failed = await runSandboxCi(proCheck, dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', trustedRef: base, mint: async () => { throw new Error('GitHub: HTTP 500'); }, revoke: async () => {} });
   assert.match(failed.notRun, /^could not get access to Acme\/free, Acme\/pro/);
@@ -751,7 +751,7 @@ function keyedServer() {
   const fp = spawnSync('ssh-keygen', ['-lf', key, '-E', 'sha256'], { encoding: 'utf8' }).stdout.split(' ')[1];
   const conf = path.join(root, 'ci-mirrors');
   const hosts = path.join(root, 'known_hosts');
-  fs.writeFileSync(conf, `# repository key fingerprint\nacme/licensing ${key} ${fp}\n`, { mode: 0o644 });
+  fs.writeFileSync(conf, `# repository key fingerprint\nAcme/licensing ${key} ${fp}\n`, { mode: 0o644 });
   fs.writeFileSync(hosts, 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n', { mode: 0o644 });
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const sb = path.join(home, 'sandbox/sb-src/sb');
@@ -769,7 +769,8 @@ echo '{"ok":true,"cells":[{"label":"a","status":"passed","exit_code":0,"output":
   const src = fs.mkdtempSync(path.join(tmp, 'src-'));
   fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
   fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), OK);
-  const run = (head = 'miu-ci-secrets 0 mirrors=Acme/licensing\n', files = {}) => {
+  // Asked in another spelling than the list's, as a composer.json may write it.
+  const run = (head = 'miu-ci-secrets 0 mirrors=acme/LICENSING\n', files = {}) => {
     for (const [n, t] of Object.entries(files)) fs.writeFileSync(path.join(src, n), t);
     for (const f of ['cloned', 'cloned-sha', 'env']) fs.rmSync(path.join(home, f), { recursive: true, force: true });
     const tar = spawnSync('tar', ['-c', '-C', src, '.']).stdout;
@@ -787,8 +788,8 @@ test('the worker fetches a deploy-key repo into its mirror and the job reads a c
   assert.equal(k.read('cloned-sha'), first, k.read('clone-err'));
   // The list's spelling and the asked one (insteadOf is case-sensitive), and safe.directory.
   assert.match(k.read('env'), /^GIT_CONFIG_COUNT=7$/m);
-  assert.match(k.read('env'), /^GIT_CONFIG_VALUE_0=git@github\.com:acme\/licensing\.git$/m);
-  assert.match(k.read('env'), /^GIT_CONFIG_VALUE_3=git@github\.com:Acme\/licensing\.git$/m);
+  assert.match(k.read('env'), /^GIT_CONFIG_VALUE_0=git@github\.com:Acme\/licensing\.git$/m);
+  assert.match(k.read('env'), /^GIT_CONFIG_VALUE_3=git@github\.com:acme\/LICENSING\.git$/m);
   assert.equal(k.read('key-seen'), '', 'the key, or its path, is in the job\'s workspace');
   assert.equal(k.read('copy-remotes'), '');
   assert.equal(k.read('status'), '', 'the copy and .env show in git status');
@@ -800,7 +801,7 @@ test('the worker fetches a deploy-key repo into its mirror and the job reads a c
   fs.renameSync(k.origin, `${k.origin}.away`);
   const stale = k.run();
   assert.equal(stale.status, 0, stale.stderr);
-  assert.match(stale.stderr, /could not fetch acme\/licensing with its deploy key; the job reads the copy from/);
+  assert.match(stale.stderr, /could not fetch Acme\/licensing with its deploy key; the job reads the copy from/);
   assert.equal(k.read('cloned-sha'), second);
   fs.renameSync(`${k.origin}.away`, k.origin);
 });
