@@ -562,7 +562,8 @@ test('no access to a repository it needs: not run, and says which', needsYaml, a
 test('more GitHub-token secrets than the worker takes: not run, before any token is made', needsYaml, async () => {
   const app = fakeApp();
   const steps = Array.from({ length: 9 }, (_, i) => `      - run: echo "\${{ secrets.T${i} || github.token }}"`).join('\n');
-  const r = await runSandboxCi(check, repo({ '.github/workflows/test.yml': `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { repository: Acme/free }\n${steps}\n` }), server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
+  const dir = repo({ '.github/workflows/test.yml': `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { repository: Acme/free }\n${steps}\n` });
+  const r = await runSandboxCi(check, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', trustedRef: git(dir, 'rev-parse', 'HEAD').stdout.trim(), mint: app.mint, revoke: app.revoke });
   assert.match(r.notRun, /uses 9 secrets as a GitHub token; Miu gives at most 8/);
   assert.deepEqual(app.calls.mint, []);
 });
