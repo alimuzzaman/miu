@@ -742,7 +742,7 @@ function keyedServer() {
   const root = fs.mkdtempSync(path.join(tmp, 'keyed-'));
   const origin = path.join(root, 'gh/Acme/licensing.git');
   const work = path.join(root, 'work');
-  spawnSync('git', ['init', '-q', '--bare', origin]);
+  spawnSync('git', ['init', '-q', '--bare', '--initial-branch=main', origin]);
   spawnSync('git', ['init', '-q', work]);
   const commit = (msg) => { fs.writeFileSync(path.join(work, 'f.txt'), msg); git(work, 'add', '-A'); git(work, 'commit', '-qm', msg); git(work, 'push', '-q', origin, 'HEAD:refs/heads/main'); return git(work, 'rev-parse', 'HEAD').stdout.trim(); };
   const key = path.join(root, 'id_deploy');
