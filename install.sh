@@ -311,6 +311,30 @@ EOF
   chmod 0440 /etc/sudoers.d/miu-sandbox-ci.tmp && mv /etc/sudoers.d/miu-sandbox-ci.tmp /etc/sudoers.d/miu-sandbox-ci
   setenv MIU_SANDBOX_USER "$SANDBOX_USER"
   setenv MIU_SANDBOX_WORKER "$LIB/sandbox-ci"
+  # Repositories CI reads with a deploy key ($ETC/ci-mirrors: repository, key
+  # file, fingerprint). bin/miu-ci-mirror fetches them as its own account, which
+  # holds nothing but those keys and its mirrors, never as $SANDBOX_USER. Each
+  # sudo rule names one listed repository exactly; run this again after
+  # changing the list. Put each key in /var/lib/miu-mirror/keys, owned by
+  # miu-mirror, mode 600.
+  MIRROR_USER=miu-mirror
+  id "$MIRROR_USER" >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/miu-mirror --shell /usr/sbin/nologin "$MIRROR_USER"
+  install -d -o "$MIRROR_USER" -g "$MIRROR_USER" -m 0700 /var/lib/miu-mirror /var/lib/miu-mirror/keys /var/lib/miu-mirror/mirrors
+  install -o root -g root -m 0755 "$APP/bin/miu-ci-mirror" "$LIB/ci-mirror"
+  {
+    echo "# $MIU_USER may fetch each repository $ETC/ci-mirrors lists, as $MIRROR_USER, and nothing else."
+    if [ -f "$ETC/ci-mirrors" ]; then
+      while read -r r _ || [ -n "$r" ]; do
+        [[ -z $r || $r == \#* ]] && continue
+        [[ $r =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ ]] || die "$ETC/ci-mirrors: not a repository name: $r"
+        echo "$MIU_USER ALL=($MIRROR_USER) NOPASSWD: $LIB/ci-mirror $r"
+      done < "$ETC/ci-mirrors"
+    fi
+  } > /etc/sudoers.d/miu-ci-mirror.tmp
+  visudo -cqf /etc/sudoers.d/miu-ci-mirror.tmp || die "the deploy-key sudoers rules did not validate"
+  chmod 0440 /etc/sudoers.d/miu-ci-mirror.tmp && mv /etc/sudoers.d/miu-ci-mirror.tmp /etc/sudoers.d/miu-ci-mirror
+  setenv MIU_CI_MIRROR_USER "$MIRROR_USER"
+  setenv MIU_CI_MIRROR_HELPER "$LIB/ci-mirror"
   # Sandbox runs act with --pull=false, so the runner image has to be here already.
   sudo -u "$SANDBOX_USER" -H docker pull -q catthehacker/ubuntu:act-22.04 >/dev/null || say "Could not pull the CI runner image as $SANDBOX_USER; CI workflows will fail until it is there."
   sudo -u "$SANDBOX_USER" -H sh -c 'command -v act' >/dev/null || say "act is not installed for $SANDBOX_USER; CI workflows will report \"not run\" until it is."

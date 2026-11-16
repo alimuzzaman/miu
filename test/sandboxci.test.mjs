@@ -5,10 +5,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos, deployKeyRepos } from '../lib/sandboxci.mjs';
+import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos, deployKeyRepos, lockWithoutDists } from '../lib/sandboxci.mjs';
 import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling } from '../lib/ci.mjs';
 
 const WORKER = fileURLToPath(new URL('../bin/miu-sandbox-ci', import.meta.url));
+const MIRROR = fileURLToPath(new URL('../bin/miu-ci-mirror', import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-sandboxci-'));
 const check = { label: 'CI', sandbox_ci: { workflow: '.github/workflows/test.yml', job: 'a' } };
 // The worker's workflow policy needs PyYAML, which the installer adds on a server.
@@ -35,7 +36,7 @@ function repo(extra = {}) {
 // runs the worker, the same as the rule install.sh writes.
 function server({ worker, home, docker = 'exit 0' }) {
   const bin = fs.mkdtempSync(path.join(tmp, 'bin-'));
-  script(path.join(bin, 'sudo'), `printf '%s\\n' "$@" > "${bin}/sudo-argv"\nshift 4\nexec "$@"`);
+  script(path.join(bin, 'sudo'), `printf '%s\\n' "$@" > "${bin}/sudo-argv"\necho "$*" >> "${bin}/sudo-all"\nshift 4\nexec "$@"`);
   script(path.join(bin, 'timeout'), 'shift 3\nexec "$@"');
   script(path.join(bin, 'docker'), docker);
   script(path.join(bin, 'curl'), `cat >> "${bin}/curl-stdin"\nprintf '%s\\n' "$@" >> "${bin}/curl-argv"`);
@@ -43,6 +44,7 @@ function server({ worker, home, docker = 'exit 0' }) {
   return {
     env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '8', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-deploy-keys') },
     sudoArgv: () => fs.readFileSync(path.join(bin, 'sudo-argv'), 'utf8').trim().split('\n'),
+    sudoAll: () => fs.readFileSync(path.join(bin, 'sudo-all'), 'utf8').trim().split('\n'),
     curl: (f) => { try { return fs.readFileSync(path.join(bin, `curl-${f}`), 'utf8'); } catch { return ''; } },
   };
 }
@@ -736,9 +738,9 @@ test('without a deploy key, a repo the App cannot reach is still not run, and sa
   assert.match(r.notRun, /^no access to Acme\/licensing: install the Miu GitHub App there, or give this server a deploy key for it/);
 });
 
-// The worker side: a local "GitHub", a real key, and an sb that clones the
-// repository's GitHub URL from inside the job's environment, as Composer would.
-function keyedServer() {
+// A local "GitHub" with the repository, a real key, root's list (owned by
+// this test's account, which stands in for root), and the helper's folders.
+function keyed() {
   const root = fs.mkdtempSync(path.join(tmp, 'keyed-'));
   const origin = path.join(root, 'gh/Acme/licensing.git');
   const work = path.join(root, 'work');
@@ -752,95 +754,181 @@ function keyedServer() {
   const conf = path.join(root, 'ci-mirrors');
   const hosts = path.join(root, 'known_hosts');
   fs.writeFileSync(conf, `# repository key fingerprint\nAcme/licensing ${key} ${fp}\n`, { mode: 0o644 });
-  fs.writeFileSync(hosts, 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n', { mode: 0o644 });
+  fs.writeFileSync(hosts, fs.readFileSync(new URL('../lib/github-known-hosts', import.meta.url)), { mode: 0o644 });
+  const mirrors = path.join(root, 'mirrors');
+  const knobs = { MIU_CI_MIRRORS_CONF: conf, MIU_CI_KNOWN_HOSTS: hosts, MIU_CI_MIRROR_HOST: `file://${root}/gh/`, MIU_CI_MIRRORS_DIR: mirrors, MIU_CI_ROOT_UID: String(process.getuid()) };
+  const env = { ...process.env, ...knobs };
+  const helper = (repo = 'Acme/licensing') => spawnSync(MIRROR, [repo], { env, maxBuffer: 64 * 1024 * 1024 });
+  // The bundle the helper wrote, opened: the commit main is at.
+  const tip = (out) => { const b = path.join(fs.mkdtempSync(path.join(tmp, 'b-')), 'r.bundle'); fs.writeFileSync(b, out); return spawnSync('git', ['bundle', 'list-heads', b], { encoding: 'utf8' }).stdout.split('\n').find((l) => l.endsWith(' refs/heads/main'))?.split(' ')[0]; };
+  return { root, origin, commit, key, fp, conf, hosts, mirrors, env, knobs, helper, tip };
+}
+
+test('the mirror helper fetches with the deploy key into its own mirror and writes a bundle; GitHub down, it uses a copy up to a day old', () => {
+  const k = keyed();
+  const first = k.commit('one');
+  let r = k.helper();
+  assert.equal(r.status, 0, String(r.stderr));
+  assert.equal(k.tip(r.stdout), first);
+  assert.ok(fs.existsSync(path.join(k.mirrors, 'acme/licensing.git/objects')));
+  const second = k.commit('two');
+  r = k.helper('acme/LICENSING');
+  assert.equal(k.tip(r.stdout), second);
+  assert.doesNotMatch(String(r.stdout) + String(r.stderr), new RegExp(fs.readFileSync(k.key, 'utf8').split('\n')[1].replace(/[+/]/g, '.')));
+  fs.renameSync(k.origin, `${k.origin}.away`);
+  r = k.helper();
+  assert.equal(r.status, 0, String(r.stderr));
+  assert.equal(k.tip(r.stdout), second);
+  assert.match(String(r.stderr), /^ci-mirror: note: could not fetch Acme\/licensing with its deploy key; the job read the copy from .* UTC$/m);
+  spawnSync('touch', ['-d', '2 days ago', path.join(k.mirrors, 'acme/licensing.git')]);
+  r = k.helper();
+  assert.equal(r.status, 2);
+  assert.match(String(r.stderr), /older than 24 hours/);
+  assert.equal(r.stdout.length, 0);
+});
+
+test('the mirror helper refuses unless root\'s list, the key and its fingerprint all check out', () => {
+  const k = keyed();
+  k.commit('one');
+  const refused = (why, setup, undo, repo) => {
+    setup?.();
+    try {
+      const r = k.helper(repo);
+      assert.equal(r.status, 2, `${why}: ${r.stderr}`);
+      assert.match(String(r.stderr), why);
+      assert.equal(r.stdout.length, 0);
+    } finally { undo?.(); }
+  };
+  const text = fs.readFileSync(k.conf, 'utf8');
+  const set = (t) => () => fs.writeFileSync(k.conf, t), back = () => fs.writeFileSync(k.conf, text);
+  refused(/no deploy key for Acme\/other/, null, null, 'Acme/other');
+  for (const bad of ['Acme/..', 'Acme/-x', '../x', 'a b']) refused(/not a repository name/, null, null, bad);
+  refused(/not root's own file/, () => fs.chmodSync(k.conf, 0o664), () => fs.chmodSync(k.conf, 0o644));
+  refused(/not root's own file/, () => { k.env.MIU_CI_ROOT_UID = '0'; }, () => { k.env.MIU_CI_ROOT_UID = String(process.getuid()); });
+  refused(/must be this account's own, mode 600 or 400/, () => fs.chmodSync(k.key, 0o640), () => fs.chmodSync(k.key, 0o600));
+  refused(/is not the one .* names/, set(text.replace(/SHA256:\S+/, `SHA256:${'A'.repeat(43)}`)), back);
+  refused(/gives no SHA256 fingerprint/, set(text.replace(/ SHA256:\S+/, '')), back);
+  refused(/more than repository, key file and fingerprint/, set(text.replace(/\n$/, ' extra\n')), back);
+  refused(/no root-owned GitHub host key file/, () => fs.chmodSync(k.hosts, 0o666), () => fs.chmodSync(k.hosts, 0o644));
+  refused(/could not fetch Acme\/licensing with its deploy key$/m, () => fs.renameSync(k.origin, `${k.origin}.away`), () => fs.renameSync(`${k.origin}.away`, k.origin));
+  // A last line without a newline counts.
+  fs.writeFileSync(k.conf, text.replace(/\n$/, ''));
+  assert.equal(k.helper().status, 0);
+});
+
+test('composer.lock loses the dist of a deploy-key package only', () => {
+  const pkg = (name, url) => ({ name, version: 'dev-main', source: { type: 'git', url, reference: 'abc' }, dist: { type: 'zip', url: `https://api.github.com/repos/${name}/zipball/abc` } });
+  const lock = { 'content-hash': 'h', packages: [pkg('acme/licensing', 'git@github.com:ACME/licensing.git'), pkg('acme/other', 'https://github.com/Acme/other.git')], 'packages-dev': [pkg('acme/lic-dev', 'https://github.com/acme/licensing')] };
+  const out = JSON.parse(lockWithoutDists(JSON.stringify(lock), ['Acme/licensing']));
+  assert.equal(out.packages[0].dist, undefined);
+  assert.deepEqual(out.packages[0].source, lock.packages[0].source);
+  assert.deepEqual(out.packages[1].dist, lock.packages[1].dist);
+  assert.equal(out['packages-dev'][0].dist, undefined);
+  assert.equal(out['content-hash'], 'h');
+  assert.equal(lockWithoutDists(JSON.stringify(lock), ['Acme/none']), null);
+  assert.equal(lockWithoutDists('{not json', ['Acme/licensing']), null);
+});
+
+// The whole way: Miu asks the helper (through sudo, as its own account), puts
+// the copy and the lock change in the tar, the worker gives the job its git
+// config, and an sb stand-in clones the GitHub URL from inside the job's
+// environment, as Composer would.
+function keyedRun() {
+  const k = keyed();
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
-  script(sb, `if [ "$2" = plan ]; then echo '{"jobs":[{"id":"a","cells":[{"matrix":{}}]}]}'; exit 0; fi
+  script(sb, `if [ "$2" = plan ]; then echo '{"jobs":[{"id":"php","cells":[{"matrix":{}}]}]}'; exit 0; fi
 project="$6"; cat > /dev/null
 cp "$project/.env" "${home}/env" 2>/dev/null || true
+cp "$project/composer.lock" "${home}/lock" 2>/dev/null || true
 git -C "$project" status --porcelain > "${home}/status"
 git -C "$project" ls-files | grep -c '^.miu-ci/' > "${home}/committed-copy"
-cp "$project/composer.lock" "${home}/lock" 2>/dev/null || true
-( set -a; . "$project/.env"; set +a; env -u GIT_SSH_COMMAND git clone -q git@github.com:Acme/licensing.git "${home}/cloned" && git -C "${home}/cloned" rev-parse HEAD > "${home}/cloned-sha" ) 2> "${home}/clone-err"
-{ grep -rlF -- "$(sed -n 2p "${key}")" "$project" ; grep -rlF -- "${key}" "$project"; } > "${home}/key-seen" 2>/dev/null
-git -C "$project/.miu-ci/mirrors/acme/licensing.git" remote > "${home}/copy-remotes" 2>&1
-echo '{"ok":true,"cells":[{"label":"a","status":"passed","exit_code":0,"output":"[t/a]   🏁  Job succeeded"}]}'`);
+( set -a; . "$project/.env"; set +a; git clone -q git@github.com:Acme/licensing.git "${home}/cloned" && git -C "${home}/cloned" rev-parse HEAD > "${home}/cloned-sha" ) 2> "${home}/clone-err"
+{ grep -rlF -- "$(sed -n 2p "${k.key}")" "$project"; grep -rlF -- "${k.key}" "$project"; } > "${home}/key-seen" 2>/dev/null
+echo '{"ok":true,"cells":[{"label":"php","status":"passed","exit_code":0,"output":"[t/php]   🏁  Job succeeded"}]}'`);
   const s = server({ home });
-  const env = { ...s.env, MIU_CI_MIRRORS_CONF: conf, MIU_CI_KNOWN_HOSTS: hosts, MIU_CI_MIRROR_HOST: `file://${root}/gh/`, MIU_CI_MIRRORS_DIR: path.join(home, 'mirrors'), MIU_CI_ROOT_UID: String(process.getuid()) };
-  const src = fs.mkdtempSync(path.join(tmp, 'src-'));
-  fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
-  fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), OK);
-  // Asked in another spelling than the list's, as a composer.json may write it.
-  const run = (head = 'miu-ci-secrets 0 mirrors=acme/LICENSING\n', files = {}) => {
-    for (const [n, t] of Object.entries(files)) {
-      fs.rmSync(path.join(src, n), { recursive: true, force: true });
-      if (t && typeof t === 'object' && t.link) fs.symlinkSync(t.link, path.join(src, n));
-      else if (t && typeof t === 'object' && t.fifo) spawnSync('mkfifo', [path.join(src, n)]);
-      else if (t !== null) fs.writeFileSync(path.join(src, n), t);
-    }
-    for (const f of ['cloned', 'cloned-sha', 'env']) fs.rmSync(path.join(home, f), { recursive: true, force: true });
-    const tar = spawnSync('tar', ['-c', '-C', src, '.']).stdout;
-    return spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from(head), tar]), env, encoding: 'utf8' });
-  };
+  const env = { ...s.env, ...k.knobs, MIU_CI_MIRROR_USER: 'miu-mirror', MIU_CI_MIRROR_HELPER: MIRROR };
+  const lock = { 'content-hash': 'h', packages: [{ name: 'acme/licensing', version: 'dev-main', source: { type: 'git', url: 'git@github.com:Acme/licensing.git', reference: 'abc' }, dist: { type: 'zip', url: 'https://api.github.com/repos/Acme/licensing/zipball/abc' } }] };
+  const wf = 'jobs:\n  php:\n    runs-on: ubuntu-22.04\n    steps:\n      - run: composer install\n';
+  const dir = repo({ '.github/workflows/test.yml': wf, 'composer.json': JSON.stringify({ repositories: [{ type: 'vcs', url: 'git@github.com:acme/LICENSING.git' }] }), 'composer.lock': JSON.stringify(lock) });
+  const base = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+  const app = fakeApp();
+  const go = () => runSandboxCi(proCheck, dir, env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
   const read = (f) => { try { return fs.readFileSync(path.join(home, f), 'utf8').trim(); } catch { return ''; } };
-  return { root, origin, commit, key, conf, hosts, env, run, read, home, src };
+  return { k, s, env, go, read, app, dir, home };
 }
 
-test('the worker fetches a deploy-key repo into its mirror and the job reads a copy for its GitHub URL, never the key', needsYaml, () => {
-  const k = keyedServer();
-  const first = k.commit('one');
-  const r = k.run();
-  assert.equal(r.status, 0, r.stderr);
-  assert.equal(k.read('cloned-sha'), first, k.read('clone-err'));
-  // The list's spelling and the asked one (insteadOf is case-sensitive), and safe.directory.
-  assert.match(k.read('env'), /^GIT_CONFIG_COUNT=7$/m);
-  assert.match(k.read('env'), /^GIT_CONFIG_VALUE_0=git@github\.com:Acme\/licensing\.git$/m);
-  assert.match(k.read('env'), /^GIT_CONFIG_VALUE_3=git@github\.com:acme\/LICENSING\.git$/m);
-  assert.equal(k.read('key-seen'), '', 'the key, or its path, is in the job\'s workspace');
-  assert.equal(k.read('copy-remotes'), '');
-  assert.equal(k.read('status'), '', 'the copy and .env show in git status');
-  // The next run fetches what is new.
-  const second = k.commit('two');
-  assert.equal(k.run().status, 0);
-  assert.equal(k.read('cloned-sha'), second);
-  // GitHub down: the job reads the last copy, and the log says how old it is.
-  fs.renameSync(k.origin, `${k.origin}.away`);
-  const stale = k.run();
-  assert.equal(stale.status, 0, stale.stderr);
-  assert.match(stale.stderr, /^sandbox-ci: note: could not fetch Acme\/licensing with its deploy key; the job read the copy from/m);
-  assert.equal(k.read('cloned-sha'), second);
-  fs.renameSync(`${k.origin}.away`, k.origin);
+test('end to end: the job installs the deploy-key repo from its copy; no key, no token, the PR\'s own files untouched', needsYaml, async () => {
+  const t = keyedRun();
+  const first = t.k.commit('one');
+  const r = await t.go();
+  assert.equal(r.status, 0, JSON.stringify(r));
+  assert.deepEqual(t.app.calls.mint, []);
+  // The helper ran as its own account, for the list's spelling.
+  assert.deepEqual(t.s.sudoAll(), [`-n -H -u miu-mirror ${MIRROR} Acme/licensing`, `-n -H -u ubuntu ${WORKER} .github/workflows/test.yml pull_request 1800 php`]);
+  assert.equal(t.read('cloned-sha'), first, t.read('clone-err'));
+  assert.equal(t.read('key-seen'), '', 'the key, or its path, is in the job\'s workspace');
+  assert.equal(t.read('status'), '');
+  assert.equal(t.read('committed-copy'), '0');
+  assert.equal(JSON.parse(t.read('lock')).packages[0].dist, undefined);
+  assert.match(t.read('env'), /^GIT_CONFIG_VALUE_0=git@github\.com:Acme\/licensing\.git$/m);
+  // The pull request's clone has no new branch or tag, and its tree is as it was.
+  assert.equal(git(t.dir, 'status', '--porcelain', '--untracked-files=no').stdout, '');
+  // GitHub down: the run still passes on the copy, and its log says so first.
+  fs.renameSync(t.k.origin, `${t.k.origin}.away`);
+  const stale = await t.go();
+  assert.equal(stale.status, 0, JSON.stringify(stale));
+  assert.match(stale.log, /^Note: could not fetch Acme\/licensing with its deploy key; the job read the copy from/);
 });
 
-test('the worker refuses a deploy-key repo unless root\'s list, the key and its fingerprint all check out', needsYaml, () => {
-  const k = keyedServer();
-  k.commit('one');
-  const notRun = (why, setup, undo, head) => {
-    setup?.();
-    try {
-      const r = k.run(head);
-      assert.equal(r.status, 2, `${why}: ${r.stderr}`);
-      assert.match(r.stderr, why);
-      assert.equal(k.read('cloned-sha'), '');
-    } finally { undo?.(); }
+test('no mirror account, or a helper that refuses: not run, and no token is left alive', needsYaml, async () => {
+  const t = keyedRun();
+  t.k.commit('one');
+  delete t.env.MIU_CI_MIRROR_USER;
+  assert.match((await t.go()).notRun, /reads Acme\/licensing with a deploy key, but has no ci-mirror account/);
+  t.env.MIU_CI_MIRROR_USER = 'miu-mirror';
+  fs.chmodSync(t.k.key, 0o644);
+  assert.match((await t.go()).notRun, /must be this account's own, mode 600 or 400/);
+});
+
+test('the worker refuses a link or special file in the copies, and a missing copy', needsYaml, () => {
+  const sandbox = sandboxHome();
+  const { env } = server({ home: sandbox.home });
+  const send = (setup) => {
+    const src = fs.mkdtempSync(path.join(tmp, 'mc-'));
+    fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
+    fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), OK);
+    const copy = path.join(src, '.miu-ci/mirrors/acme/licensing.git');
+    fs.mkdirSync(path.join(copy, 'objects'), { recursive: true });
+    fs.writeFileSync(path.join(copy, 'HEAD'), 'ref: refs/heads/main\n');
+    setup(src, copy);
+    const tar = spawnSync('tar', ['-c', '-C', src, '.']).stdout;
+    return spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from('miu-ci-secrets 0 mirrors=Acme/licensing\n'), tar]), env, encoding: 'utf8' });
   };
-  notRun(/this server has no deploy key for Acme\/other/, null, null, 'miu-ci-secrets 0 mirrors=Acme/other\n');
-  notRun(/not a repository name/, null, null, 'miu-ci-secrets 0 mirrors=Acme/..\n');
-  notRun(/not root's own file/, () => fs.chmodSync(k.conf, 0o664), () => fs.chmodSync(k.conf, 0o644));
-  notRun(/not root's own file/, () => { k.env.MIU_CI_ROOT_UID = '0'; }, () => { k.env.MIU_CI_ROOT_UID = String(process.getuid()); });
-  notRun(/must be this account's own, mode 600 or 400/, () => fs.chmodSync(k.key, 0o640), () => fs.chmodSync(k.key, 0o600));
-  const text = fs.readFileSync(k.conf, 'utf8');
-  notRun(/is not the one .* names/, () => fs.writeFileSync(k.conf, text.replace(/SHA256:\S+/, `SHA256:${'A'.repeat(43)}`)), () => fs.writeFileSync(k.conf, text));
-  notRun(/more than repository, key file and fingerprint/, () => fs.writeFileSync(k.conf, text.replace(/\n$/, ' extra\n')), () => fs.writeFileSync(k.conf, text));
-  notRun(/no root-owned GitHub host key file/, () => fs.chmodSync(k.hosts, 0o666), () => fs.chmodSync(k.hosts, 0o644));
-  // A first fetch that fails leaves nothing to read.
-  notRun(/could not fetch Acme\/licensing|could not fetch acme\/licensing/, () => fs.renameSync(k.origin, `${k.origin}.away`), () => fs.renameSync(`${k.origin}.away`, k.origin));
-  // The base branch's own .env stays, and may not set git config itself.
-  const ok = k.run(undefined, { '.env': 'APP_ENV=test' });
-  assert.equal(ok.status, 0, ok.stderr);
-  assert.match(k.read('env'), /^APP_ENV=test\nGIT_CONFIG_COUNT=7$/m);
-  notRun(/refused: the base branch's .env sets GIT_CONFIG_/, () => fs.writeFileSync(path.join(k.src, '.env'), 'GIT_CONFIG_COUNT=1\n'), () => fs.rmSync(path.join(k.src, '.env')));
+  assert.equal(send(() => {}).status, 0);
+  for (const [setup, why] of [
+    [(src, copy) => fs.symlinkSync('/etc', path.join(copy, 'objects/x')), /refused: a link or special file under .miu-ci/],
+    [(src, copy) => spawnSync('mkfifo', [path.join(copy, 'objects/f')]), /refused: a link or special file under .miu-ci/],
+    [(src, copy) => fs.rmSync(path.join(copy, 'HEAD')), /not run: Miu sent no copy of Acme\/licensing/],
+    [(src) => fs.writeFileSync(path.join(src, '.env'), 'A="open\n'), /unclosed double quote/],
+    [(src) => fs.writeFileSync(path.join(src, '.env'), 'GIT_CONFIG_COUNT=1\n'), /sets GIT_CONFIG_COUNT/],
+    [(src) => spawnSync('mkfifo', [path.join(src, '.env')]), /refused: \.env is not a plain file/],
+  ]) {
+    const r = send(setup);
+    assert.equal(r.status, 2, r.stderr);
+    assert.match(r.stderr, why);
+  }
+  // Without mirrors in the header, a .miu-ci from the tar is dropped, link or not.
+  const outside = fs.mkdtempSync(path.join(tmp, 'outside-'));
+  const src = fs.mkdtempSync(path.join(tmp, 'mc-'));
+  fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
+  fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), OK);
+  fs.symlinkSync(outside, path.join(src, '.miu-ci'));
+  const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from('miu-ci-secrets 0\n'), spawnSync('tar', ['-c', '-C', src, '.']).stdout]), env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(sandbox.read('files'), /miu-ci/);
+  assert.deepEqual(fs.readdirSync(outside), []);
 });
 
 test('the worker revokes only an installation token, nothing else', () => {
@@ -850,71 +938,7 @@ test('the worker revokes only an installation token, nothing else', () => {
   fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), OK);
   const tar = spawnSync('tar', ['-c', '-C', src, '.']).stdout;
   const s = server({ home: sandbox.home });
-  const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from(`miu-ci-secrets 1\nGITHUB_TOKEN=not_an_installation_token\n`), tar]), env: s.env, encoding: 'utf8' });
+  const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from('miu-ci-secrets 1\nGITHUB_TOKEN=not_an_installation_token\n'), tar]), env: s.env, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(s.curl('argv'), '');
-});
-
-test('review fixes: a planted .miu-ci, an odd .env, a .gitignore, a list line without a fingerprint, an old copy', needsYaml, () => {
-  const k = keyedServer();
-  k.commit('one');
-  // A .miu-ci link in the tar is dropped: nothing is written where it points.
-  const outside = fs.mkdtempSync(path.join(tmp, 'outside-'));
-  const linked = k.run(undefined, { '.miu-ci': { link: outside } });
-  assert.equal(linked.status, 0, linked.stderr);
-  assert.deepEqual(fs.readdirSync(outside), []);
-  assert.ok(k.read('cloned-sha'));
-  // A .gitignore cannot pull the copy into the pull request's commit.
-  const ignored = k.run(undefined, { '.miu-ci': null, '.gitignore': '!/.miu-ci/\n' });
-  assert.equal(ignored.status, 0, ignored.stderr);
-  assert.equal(k.read('committed-copy'), '0');
-  const refused = (files, why) => {
-    const r = k.run(undefined, files);
-    assert.equal(r.status, 2, r.stderr);
-    assert.match(r.stderr, why);
-  };
-  refused({ '.gitignore': null, '.env': { fifo: true } }, /refused: \.env is not a plain file/);
-  refused({ '.env': 'A="open\n' }, /refused: the base branch's .env has an unclosed double quote/);
-  // A harmless GIT_CONFIG_ name is fine.
-  assert.equal(k.run(undefined, { '.env': 'GIT_CONFIG_NOSYSTEM=1\n' }).status, 0);
-  fs.rmSync(path.join(k.src, '.env'));
-  // The list: a last line without a newline counts; one without a fingerprint does not.
-  const text = fs.readFileSync(k.conf, 'utf8');
-  fs.writeFileSync(k.conf, text.replace(/\n$/, ''));
-  assert.equal(k.run().status, 0);
-  fs.writeFileSync(k.conf, text.replace(/ SHA256:\S+/, ''));
-  refused({}, /gives no SHA256 fingerprint for Acme\/licensing/);
-  fs.writeFileSync(k.conf, text);
-  // GitHub unreachable and the copy older than a day: not run.
-  fs.renameSync(k.origin, `${k.origin}.away`);
-  spawnSync('touch', ['-d', '2 days ago', path.join(k.home, 'mirrors/acme/licensing.git')]);
-  refused({}, /could not fetch Acme\/licensing with its deploy key, and the last copy is older than 24 hours/);
-  fs.renameSync(`${k.origin}.away`, k.origin);
-});
-
-test('a worker note goes at the top of a passing run\'s log', async () => {
-  const s = fakeWorker({ stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: '[t/a]   🏁  Job succeeded' }]), stderr: 'sandbox-ci: note: could not fetch Acme/lib with its deploy key; the job read the copy from 2026-11-15 10:00 UTC\nother noise\n' });
-  const r = await runSandboxCi(check, repo(), s.env);
-  assert.equal(r.status, 0);
-  assert.match(r.log, /^Note: could not fetch Acme\/lib with its deploy key; the job read the copy from 2026-11-15 10:00 UTC\n\n/);
-  assert.doesNotMatch(r.log, /other noise/);
-});
-
-test('the job\'s composer.lock loses the dist of a deploy-key package only, so Composer clones it from the mirror', needsYaml, () => {
-  const k = keyedServer();
-  k.commit('one');
-  const pkg = (name, url) => ({ name, version: 'dev-main', source: { type: 'git', url, reference: 'abc' }, dist: { type: 'zip', url: `https://api.github.com/repos/${name}/zipball/abc` } });
-  const lock = { 'content-hash': 'h', packages: [pkg('acme/licensing', 'git@github.com:ACME/licensing.git'), pkg('acme/other', 'https://github.com/Acme/other.git')], 'packages-dev': [pkg('acme/lic-dev', 'https://github.com/acme/licensing')] };
-  const r = k.run(undefined, { 'composer.lock': JSON.stringify(lock) });
-  assert.equal(r.status, 0, r.stderr);
-  const out = JSON.parse(k.read('lock'));
-  assert.equal(out.packages[0].dist, undefined);
-  assert.deepEqual(out.packages[0].source, lock.packages[0].source);
-  assert.deepEqual(out.packages[1].dist, lock.packages[1].dist);
-  assert.equal(out['packages-dev'][0].dist, undefined);
-  assert.equal(out['content-hash'], 'h');
-  assert.equal(k.read('status'), '');
-  const bad = k.run(undefined, { 'composer.lock': '{not json' });
-  assert.equal(bad.status, 2);
-  assert.match(bad.stderr, /refused: composer.lock is not readable JSON/);
 });

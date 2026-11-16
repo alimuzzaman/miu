@@ -39,15 +39,24 @@ Rules the code keeps:
   forms, from the CI log. Forks and Dependabot get no run, so no token.
 - **A repository listed in `/etc/miu/ci-mirrors` is read with a deploy key**
   ([install.md](install.md#a-repository-the-app-may-not-read-a-deploy-key)).
-  The key never leaves the Sandbox account. Only the worker uses it, as that
-  account, for one fetch into a mirror in that account's home. The job gets a
-  copy of the mirror with no key and no remote, so the pull request's code can
-  read that repository's code, as it could with a token for it, but cannot
-  use the key. Miu's account can only name a listed repository: root's list
-  picks the key, and the worker checks the key's owner, its mode and its
-  fingerprint, and GitHub's host key. Miu's account runs pull request code in
-  fast checks, so anything that runs as `miu` can get a copy of a listed
-  repository. List only what every repository Miu tests may read.
+  - **Who holds the key.** Only `miu-mirror` holds it, a system account with
+    nothing else: no shell, no groups, no Sandbox secrets.
+  - **What `miu` can ask for.** `miu` may run one script as that account, and
+    only with a listed repository's name as its argument, since each sudo rule
+    names the repository exactly.
+  - **What the script checks.** The list must be root's, and the key must be
+    the account's own at mode 600 with the fingerprint the list names. GitHub's
+    host key is pinned.
+  - **What the script does.** It takes no path, opens nothing outside the
+    account's own folders, and writes only a git bundle to `miu`. So the worst
+    it can be made to do is read a listed repository, which the key allows
+    anyway.
+  - **What the job gets.** A copy with no key and no remote, so pull request
+    code can read the repository's code, as with a token for it, but never use
+    the key.
+  - **Who can get a copy.** `miu` runs pull request code in fast checks, so
+    anything that runs as `miu` can get a copy of a listed repository. List
+    only what every repository Miu tests may read.
 - A comment can be edited only by whoever wrote it: editing one posted before
   the App was installed uses the fallback account (`fallback: true`).
 

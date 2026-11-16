@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Fetch one repository with this server's read-only deploy key, for CI.
+#
+# Installed as /usr/local/lib/miu/ci-mirror. It runs as its own system account
+# (miu-mirror by default; install.sh makes it), through sudo rules that name
+# each repository of the root-owned list /etc/miu/ci-mirrors exactly. That
+# account holds nothing but the deploy keys and the mirrors, so the worst this
+# script can be made to do is read a listed repository, which its key allows
+# anyway.
+#
+#   ci-mirror <owner/name>
+#
+# Refreshes this account's bare mirror of the repository with its key and
+# writes a git bundle of it (branches and tags) on stdout. It takes no path
+# and opens nothing outside this account's own folders, so Miu, which cannot
+# be trusted with the key, turns the bundle into the job's copy itself.
+set -euo pipefail
+umask 077
+
+die() { echo "$*" >&2; exit 2; }
+[ $# -eq 1 ] || die "usage: ci-mirror <owner/name>"
+repo=$1 asked=$1
+[[ $repo =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ && $repo != */. && $repo != */.. && $repo != */-* ]] || die "not run: not a repository name: $repo"
+
+# sudo resets the environment, so only a test can point these elsewhere.
+conf=${MIU_CI_MIRRORS_CONF:-/etc/miu/ci-mirrors}
+known_hosts=${MIU_CI_KNOWN_HOSTS:-/usr/local/lib/miu/github-known-hosts}
+home=${MIU_CI_MIRRORS_DIR:-$HOME/mirrors}
+git_host=${MIU_CI_MIRROR_HOST:-git@github.com:}
+root_uid=${MIU_CI_ROOT_UID:-0}
+max_age_minutes=${MIU_CI_MIRROR_MAX_AGE_MINUTES:-1440}
+
+bounded() { timeout -k 10 "$1" "${@:2}"; }
+# root's own file that only root can change, and that Miu's account may read.
+owned_by_root() { [ -f "$1" ] && [ ! -L "$1" ] && [[ $(stat -c '%u %a' "$1") =~ ^$root_uid\ [0-7][0145][45]$ ]]; }
+
+owned_by_root "$conf" || die "not run: $conf is missing or not root's own file, so no deploy-key repository can be read"
+key= fp=
+while read -r conf_repo got got_fp extra || [ -n "$conf_repo" ]; do
+  [[ -z $conf_repo || $conf_repo == \#* ]] && continue
+  [ -z "$extra" ] || die "not run: a line of $conf has more than repository, key file and fingerprint"
+  # The list's spelling, for the URL.
+  if [ "${conf_repo,,}" = "${repo,,}" ]; then key=$got fp=$got_fp repo=$conf_repo; break; fi
+done < "$conf"
+[ -n "$key" ] || die "not run: this server has no deploy key for $asked"
+[[ $fp =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || die "not run: $conf gives no SHA256 fingerprint for $repo"
+# A plain path: GIT_SSH_COMMAND is read by a shell.
+[[ $key =~ ^/[A-Za-z0-9_./-]+$ && -f $key && ! -L $key ]] || die "not run: the deploy key for $repo is not a plain file"
+# This account's own key, unreadable by anyone else, and the one the list names.
+[[ $(stat -c '%u %a' "$key") =~ ^$(id -u)\ [46]00$ ]] || die "not run: the deploy key for $repo must be this account's own, mode 600 or 400"
+[ "$(ssh-keygen -lf "$key" -E sha256 2>/dev/null | awk '{print $2}')" = "$fp" ] || die "not run: the deploy key for $repo is not the one $conf names"
+owned_by_root "$known_hosts" || die "not run: no root-owned GitHub host key file at $known_hosts"
+
+dir=$home/${repo,,}.git
+mkdir -p "${dir%/*}"
+# Two runs at once fetch one after the other.
+exec 8>>"$dir.lock"
+bounded 300 python3 -I -c '
+import fcntl
+fcntl.flock(8, fcntl.LOCK_EX)
+' || die "not run: another run held the $repo mirror too long"
+
+ssh="ssh -F /dev/null -i $key -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts -o HostKeyAlgorithms=ssh-ed25519"
+url=$git_host$repo.git
+nohooks=(-c core.hooksPath=/dev/null)
+fetched=1
+if [ -d "$dir/objects" ]; then
+  GIT_SSH_COMMAND=$ssh bounded 300 git -C "$dir" "${nohooks[@]}" fetch --quiet --prune "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' >&2 || fetched=0
+else
+  rm -rf "$dir.tmp"
+  if GIT_SSH_COMMAND=$ssh bounded 300 git "${nohooks[@]}" clone --quiet --bare "$url" "$dir.tmp" >&2; then
+    git -C "$dir.tmp" "${nohooks[@]}" remote remove origin
+    mv "$dir.tmp" "$dir"
+  else
+    fetched=0
+  fi
+fi
+if [ "$fetched" = 0 ]; then
+  [ -d "$dir/objects" ] || die "not run: could not fetch $repo with its deploy key"
+  # A key removed on GitHub must end access soon, and a run must not pass
+  # against old code for long.
+  [ -n "$(find "$dir" -maxdepth 0 -mmin "-$max_age_minutes")" ] || die "not run: could not fetch $repo with its deploy key, and the last copy is older than $((max_age_minutes / 60)) hours"
+  # Miu puts this line at the top of the run's log.
+  echo "ci-mirror: note: could not fetch $repo with its deploy key; the job read the copy from $(stat -c %y "$dir" | cut -c1-16) UTC" >&2
+else
+  touch "$dir"
+fi
+bounded 300 git -C "$dir" "${nohooks[@]}" bundle create --quiet - --branches --tags || die "not run: could not bundle the $repo mirror"

@@ -57,13 +57,23 @@ Workflow steps run the pull request's code in Docker containers on this server, 
 
 ### A repository the App may not read: a deploy key
 
-A private dependency (a Composer or npm package on GitHub) that the App is not installed on can be read with a read-only deploy key instead. The key must belong to the Sandbox account, mode `600`, and be added on GitHub as that repository's deploy key without write access. List it in `/etc/miu/ci-mirrors`, a file owned by root, mode `644`. Each line holds the repository, the key's path and its fingerprint (`ssh-keygen -lf <key> -E sha256`):
+A private dependency (a Composer or npm package on GitHub) that the App is not installed on can be read with a read-only deploy key instead. The installer makes a system account for this, `miu-mirror`, with no login shell. It holds nothing but the deploy keys and its mirrors, in `/var/lib/miu-mirror`. Sandbox's account never touches a key.
 
-```text
-acme/licensing /home/ubuntu/keys/licensing SHA256:...
-```
+1. Add the key on GitHub as the repository's deploy key, without write access.
+2. Put the private half in `/var/lib/miu-mirror/keys/`, owned by `miu-mirror`, mode `600`.
+3. List it in `/etc/miu/ci-mirrors`, a file owned by root, mode `644`. Each line holds the repository, the key's path and its fingerprint (`ssh-keygen -lf <key> -E sha256`):
 
-For a job that needs a listed repository, other than through `actions/checkout`, the script fetches it with the key into a bare mirror in the account's `~/.cache/miu-ci-mirrors`. It checks GitHub's host key against `/usr/local/lib/miu/github-known-hosts`. The job then gets a copy of the mirror in its workspace (`.miu-ci/mirrors`, with no key and no remote). The job's `.env` gets git config (`GIT_CONFIG_*`) that reads that copy for the repository's `git@github.com:`, `ssh://` and `https://` URLs, so Composer and npm install it from there. Composer would first try the package's zip from GitHub's API, which the key cannot open, and does not fall back to git then, so the job's copy of `composer.lock` loses the `dist` of each listed package; `composer.json` and the lock's content hash stay as they are. When the fetch fails, the job reads the last copy, up to a day old, and the top of the log says how old it is. A run that then needs no token but whose workflow names one (`${{ secrets.X || github.token }}`) gets an App token that reads only the pull request's repository's metadata, because Composer sends it with every download, public ones too.
+   ```text
+   acme/licensing /var/lib/miu-mirror/keys/licensing SHA256:...
+   ```
+
+4. Run the installer again. It writes one sudo rule for each listed repository, `/etc/sudoers.d/miu-ci-mirror`: `miu` may run `/usr/local/lib/miu/ci-mirror <that repository>` as `miu-mirror`, with exactly that argument.
+
+For a job that needs a listed repository, other than through `actions/checkout`, Miu runs that script. It checks four things: the list is root's, the key is the account's own at mode 600, its fingerprint matches the list, and GitHub's host key matches `/usr/local/lib/miu/github-known-hosts`. It then fetches the repository into the account's mirror and hands Miu a git bundle, so it takes no path from Miu. Miu puts a bare copy of the bundle in the job's tar at `.miu-ci/mirrors`, with no key and no remote. The CI script gives the job git config (`GIT_CONFIG_*`, through its `.env`) that reads that copy for the repository's `git@github.com:`, `ssh://` and `https://` URLs.
+
+Composer first tries the package's zip from GitHub's API, which the key cannot open, and does not fall back to git after that. So the job's copy of `composer.lock` loses the `dist` of each listed package. `composer.json` and the lock's content hash stay as they are.
+
+When the fetch fails, the job reads the last copy, up to a day old, and the top of its log says how old it is. A run that then needs no repository token but whose workflow names one (`${{ secrets.X || github.token }}`) gets an App token that reads only the pull request's repository's metadata. Composer sends that token with every download, public ones too.
 
 ## After the installer
 
