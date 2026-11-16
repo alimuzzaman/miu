@@ -40,6 +40,7 @@ import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
 import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem, forkOf, workflowsAt } from '../lib/ci.mjs';
 import { runSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
+import { createStacks, sudoRunner, WORKER as STACK_WORKER } from '../lib/prstackctl.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -363,6 +364,8 @@ function detail(name) {
     // The queue's switches, and whether this pull request is in the line again.
     control: (() => { const pr = readJson(path.join(dir, 'context/pr.json')); const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); const q = m && queue.find((x) => x.repo === m[1] && x.pr === Number(m[2])); return { ...queueState(), inLine: !!q, waits: q ? holdReason(q, queueState()) : null }; })(),
     // The CI of the commit this run tested (lib/ci.mjs), and where GitHub shows its own checks.
+    // Its test stack (lib/prstackctl.mjs), when PR stacks are on.
+    stack: (() => { const m = readJson(path.join(dir, 'context/pr.json'))?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); return m && stacksOn() ? stacks.view(`${m[1]}#${m[2]}`) : null; })(),
     ci: (() => { const pr = readJson(path.join(dir, 'context/pr.json')); const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); return m ? { ...(ci.view(ci.get(m[1], Number(m[2]), pr.headRefOid)) ?? { state: 'not_started', repo: m[1], pr: Number(m[2]), sha: pr.headRefOid, jobs: [] }), checksUrl: `${pr.url}/checks`, paused: queueState().paused, parallel: ciParallel() } : null; })(),
     notes: read(path.join(dir, 'notes.md')),
     prompt: read(path.join(dir, 'prompt.md')),
@@ -980,6 +983,53 @@ const scan = () => autoScan().catch((e) => console.error('auto scan:', e.message
 setInterval(scan, 2 * 60 * 1000);
 setTimeout(scan, 5000);
 setInterval(pump, 15 * 1000);
+
+// ---- PR test stacks ----------------------------------------------------------
+// Each PR in the queue (or being tested) gets a Sandbox stack that follows
+// its branch (lib/prstacks.mjs decides, lib/prstackctl.mjs does it). Off
+// unless Settings has stacks.on and install.sh set up the worker.
+const stacksOn = () => getConfig().stacks?.on === true && !!process.env.MIU_SANDBOX_USER && fs.existsSync(STACK_WORKER);
+const stacks = createStacks({ runsDir: RUNS, run: sudoRunner(process.env.MIU_SANDBOX_USER || 'nobody') });
+// The latest verdict per PR, and the commit it judged.
+function verdicts() {
+  const out = new Map();
+  for (const [key, rows] of runsByPr()) {
+    for (const r of rows) {
+      if (!r.verdict) continue;
+      let at; try { at = fs.statSync(path.join(RUNS, r.name, 'verdict.json')).mtimeMs; } catch { continue; }
+      if (!out.has(key) || out.get(key).at < at) out.set(key, { at, sha: r.sha });
+    }
+  }
+  return out;
+}
+let stackBusy = false;
+async function stackScan() {
+  if (!stacksOn() || stackBusy) return;
+  stackBusy = true;
+  try {
+    const { list, error } = await refreshPrs();
+    const listed = !error && list.length > 0;
+    const open = listed ? new Map(list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid])) : null;
+    const live = liveRun();
+    const ctx = live ? readJson(path.join(RUNS, live, 'context/pr.json')) : null;
+    const own = ctx?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+    const liveKeys = new Set([own && `${own[1]}#${own[2]}`, ...(live ? (readJson(path.join(RUNS, live, 'context/pair.json')) ?? []).map((x) => `${x.repo}#${x.number}`) : [])].filter(Boolean));
+    const wanted = new Set([...queue.map((q) => `${q.repo}#${q.pr}`), ...liveKeys]);
+    for (const key of wanted) {
+      const p = list.find((x) => `${x.repo}#${x.number}` === key);
+      const role = p && roleOf(p.repo);
+      if (!p || !role) continue;
+      let pair = {};
+      try { pair = await partnersOf(p.repo, p.number); } catch (e) { console.error('stack pair lookup:', e.message); continue; }
+      stacks.want(p.repo, p.number, role, p, pair);
+    }
+    const v = verdicts();
+    for (const s of stacks.list()) stacks.observe(s.key, { head: open?.get(s.key), verdictAt: v.get(s.key)?.at, verdictHead: v.get(s.key)?.sha });
+    await stacks.scan({ open, liveKeys });
+  } catch (e) { console.error('stack scan:', e.message); } finally { stackBusy = false; }
+}
+setInterval(stackScan, 2 * 60 * 1000);
+setTimeout(stackScan, 20 * 1000);
 
 // ---- disk: what a finished run keeps -------------------------------------
 // The agent's own working folders (its builds, node_modules, browsers) are

@@ -158,3 +158,25 @@ Each Miu has its own accounts ([lib/users.mjs](../lib/users.mjs)), kept in
 Put Miu behind a reverse proxy that terminates TLS, set `MIU_PUBLIC_URL` to the
 https address, and add `<MIU_PUBLIC_URL>/auth/callback` as a callback URL in
 the App's settings.
+
+## Pull request test stacks
+
+With `--sandbox-user` and `"stacks": {"on": true}` in `runs/.config.json`, each
+pull request in Miu's queue gets a Sandbox stack that follows its branch (Sandbox
+`host follow`), for people to try. Miu reaches it only through
+`/usr/local/lib/miu/pr-stack` (`bin/miu-pr-stack`), run as the Sandbox account by
+one sudo rule. That command has four verbs (`mem`, `add`, `status`, `remove`) and
+builds every Sandbox argument itself. Miu passes a stack name, a kind and branch
+names, and the command checks each one.
+
+- Branches from the WPDevelopers org only. A fork never gets a stack.
+- The prepare step and the stack template come from `xspeed-dev-setup@main`, not
+  from the pull request. `stacks/follow-prepare.sh` builds the pull request's code
+  in a throwaway container: no Docker socket, no home folder, no Sandbox state, no
+  keys, non-root, no capabilities. Only the plugin zips come back.
+- The follow's deploy keys are read-only. Pro stays unlicensed: no key is ever
+  wired, real or placeholder.
+- At most 10 stacks. A new one past 10 removes the oldest idle one first. A stack
+  goes when its pull request is merged or closed, or 48 hours after Miu's verdict
+  with no new commits. Nothing new starts while the server has under 3 GB of memory
+  free.

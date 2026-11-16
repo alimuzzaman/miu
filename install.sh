@@ -291,6 +291,8 @@ if [ -n "$SANDBOX_USER" ]; then
   install -o root -g root -m 0755 "$APP/bin/miu-sandbox-ci" "$LIB/sandbox-ci"
   # GitHub's SSH host key, for repositories CI reads with a deploy key (/etc/miu/ci-mirrors).
   install -o root -g root -m 0644 "$APP/lib/github-known-hosts" "$LIB/github-known-hosts"
+  # PR test stacks (lib/prstackctl.mjs): off until Settings has stacks.on.
+  install -o root -g root -m 0755 "$APP/bin/miu-pr-stack" "$LIB/pr-stack"
   # CI job containers go here (bin/miu-sandbox-ci passes --cgroup-parent), capped
   # together; stop them all with: systemctl stop miu-ci.slice
   cat > /etc/systemd/system/miu-ci.slice <<SLICE
@@ -306,6 +308,8 @@ SLICE
   cat > /etc/sudoers.d/miu-sandbox-ci.tmp <<EOF
 # $MIU_USER may hand a pull request's files to Sandbox CI as $SANDBOX_USER, nothing else.
 $MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/sandbox-ci
+# ... and add, read and remove its pull requests' test stacks (fixed verbs, checked arguments).
+$MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/pr-stack
 EOF
   visudo -cqf /etc/sudoers.d/miu-sandbox-ci.tmp || die "the Sandbox CI sudoers rule did not validate"
   chmod 0440 /etc/sudoers.d/miu-sandbox-ci.tmp && mv /etc/sudoers.d/miu-sandbox-ci.tmp /etc/sudoers.d/miu-sandbox-ci
