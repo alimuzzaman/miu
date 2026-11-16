@@ -25,7 +25,9 @@ SETUP_BRANCH=main
 LICENSING_BRANCH=main
 OWNER=miu
 PREPARE_TIMEOUT=3600
-# sudo resets the environment, so only a test can point these elsewhere.
+# Only a test can point these elsewhere: under sudo they are dropped, whatever
+# this server's sudoers keeps.
+[ -z "${SUDO_USER:-}" ] || unset MIU_PR_STACK_SB MIU_PR_STACK_FOLLOW_ROOT MIU_PR_STACK_MEMINFO
 sb=${MIU_PR_STACK_SB:-$HOME/sandbox/sb-src/sb}
 follow_root=${MIU_PR_STACK_FOLLOW_ROOT:-$HOME/sandbox/runtime/hosting/follow}
 meminfo=${MIU_PR_STACK_MEMINFO:-/proc/meminfo}
@@ -96,7 +98,11 @@ case $verb in
     out=$(here follow remove --name "$stack" 2>&1) || {
       [[ $out == *follow_not_found* ]] || { printf '%s\n' "$out"; exit 1; }
     }
-    here stack down --name "$stack" --owner "$OWNER" --confirm
+    # A stack already gone (reaped, taken down, never built) is done, not an error.
+    out=$(here stack down --name "$stack" --owner "$OWNER" --confirm 2>&1) || {
+      [[ $out == *stack_not_found* ]] || { printf '%s\n' "$out"; exit 1; }
+    }
+    printf '%s\n' "$out"
     # Sandbox keeps the follow's clones; with the stack down nothing uses them.
     work=$follow_root/work/$stack
     if [ -e "$work" ]; then
