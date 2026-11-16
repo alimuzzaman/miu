@@ -15,7 +15,7 @@ function harness({ fail = '' } = {}) {
   const log = path.join(dir, 'calls');
   const sb = path.join(dir, 'sb');
   // Records each call's argv as one JSON line; FAIL names a verb that fails.
-  fs.writeFileSync(sb, `#!/usr/bin/env node
+  fs.writeFileSync(sb, `#!${process.execPath}
 const fs = require('fs'); const a = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(a) + '\\n');
 if (process.env.FAIL && a.join(' ').includes(process.env.FAIL)) { console.log('{"ok":false,"code":"' + process.env.FAIL_CODE + '"}'); process.exit(1); }
