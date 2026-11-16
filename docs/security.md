@@ -25,6 +25,16 @@ Rules the code keeps:
 - Network errors, 5xx answers and the secondary rate limit are retried with a
   back-off; anything else fails at once.
 - The QA agent gets no GitHub, Cloudinary, agent-notes or Slack token.
+- **A CI run gets one GitHub token, and the pull request's code can read it.**
+  [lib/sandboxci.mjs](../lib/sandboxci.mjs) has the App mint it per run
+  (`ciRepoToken` in [lib/ghapp.mjs](../lib/ghapp.mjs)): `contents: read` only,
+  for the pull request's repository and the ones the workflow reaches (read
+  from the base branch's workflow, `composer.json` and `package.json`, never the
+  pull request's, so a pull request cannot widen it), GitHub's one-hour
+  expiry, never cached, revoked when the run ends. It goes to the worker on
+  stdin and to Sandbox on a pipe: never in an argument, the environment of a
+  Miu process, a file Miu keeps, or the tar. Miu removes it, and its base64
+  forms, from the CI log. Forks and Dependabot get no run, so no token.
 - A comment can be edited only by whoever wrote it: editing one posted before
   the App was installed uses the fallback account (`fallback: true`).
 

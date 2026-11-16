@@ -53,7 +53,7 @@ sudo bash install.sh --sandbox-user ubuntu
 
 `miu` stays out of the `docker` group. The installer adds one sudo rule, `/etc/sudoers.d/miu-sandbox-ci`, that lets `miu` run `/usr/local/lib/miu/sandbox-ci` as that account and nothing else. The script gets the commit as a tar on stdin, runs it in a temporary folder and removes the folder afterwards. It expects Sandbox at `~/sandbox/sb-src/sb`.
 
-Workflow steps run the pull request's code in Docker containers on this server, without the Docker socket. Give a workflow only the CI secrets you would give that code: the `ci_secrets` in the Sandbox account's `sandbox.local.yml`. A workflow that needs a secret with no entry there is reported as not run.
+Workflow steps run the pull request's code in Docker containers on this server, without the Docker socket. Give a workflow only the CI secrets you would give that code: the `ci_secrets` in the Sandbox account's `sandbox.local.yml`. A workflow that needs a secret with no entry there is reported as not run, also when it has a fallback (`${{ secrets.X || github.token }}`). Miu adds one secret itself: a read-only GitHub App token for the repositories the run reaches, as `GITHUB_TOKEN` and the secrets used beside `github.token` ([profiles.md](profiles.md#choosing-the-workflows-pr_ci)). It reaches the script on stdin, before the tar, and Sandbox on a pipe (`sb ci run --secrets-stdin`, which needs a Sandbox that has it).
 
 ## After the installer
 

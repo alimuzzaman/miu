@@ -489,7 +489,7 @@ test('finds every repository a job and the jobs it needs reach, and the secrets 
 
 test('private Composer and npm dependencies on GitHub', () => {
   assert.deepEqual(manifestRepos(COMPOSER, JSON.stringify({ dependencies: { a: '^1.0', b: 'github:Acme/ui#v2', c: 'Acme/icons', d: 'git+ssh://git@github.com/Acme/lib.git', e: 'file:../x', f: 'npm:left-pad@1' } })).sort(),
-    ['Acme/icons', 'Acme/licensing', 'Acme/lib', 'Acme/ui']);
+    ['Acme/icons', 'Acme/lib', 'Acme/licensing', 'Acme/ui']);
   assert.deepEqual(manifestRepos('not json', null), []);
 });
 
@@ -499,7 +499,7 @@ test('a run gets one token for the pull request\'s repo and every one it reaches
   const app = fakeApp();
   const { dir, base } = proRepo();
   const r = await runSandboxCi(proCheck, dir, s.env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
-  assert.equal(r.status, 0);
+  assert.equal(r.status, 0, JSON.stringify(r));
   // The own repo first, then what it checks out, fetches and installs; a download from another owner is left alone.
   assert.deepEqual(app.calls.mint, [['Acme', ['pro', 'free', 'tools', 'hub', 'licensing'], []]]);
   assert.deepEqual(sandbox.read('stdin').split('\n').sort(), [`FREE_REPO_TOKEN=${TOKEN}`, `GITHUB_TOKEN=${TOKEN}`, `PKG_TOKEN=${TOKEN}`]);
@@ -586,8 +586,11 @@ test('the worker reads its secrets header before the tar, and refuses one that i
 test('profile validation: repos is a short list of owner/name', () => {
   assert.equal(sandboxCiProblem({ label: 'x', sandbox_ci: { workflow: '.github/workflows/a.yml', job: 'a', repos: ['Acme/lib'] } }), null);
   assert.match(sandboxCiProblem({ label: 'x', sandbox_ci: { workflow: '.github/workflows/a.yml', job: 'a', repos: ['../x'] } }), /sandbox_ci.repos/);
+  assert.match(sandboxCiProblem({ label: 'x', sandbox_ci: { workflow: '.github/workflows/a.yml', job: 'a', repos: ['acme/..'] } }), /sandbox_ci.repos/);
+  assert.equal(sandboxCiProblem({ label: 'x', sandbox_ci: { workflow: '.github/workflows/a.yml', job: 'a', repos: ['acme/.github'] } }), null);
   assert.equal(prCiProblem([{ workflow: '.github/workflows/ci.yml', repos: ['Acme/lib'] }]), null);
   assert.match(prCiProblem([{ workflow: '.github/workflows/ci.yml', repos: 'Acme/lib' }]), /repos/);
+  assert.match(prCiProblem([{ workflow: '.github/workflows/ci.yml', repos: ['../x'] }]), /repos/);
   const [j] = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { a: { 'runs-on': 'ubuntu-latest', steps: [{ run: 'id' }] } } }, { listed: { workflow: '.github/workflows/ci.yml', repos: ['Acme/lib'] } });
   assert.deepEqual(j.check.sandbox_ci.repos, ['Acme/lib']);
 });

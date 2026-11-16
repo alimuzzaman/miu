@@ -93,6 +93,9 @@ Some repos run their tests only by hand (`workflow_dispatch`) or from another wo
 | `workflow` | A file directly in `.github/workflows`. It runs whatever its trigger is: as `pull_request` if it has that, then as `push`, then as `workflow_dispatch` (with its inputs' defaults). A workflow that is only `workflow_call`, or that runs by itself on pushes to certain branches or tags, is not run. |
 | `jobs` | Optional. Only these job ids run. Leave it out for every job. A job the workflow does not have is listed as such. |
 | `matrix` | Optional. Only these values of each matrix key run, to stay within the two jobs at a time. |
+| `repos` | Optional. Up to 10 more repositories (`owner/name`) the run's token may read, for what Miu cannot find in the workflow. |
+
+Each run gets a GitHub token from the Miu App, as `GITHUB_TOKEN` (what `${{ github.token }}` reads) and as every secret the workflow uses beside `github.token` (`${{ secrets.X || github.token }}`). It reads the pull request's own repository and every one the job, and the jobs it needs, reaches over the network: `repository:` of `actions/checkout`, `github.com/owner/name` URLs, `gh repo clone`, `gh api repos/...` and `gh -R` in `run:` steps, and, when a step runs Composer or npm, the GitHub repositories in `composer.json` `repositories` and in `package.json` dependencies, read from the base branch, not from the pull request. Only the App owner's repositories go in the token; a checkout of another owner's repository must be public. The token can only read code, lasts at most an hour and is revoked when the run ends. The pull request's code can read it. A repository the App is not installed on makes the job "not run (no access to owner/name)", as does a checkout whose repository is an expression.
 
 With `pr_ci` set, only the listed workflows run; the default rule is off for the repo. `"pr_ci": []` runs no CI for pull requests. Leave `pr_ci` out to keep the default rule.
 
