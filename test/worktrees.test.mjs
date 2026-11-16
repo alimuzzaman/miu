@@ -264,6 +264,10 @@ test('XSPEED_DIR is the side\'s link, else Free of the same side, never the othe
   fs.mkdirSync(path.join(linked, 'xspeed'), { recursive: true });
   assert.equal(freeDirFor(path.join(linked, 'xspeed-pro'), srcs), path.join(linked, 'xspeed'));
   assert.equal(freeDirFor(path.join(CACHE, 'wt', 'check-dev-xspeed', 'xspeed'), srcs), '/wt/xspeed-dev');
+  // Free's own check: its checkout is ../xspeed itself.
+  const own = path.join(CACHE, 'wt', 'check-pr-ownfree', 'xspeed');
+  fs.mkdirSync(own, { recursive: true });
+  assert.equal(freeDirFor(own, srcs), own);
   assert.equal(freeDirFor(path.join(CACHE, 'wt', 'check-pr-xspeed', 'xspeed'), srcs), '/wt/xspeed-pr');
   assert.equal(freeDirFor(path.join(CACHE, 'wt', 'check-pr-xspeed', 'xspeed'), { 'free-dev': '/wt/xspeed-dev' }), '/wt/xspeed-dev');
 });

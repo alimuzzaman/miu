@@ -405,10 +405,16 @@ const depsFallback = await gh.composerAuthEnv(repo, { fallback: true }).catch(()
 // Worktrees are shared by every run, so only one run may use them at a time.
 const lockFile = path.join(CACHE, 'run.lock');
 fs.mkdirSync(CACHE, { recursive: true });
-const holder = fs.existsSync(lockFile) ? Number(fs.readFileSync(lockFile, 'utf8')) : 0;
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-if (holder && holder !== process.pid && alive(holder)) { console.error(`Another QA run (pid ${holder}) is using the worktrees.`); process.exit(3); }
-fs.writeFileSync(lockFile, String(process.pid));
+// Created only if absent (wx), so two runs started at once cannot both get it;
+// a lock whose run is gone is taken over once.
+const takeLock = () => { try { fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' }); return true; } catch (e) { if (e.code !== 'EEXIST') throw e; return false; } };
+if (!takeLock()) {
+  const holder = Number(fs.readFileSync(lockFile, 'utf8')) || 0;
+  if (holder && holder !== process.pid && alive(holder)) { console.error(`Another QA run (pid ${holder}) is using the worktrees.`); process.exit(3); }
+  fs.rmSync(lockFile, { force: true });
+  if (!takeLock()) { console.error('Another QA run took the worktrees just now.'); process.exit(3); }
+}
 process.on('exit', () => { try { if (Number(fs.readFileSync(lockFile, 'utf8')) === process.pid) fs.rmSync(lockFile); } catch { /* gone */ } });
 
 const builds = [];
@@ -633,9 +639,9 @@ async function runFastChecks() {
     log(`check ${c.label}: ${r.status === 0 ? 'passed' : 'failed'} in ${secs(t0)}`);
     if (r.status !== 0 && slotInfo[devLabel]) {
       log(`check ${c.label}: running on dev to compare`);
-      devSrc = checkSlot(devLabel);
-      const d = await runCheck(c, devSrc);
-      prSrc = checkSlot(prLabel);
+      // The PR's check folder is its own, so it stays as the check left it.
+      let d;
+      try { devSrc = checkSlot(devLabel); d = await runCheck(c, devSrc); } catch (e) { d = { notRun: `the dev checkout failed: ${String(e.message).split('\n')[0].slice(0, 200)}` }; }
       line += d.notRun ? `, could not be compared with dev (${d.notRun})` : d.status === 0 ? ', passes on dev, so this PR introduced it' : ', also fails on dev, so it is not from this PR';
       log(`check ${c.label}: ${d.notRun ? 'no comparison with dev' : d.status === 0 ? 'passes on dev' : 'also fails on dev'}`);
     }
