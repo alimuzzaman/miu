@@ -299,7 +299,10 @@ if [ -n "$mirror_list" ]; then
   IFS=, read -r -a mirror_repos <<<"$mirror_list"
   [ ${#mirror_repos[@]} -le 4 ] || die "not run: more than 4 deploy-key repositories"
   [ -d "$root/.miu-ci" ] || die "not run: Miu sent no deploy-key copies"
-  # find must read every folder: one it cannot list would hide what is in it.
+  # find must read every folder: one it cannot list would hide what is in it,
+  # and keep the cleanup from removing it. chmod changes a folder before it
+  # reads it, and follows no link.
+  bounded 60 chmod -R u+rwX "$root/.miu-ci" 2>/dev/null || true
   odd=$(find "$root/.miu-ci" \( -type l -o ! -type f ! -type d \) -print -quit) || die "refused: .miu-ci has a folder this account cannot read"
   [ -z "$odd" ] || die "refused: a link or special file under .miu-ci"
   mirror_config=()

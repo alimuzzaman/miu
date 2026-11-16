@@ -930,7 +930,7 @@ test('the worker refuses a link or special file in the copies, and a missing cop
     [(src) => fs.writeFileSync(path.join(src, '.env'), 'A="open\n'), /unclosed quote/],
     [(src) => fs.writeFileSync(path.join(src, '.env'), "A='open\n"), /unclosed quote/],
     [(src) => fs.writeFileSync(path.join(src, '.env'), 'A=1\n', { mode: 0o200 }), /refused: \.env is not readable/],
-    [(src, copy) => { fs.rmSync(copy, { recursive: true }); fs.mkdirSync(copy); fs.symlinkSync('/etc', path.join(copy, 'objects')); fs.writeFileSync(path.join(copy, 'HEAD'), 'x'); fs.chmodSync(path.dirname(copy), 0o100); }, /refused: .miu-ci has a folder this account cannot read/],
+    [(src, copy) => { fs.rmSync(copy, { recursive: true }); fs.mkdirSync(copy); fs.symlinkSync('/etc', path.join(copy, 'objects')); fs.writeFileSync(path.join(copy, 'HEAD'), 'x'); fs.chmodSync(path.dirname(copy), 0o100); }, /refused: (a link or special file under|\.miu-ci has a folder this account cannot read)/],
     [(src) => fs.writeFileSync(path.join(src, '.env'), 'GIT_CONFIG_COUNT=1\n'), /sets GIT_CONFIG_COUNT/],
     [(src) => spawnSync('mkfifo', [path.join(src, '.env')]), /refused: \.env is not a plain file/],
   ]) {
