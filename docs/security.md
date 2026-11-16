@@ -60,6 +60,9 @@ Rules the code keeps:
     package's GitHub URLs. Composer reads copies of `composer.json` and
     `composer.lock`, the second without that package's dist. The worktree's
     files are not changed, and no key or token goes into the build.
+    Composer's git cache for that install is in the temp folder as well, so
+    no copy outlives the build. If the helper cannot get the package, the
+    build fails, with no retry: no token can read it.
   - **Who can get a copy.** `miu` runs pull request code in fast checks, so
     anything that runs as `miu` can get a copy of a listed repository. List
     only what every repository Miu tests may read.

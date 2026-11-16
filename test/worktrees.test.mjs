@@ -33,7 +33,7 @@ function server({ helperBody } = {}) {
   // Composer as far as this test needs: which files it read, and what git reads for the package's URLs.
   script(path.join(bin, 'composer'), `printf '%s' "\${COMPOSER:-}" > "${log}/composer-file"
 if [ -n "\${COMPOSER:-}" ]; then
-  cp "\${COMPOSER%.json}.lock" "${log}/lock-seen"; cp "$COMPOSER" "${log}/json-seen"
+  cp "\${COMPOSER%.json}.lock" "${log}/lock-seen"; cp "$COMPOSER" "${log}/json-seen"; printf '%s' "\${COMPOSER_CACHE_VCS_DIR:-}" > "${log}/vcs-dir"; printf '%s' "\${GIT_CONFIG_KEY_0:-}=\${GIT_CONFIG_VALUE_0:-}" > "${log}/config-0"
   for u in \${LS_URLS:-}; do git ls-remote "$u" HEAD | cut -f1 >> "${log}/ls"; done
 fi
 mkdir -p vendor`);
@@ -70,6 +70,9 @@ test('a Pro dependency build reads a deploy-key package from the helper\'s bundl
   assert.deepEqual(s.log('sudo-argv').trim().split('\n'), ['-n', '-H', '-u', 'miu-mirror', s.helper, 'acme/LICENSING']);
   // Composer read copies outside the worktree, and git read the bundle for every URL spelling.
   assert.ok(!s.log('composer-file').startsWith(dir), s.log('composer-file'));
+  // Composer's git cache is in the same temp folder, so no copy outlives the build.
+  assert.equal(s.log('vcs-dir'), path.join(path.dirname(s.log('composer-file')), 'vcs'));
+  assert.ok(path.basename(path.dirname(s.log('composer-file'))).startsWith('miu-ci-mirror-'));
   assert.equal(s.log('json-seen'), before.json);
   assert.deepEqual(s.log('ls').trim().split('\n'), [head, head, head]);
   const seen = JSON.parse(s.log('lock-seen'));
@@ -113,4 +116,13 @@ test('a server with a deploy key listed but no ci-mirror account says so', () =>
   delete env.MIU_CI_MIRROR_USER;
   assert.throws(() => ensureDeps(worktree('pro-x'), { env }), /composer install failed in pro-x: this server reads Acme\/licensing with a deploy key, but has no ci-mirror account/);
   assert.equal(s.log('composer-file'), null);
+});
+
+test('a lock URL without .git still reads the copy, and config the environment carries already is kept', () => {
+  const s = server();
+  const noGit = { ...lock, packages: [{ ...lock.packages[0], source: { ...lock.packages[0].source, url: 'https://github.com/Acme/licensing' } }] };
+  const did = ensureDeps(worktree('pro-nogit', noGit), { env: { ...s.env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.askPass', GIT_CONFIG_VALUE_0: 'true', MIU_CI_MIRRORS_CONF: keyList('Acme/licensing /k SHA256:x\n'), LS_URLS: 'https://github.com/Acme/licensing' } });
+  assert.equal(did[0], 'composer install (Acme/licensing by the server\'s deploy key)');
+  assert.equal(s.log('ls').trim(), head);
+  assert.equal(s.log('config-0'), 'core.askPass=true');
 });

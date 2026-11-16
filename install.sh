@@ -321,7 +321,9 @@ EOF
   id "$MIRROR_USER" >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/miu-mirror --shell /usr/sbin/nologin "$MIRROR_USER"
   # An account made some other way may have a shell, groups (docker) or another home.
   [ "$(getent passwd "$MIRROR_USER" | cut -d: -f6,7)" = "/var/lib/miu-mirror:/usr/sbin/nologin" ] || die "$MIRROR_USER exists with another home or a login shell; fix or remove it first"
-  [ "$(id -Gn "$MIRROR_USER")" = "$MIRROR_USER" ] && [ "$(id -u "$MIRROR_USER")" -ne 0 ] || die "$MIRROR_USER must be an ordinary account in its own group only (it is in: $(id -Gn "$MIRROR_USER")); it must hold nothing else"
+  [ "$(id -Gn "$MIRROR_USER")" = "$MIRROR_USER" ] && [ "$(id -u "$MIRROR_USER")" -ne 0 ] && [ "$(id -g "$MIRROR_USER")" -ne 0 ] \
+    && [ "$(getent group "$MIRROR_USER" | cut -d: -f3)" = "$(id -g "$MIRROR_USER")" ] \
+    && [ "$(getent passwd | awk -F: -v g="$(id -g "$MIRROR_USER")" '$4 == g' | wc -l)" = 1 ] || die "$MIRROR_USER must be an ordinary account in its own group only (it is in: $(id -Gn "$MIRROR_USER")); it must hold nothing else"
   install -d -o "$MIRROR_USER" -g "$MIRROR_USER" -m 0700 /var/lib/miu-mirror /var/lib/miu-mirror/keys /var/lib/miu-mirror/mirrors
   install -o root -g root -m 0755 "$APP/bin/miu-ci-mirror" "$LIB/ci-mirror"
   {
