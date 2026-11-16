@@ -34,7 +34,7 @@ import { askToResolve, askToClose } from '../lib/conflict.mjs';
 import { findPartners, roleOf, keyOf } from '../lib/pairs.mjs';
 import { startStub } from '../lib/stub-renderer.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
-import { fetchRef, checkoutSlot, ensureDeps, checkEnv, CACHE } from '../lib/worktrees.mjs';
+import { fetchRef, checkoutSlot, checkoutCheckSlot, checkSiblings, ensureDeps, checkEnv, CACHE } from '../lib/worktrees.mjs';
 import { runSandboxCi, changesCiDefinition } from '../lib/sandboxci.mjs';
 import { ensureSites, mount, reset, setConstants, writeGuardHosts, GUARD } from '../lib/warmsites.mjs';
 import { project, projectText, profileOf, roles, mainFile } from '../lib/project.mjs';
@@ -587,14 +587,16 @@ async function rexCleanup() {
 // before it (they can take ten minutes). fast-checks.md is rewritten as each
 // one finishes, so the agent reads it when it gets to it. A failure is re-run
 // on dev so the agent can tell a new failure from one dev already has.
-// The checks build and write files, so they run in a third worktree per repo
-// (<repo>-check), never in the worktrees the QA sites are serving.
+// The checks build and write files, so they run in worktrees of their own
+// (check-pr/<repo>, check-dev/<repo>), never in the ones the QA sites are
+// serving, each beside links to its side's sibling trees (../xspeed).
 const prLabel = `${selfRole}-pr`;
 const devLabel = prLabel.replace('-pr', '-dev');
 const checkSlot = (label) => {
   const info = slotInfo[label];
   if (!info) return null;
-  const dir = checkoutSlot(info.repo, 'check', info.sha);
+  const side = label.endsWith('-dev') ? 'dev' : 'pr';
+  const dir = checkoutCheckSlot(info.repo, side, info.sha, checkSiblings(srcs, side, REPO_OF, info.repo));
   ensureDeps(dir, { env: depsEnv, fallbackEnv: depsFallback });
   return dir;
 };
@@ -603,7 +605,9 @@ let devSrc = null;
 const fastLines = new Map((profile.fast_checks ?? []).map((c) => [c.label, `- ${c.label}: waiting`]));
 const writeFast = (done) => write('fast-checks.md', ['# Fast checks on the PR head', '', done ? '' : '_Still running; read this file again later._', '', ...fastLines.values()].join('\n'));
 const runCmd = (cmd, dir) => new Promise((resolve) => {
-  const tmp = checkEnv({ ...envVars, PATH: `${path.dirname(process.execPath)}:${envVars.PATH}`, XSPEED_DIR: srcs['free-pr'] ?? srcs['free-dev'] ?? '' });
+  // The Free tree of this check's side, as its ../xspeed link has it.
+  const free = path.join(path.dirname(dir), 'xspeed');
+  const tmp = checkEnv({ ...envVars, PATH: `${path.dirname(process.execPath)}:${envVars.PATH}`, XSPEED_DIR: fs.existsSync(free) ? free : srcs['free-pr'] ?? srcs['free-dev'] ?? '' });
   const child = spawn('bash', ['-c', cmd], { cwd: dir, env: tmp.env });
   let out = '';
   child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { out += d; });

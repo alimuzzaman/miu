@@ -12,7 +12,7 @@ import { spawnSync } from 'node:child_process';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-wt-test-'));
 process.env.QA_CACHE_DIR = path.join(tmp, 'cache');
-const { ensureDeps, checkEnv } = await import('../lib/worktrees.mjs');
+const { ensureDeps, checkEnv, checkoutCheckSlot, checkSiblings } = await import('../lib/worktrees.mjs');
 
 const script = (f, body) => fs.writeFileSync(f, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
 const git = (dir, ...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
@@ -181,4 +181,43 @@ test('a folder that is not a git repository installs without any restore', () =>
   const s = server();
   const dir = worktree('not-git', { packages: [lock.packages[1]] });
   assert.deepEqual(ensureDeps(dir, { env: { ...s.env, MIU_CI_MIRRORS_CONF: keyList(''), TOUCH: path.join(dir, 'composer.json') } }), ['composer install']);
+});
+
+test('a check side sees the paired PR tree of each other repo, else its dev; the dev side sees dev', () => {
+  const srcs = { 'free-pr': '/wt/xspeed-pr', 'free-dev': '/wt/xspeed-dev', 'pro-pr': '/wt/xspeed-pro-pr', 'pro-dev': '/wt/xspeed-pro-dev', 'hub-dev': '/wt/hub-dev' };
+  const repos = { free: 'Acme/xspeed', pro: 'Acme/xspeed-pro', hub: 'Acme/hub' };
+  assert.deepEqual(checkSiblings(srcs, 'pr', repos, 'Acme/xspeed-pro'), { xspeed: '/wt/xspeed-pr', hub: '/wt/hub-dev' });
+  assert.deepEqual(checkSiblings(srcs, 'dev', repos, 'Acme/xspeed-pro'), { xspeed: '/wt/xspeed-dev', hub: '/wt/hub-dev' });
+  const unpaired = { ...srcs }; delete unpaired['free-pr'];
+  assert.deepEqual(checkSiblings(unpaired, 'pr', repos, 'Acme/xspeed-pro'), { xspeed: '/wt/xspeed-dev', hub: '/wt/hub-dev' });
+});
+
+test('the PR check and the dev check each read ../xspeed from their own Free tree, and neither flips the other', () => {
+  // Pro's bare clone where qa-run keeps it, with one commit.
+  const src = fs.mkdtempSync(path.join(tmp, 'pro-src-'));
+  spawnSync('git', ['init', '-q', '--initial-branch=main', src]);
+  fs.writeFileSync(path.join(src, 'tsconfig.json'), '{"compilerOptions":{"paths":{"@xspeed/*":["../xspeed/src/*"]}}}');
+  git(src, 'add', '-A'); git(src, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x');
+  const sha = git(src, 'rev-parse', 'HEAD').stdout.trim();
+  const bare = path.join(process.env.QA_CACHE_DIR, 'repos', 'xspeed-pro.git');
+  fs.mkdirSync(path.dirname(bare), { recursive: true });
+  spawnSync('git', ['clone', '-q', '--bare', src, bare]);
+  // Two Free trees, told apart by a file.
+  const free = (side) => { const d = fs.mkdtempSync(path.join(tmp, `xspeed-${side}-`)); fs.mkdirSync(path.join(d, 'src')); fs.writeFileSync(path.join(d, 'src', 'side'), side); return d; };
+  const freePr = free('pr'), freeDev = free('dev');
+  const sideOf = (dir) => fs.readFileSync(path.join(dir, '..', 'xspeed', 'src', 'side'), 'utf8');
+  const prDir = checkoutCheckSlot('Acme/xspeed-pro', 'pr', sha, { xspeed: freePr, 'xspeed-pro': '/ignored', '..': '/nope' });
+  const devDir = checkoutCheckSlot('Acme/xspeed-pro', 'dev', sha, { xspeed: freeDev, hub: freeDev });
+  assert.notEqual(path.dirname(prDir), path.dirname(devDir));
+  assert.equal(sideOf(prDir), 'pr');
+  assert.equal(sideOf(devDir), 'dev');
+  assert.ok(fs.existsSync(path.join(prDir, 'tsconfig.json')));
+  // Its own name and odd names never become links.
+  assert.deepEqual(fs.readdirSync(path.dirname(prDir)).sort(), ['xspeed', 'xspeed-pro']);
+  // The next run, unpaired: the PR side moves to dev, and a sibling no longer named goes.
+  checkoutCheckSlot('Acme/xspeed-pro', 'pr', sha, { xspeed: freeDev });
+  checkoutCheckSlot('Acme/xspeed-pro', 'dev', sha, { xspeed: freeDev });
+  assert.equal(sideOf(prDir), 'dev');
+  assert.deepEqual(fs.readdirSync(path.dirname(devDir)).sort(), ['xspeed', 'xspeed-pro']);
+  assert.throws(() => checkoutCheckSlot('Acme/xspeed-pro', 'check', sha), /side is pr or dev/);
 });
