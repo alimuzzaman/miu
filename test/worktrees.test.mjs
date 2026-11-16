@@ -12,7 +12,7 @@ import { spawnSync } from 'node:child_process';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-wt-test-'));
 process.env.QA_CACHE_DIR = path.join(tmp, 'cache');
-const { ensureDeps, checkEnv, checkoutCheckSlot, checkSiblings } = await import('../lib/worktrees.mjs');
+const { ensureDeps, checkEnv, checkoutCheckSlot, checkSiblings, freeDirFor, CACHE } = await import('../lib/worktrees.mjs');
 
 const script = (f, body) => fs.writeFileSync(f, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
 const git = (dir, ...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
@@ -192,16 +192,21 @@ test('a check side sees the paired PR tree of each other repo, else its dev; the
   assert.deepEqual(checkSiblings(unpaired, 'pr', repos, 'Acme/xspeed-pro'), { xspeed: '/wt/xspeed-dev', hub: '/wt/hub-dev' });
 });
 
-test('the PR check and the dev check each read ../xspeed from their own Free tree, and neither flips the other', () => {
-  // Pro's bare clone where qa-run keeps it, with one commit.
-  const src = fs.mkdtempSync(path.join(tmp, 'pro-src-'));
+// A repo's bare clone where qa-run keeps it, with one commit; its sha.
+function bareRepo(name, file) {
+  const src = fs.mkdtempSync(path.join(tmp, `${name}-src-`));
   spawnSync('git', ['init', '-q', '--initial-branch=main', src]);
-  fs.writeFileSync(path.join(src, 'tsconfig.json'), '{"compilerOptions":{"paths":{"@xspeed/*":["../xspeed/src/*"]}}}');
+  fs.writeFileSync(path.join(src, file), name);
   git(src, 'add', '-A'); git(src, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x');
-  const sha = git(src, 'rev-parse', 'HEAD').stdout.trim();
-  const bare = path.join(process.env.QA_CACHE_DIR, 'repos', 'xspeed-pro.git');
+  const bare = path.join(CACHE, 'repos', `${name}.git`);
+  fs.rmSync(bare, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(bare), { recursive: true });
   spawnSync('git', ['clone', '-q', '--bare', src, bare]);
+  return git(src, 'rev-parse', 'HEAD').stdout.trim();
+}
+
+test('the PR check and the dev check each read ../xspeed from their own Free tree, and neither flips the other', () => {
+  const sha = bareRepo('xspeed-pro', 'tsconfig.json');
   // Two Free trees, told apart by a file.
   const free = (side) => { const d = fs.mkdtempSync(path.join(tmp, `xspeed-${side}-`)); fs.mkdirSync(path.join(d, 'src')); fs.writeFileSync(path.join(d, 'src', 'side'), side); return d; };
   const freePr = free('pr'), freeDev = free('dev');
@@ -220,4 +225,56 @@ test('the PR check and the dev check each read ../xspeed from their own Free tre
   assert.equal(sideOf(prDir), 'dev');
   assert.deepEqual(fs.readdirSync(path.dirname(devDir)).sort(), ['xspeed', 'xspeed-pro']);
   assert.throws(() => checkoutCheckSlot('Acme/xspeed-pro', 'check', sha), /side is pr or dev/);
+});
+
+test('Free, Pro and Hub check folders never share a path: a Pro run then a Free run and back leave the serving trees alone', () => {
+  const proSha = bareRepo('pro2', 'pro.txt'), freeSha = bareRepo('free2', 'free.txt');
+  // The Free tree a QA site serves, with an untracked file Miu placed there.
+  const serving = fs.mkdtempSync(path.join(tmp, 'xspeed-pr-serving-'));
+  fs.writeFileSync(path.join(serving, 'built.js'), 'keep');
+  const hub = fs.mkdtempSync(path.join(tmp, 'hub-'));
+  for (let round = 0; round < 2; round++) {
+    const pro = checkoutCheckSlot('Acme/pro2', 'pr', proSha, { free2: serving, hub });
+    const free = checkoutCheckSlot('Acme/free2', 'pr', freeSha, { pro2: pro, hub });
+    assert.ok(fs.existsSync(path.join(pro, 'pro.txt')) && fs.existsSync(path.join(free, 'free.txt')));
+    assert.ok(!fs.lstatSync(free).isSymbolicLink() && !fs.lstatSync(pro).isSymbolicLink());
+    assert.equal(fs.realpathSync(path.join(pro, '..', 'free2')), fs.realpathSync(serving));
+    assert.notEqual(path.dirname(pro), path.dirname(free));
+  }
+  assert.equal(fs.readFileSync(path.join(serving, 'built.js'), 'utf8'), 'keep');
+  assert.deepEqual(fs.readdirSync(serving), ['built.js']);
+});
+
+test('a check folder refuses a link where its checkout goes, and a non-link where a sibling link goes', () => {
+  const sha = bareRepo('linkcheck', 'f');
+  const parent = path.join(CACHE, 'wt', 'check-pr-linkcheck');
+  fs.mkdirSync(parent, { recursive: true });
+  const elsewhere = fs.mkdtempSync(path.join(tmp, 'elsewhere-'));
+  fs.symlinkSync(elsewhere, path.join(parent, 'linkcheck'));
+  assert.throws(() => checkoutCheckSlot('Acme/linkcheck', 'pr', sha), /is a link, not a checkout/);
+  fs.rmSync(path.join(parent, 'linkcheck'));
+  fs.mkdirSync(path.join(parent, 'xspeed'));
+  assert.throws(() => checkoutCheckSlot('Acme/linkcheck', 'pr', sha, { xspeed: elsewhere }), /is not a link; it would not be replaced/);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+});
+
+test('XSPEED_DIR is the side\'s link, else Free of the same side, never the other side\'s', () => {
+  const srcs = { 'free-pr': '/wt/xspeed-pr', 'free-dev': '/wt/xspeed-dev' };
+  const linked = path.join(CACHE, 'wt', 'check-dev-linked');
+  fs.mkdirSync(path.join(linked, 'xspeed'), { recursive: true });
+  assert.equal(freeDirFor(path.join(linked, 'xspeed-pro'), srcs), path.join(linked, 'xspeed'));
+  assert.equal(freeDirFor(path.join(CACHE, 'wt', 'check-dev-xspeed', 'xspeed'), srcs), '/wt/xspeed-dev');
+  assert.equal(freeDirFor(path.join(CACHE, 'wt', 'check-pr-xspeed', 'xspeed'), srcs), '/wt/xspeed-pr');
+  assert.equal(freeDirFor(path.join(CACHE, 'wt', 'check-pr-xspeed', 'xspeed'), { 'free-dev': '/wt/xspeed-dev' }), '/wt/xspeed-dev');
+});
+
+test('deps stamps: a check side\'s checkout is named by its folder, a top-level slot as before', () => {
+  const s = server();
+  for (const [rel, stamp] of [['check-pr-st/st', 'check-pr-st--st.json'], ['st-pr', 'st-pr.json']]) {
+    const dir = path.join(CACHE, 'wt', rel);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'composer.json'), '{}');
+    ensureDeps(dir, { env: { ...s.env, MIU_CI_MIRRORS_CONF: keyList('') } });
+    assert.ok(fs.existsSync(path.join(CACHE, 'deps', stamp)), stamp);
+  }
 });
