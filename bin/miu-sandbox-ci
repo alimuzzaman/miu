@@ -180,7 +180,8 @@ bounded 300 tar -x -C "$root"
 
 # Miu's account runs pull request code in its fast checks, so it can call this
 # script with any tar. Before act sees the workflow, check what it asks of Docker.
-if [ -n "$(find "$root/.github" -type l -print -quit)" ]; then die "refused: a symbolic link under .github"; fi
+links=$(find "$root/.github" -type l -print -quit) || die "refused: .github has a folder this account cannot read"
+[ -z "$links" ] || die "refused: a symbolic link under .github"
 bounded 60 python3 -I - "$root/$workflow" "$job" <<'POLICY'
 import os, shlex, sys
 import yaml
@@ -297,7 +298,10 @@ if [ -n "$mirror_list" ]; then
   echo /.miu-ci/ >> "$root/.git/info/exclude"
   IFS=, read -r -a mirror_repos <<<"$mirror_list"
   [ ${#mirror_repos[@]} -le 4 ] || die "not run: more than 4 deploy-key repositories"
-  if [ -n "$(find "$root/.miu-ci" \( -type l -o ! -type f ! -type d \) -print -quit 2>/dev/null)" ]; then die "refused: a link or special file under .miu-ci"; fi
+  [ -d "$root/.miu-ci" ] || die "not run: Miu sent no deploy-key copies"
+  # find must read every folder: one it cannot list would hide what is in it.
+  odd=$(find "$root/.miu-ci" \( -type l -o ! -type f ! -type d \) -print -quit) || die "refused: .miu-ci has a folder this account cannot read"
+  [ -z "$odd" ] || die "refused: a link or special file under .miu-ci"
   mirror_config=()
   for repo in "${mirror_repos[@]}"; do
     [[ $repo =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ && $repo != */. && $repo != */.. ]] || die "not run: not a repository name: $repo"
@@ -309,12 +313,13 @@ if [ -n "$mirror_list" ]; then
     done
     mirror_config+=(safe.directory "$copy")
   done
-  if grep -qE '^[[:space:]]*(export[[:space:]]+)?GIT_CONFIG_(COUNT|KEY_|VALUE_|PARAMETERS)' "$root/.env" 2>/dev/null; then
+  if [ -e "$root/.env" ] && [ ! -r "$root/.env" ]; then die "refused: .env is not readable"; fi
+  if [ -f "$root/.env" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?GIT_CONFIG_(COUNT|KEY_|VALUE_|PARAMETERS)' "$root/.env"; then
     die "refused: the base branch's .env sets GIT_CONFIG_COUNT, _KEY_ or _VALUE_ variables, which Miu needs for a deploy-key repository"
   fi
   # act reads a quoted value across lines, so an open quote would take in the lines added here.
-  if [ -f "$root/.env" ] && [ $(( $(tr -cd '"' < "$root/.env" | wc -c) % 2 )) -ne 0 ]; then
-    die "refused: the base branch's .env has an unclosed double quote"
+  if [ -f "$root/.env" ] && { [ $(( $(tr -cd '"' < "$root/.env" | wc -c) % 2 )) -ne 0 ] || [ $(( $(tr -cd "'" < "$root/.env" | wc -c) % 2 )) -ne 0 ]; }; then
+    die "refused: the base branch's .env has an unclosed quote"
   fi
   [ ! -s "$root/.env" ] || [ -z "$(tail -c1 "$root/.env")" ] || echo >> "$root/.env"
   {

@@ -319,11 +319,15 @@ EOF
   # miu-mirror, mode 600.
   MIRROR_USER=miu-mirror
   id "$MIRROR_USER" >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/miu-mirror --shell /usr/sbin/nologin "$MIRROR_USER"
+  # An account made some other way may have a shell, groups (docker) or another home.
+  [ "$(getent passwd "$MIRROR_USER" | cut -d: -f6,7)" = "/var/lib/miu-mirror:/usr/sbin/nologin" ] || die "$MIRROR_USER exists with another home or a login shell; fix or remove it first"
+  [ "$(id -G "$MIRROR_USER" | wc -w)" = 1 ] || die "$MIRROR_USER is in other groups ($(id -Gn "$MIRROR_USER")); it must hold nothing else"
   install -d -o "$MIRROR_USER" -g "$MIRROR_USER" -m 0700 /var/lib/miu-mirror /var/lib/miu-mirror/keys /var/lib/miu-mirror/mirrors
   install -o root -g root -m 0755 "$APP/bin/miu-ci-mirror" "$LIB/ci-mirror"
   {
     echo "# $MIU_USER may fetch each repository $ETC/ci-mirrors lists, as $MIRROR_USER, and nothing else."
     if [ -f "$ETC/ci-mirrors" ]; then
+      [[ ! -L "$ETC/ci-mirrors" && $(stat -c '%u %a' "$ETC/ci-mirrors") =~ ^0\ [0-7][0145][45]$ ]] || die "$ETC/ci-mirrors must be root's own file, mode 644"
       while read -r r _ || [ -n "$r" ]; do
         [[ -z $r || $r == \#* ]] && continue
         [[ $r =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ ]] || die "$ETC/ci-mirrors: not a repository name: $r"

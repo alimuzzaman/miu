@@ -864,9 +864,11 @@ echo '{"ok":true,"cells":[{"label":"php","status":"passed","exit_code":0,"output
   const dir = repo({ '.github/workflows/test.yml': wf, 'composer.json': JSON.stringify({ repositories: [{ type: 'vcs', url: 'git@github.com:acme/LICENSING.git' }] }), 'composer.lock': JSON.stringify(lock) });
   const base = git(dir, 'rev-parse', 'HEAD').stdout.trim();
   const app = fakeApp();
+  const objectsBefore = git(dir, 'count-objects', '-v').stdout;
+  const tmpBefore = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith('miu-ci-mirror-'));
   const go = () => runSandboxCi(proCheck, dir, env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
   const read = (f) => { try { return fs.readFileSync(path.join(home, f), 'utf8').trim(); } catch { return ''; } };
-  return { k, s, env, go, read, app, dir, home };
+  return { k, s, env, go, read, app, dir, home, objectsBefore, tmpBefore };
 }
 
 test('end to end: the job installs the deploy-key repo from its copy; no key, no token, the PR\'s own files untouched', needsYaml, async () => {
@@ -883,8 +885,12 @@ test('end to end: the job installs the deploy-key repo from its copy; no key, no
   assert.equal(t.read('committed-copy'), '0');
   assert.equal(JSON.parse(t.read('lock')).packages[0].dist, undefined);
   assert.match(t.read('env'), /^GIT_CONFIG_VALUE_0=git@github\.com:Acme\/licensing\.git$/m);
-  // The pull request's clone has no new branch or tag, and its tree is as it was.
+  // The pull request's clone has no new branch or tag, its tree is as it was,
+  // and it holds no copy: the commit with the copies lived in a throwaway store.
   assert.equal(git(t.dir, 'status', '--porcelain', '--untracked-files=no').stdout, '');
+  const objectsAfter = git(t.dir, 'count-objects', '-v').stdout;
+  assert.equal(objectsAfter, t.objectsBefore);
+  assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith('miu-ci-mirror-')).filter((f) => !t.tmpBefore.includes(f)), []);
   // GitHub down: the run still passes on the copy, and its log says so first.
   fs.renameSync(t.k.origin, `${t.k.origin}.away`);
   const stale = await t.go();
@@ -921,7 +927,10 @@ test('the worker refuses a link or special file in the copies, and a missing cop
     [(src, copy) => fs.symlinkSync('/etc', path.join(copy, 'objects/x')), /refused: a link or special file under .miu-ci/],
     [(src, copy) => spawnSync('mkfifo', [path.join(copy, 'objects/f')]), /refused: a link or special file under .miu-ci/],
     [(src, copy) => fs.rmSync(path.join(copy, 'HEAD')), /not run: Miu sent no copy of Acme\/licensing/],
-    [(src) => fs.writeFileSync(path.join(src, '.env'), 'A="open\n'), /unclosed double quote/],
+    [(src) => fs.writeFileSync(path.join(src, '.env'), 'A="open\n'), /unclosed quote/],
+    [(src) => fs.writeFileSync(path.join(src, '.env'), "A='open\n"), /unclosed quote/],
+    [(src) => fs.writeFileSync(path.join(src, '.env'), 'A=1\n', { mode: 0o200 }), /refused: \.env is not readable/],
+    [(src, copy) => { fs.rmSync(copy, { recursive: true }); fs.mkdirSync(copy); fs.symlinkSync('/etc', path.join(copy, 'objects')); fs.writeFileSync(path.join(copy, 'HEAD'), 'x'); fs.chmodSync(path.dirname(copy), 0o100); }, /refused: .miu-ci has a folder this account cannot read/],
     [(src) => fs.writeFileSync(path.join(src, '.env'), 'GIT_CONFIG_COUNT=1\n'), /sets GIT_CONFIG_COUNT/],
     [(src) => spawnSync('mkfifo', [path.join(src, '.env')]), /refused: \.env is not a plain file/],
   ]) {
@@ -951,4 +960,16 @@ test('the worker revokes only an installation token, nothing else', () => {
   const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from('miu-ci-secrets 1\nGITHUB_TOKEN=not_an_installation_token\n'), tar]), env: s.env, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(s.curl('argv'), '');
+});
+
+test('the deploy-key copy is made before any token: a helper that fails leaves nothing minted', needsYaml, async () => {
+  const s = headerWorker();
+  const app = fakeApp();
+  const { dir, base } = proRepo();
+  const failing = fakeMirror();
+  script(failing.MIU_CI_MIRROR_HELPER, 'echo "not run: this server has no deploy key for Acme/licensing" >&2; exit 2');
+  const r = await runSandboxCi(proCheck, dir, { ...s.env, ...failing, MIU_CI_MIRRORS_CONF: keyList('Acme/licensing /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
+  assert.deepEqual(r, { notRun: 'not run: this server has no deploy key for Acme/licensing' });
+  assert.deepEqual(app.calls.mint, []);
+  assert.equal(s.head(), '');
 });

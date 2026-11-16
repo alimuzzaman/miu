@@ -25,7 +25,8 @@ repo=$1 asked=$1
 # sudo resets the environment, so only a test can point these elsewhere.
 conf=${MIU_CI_MIRRORS_CONF:-/etc/miu/ci-mirrors}
 known_hosts=${MIU_CI_KNOWN_HOSTS:-/usr/local/lib/miu/github-known-hosts}
-home=${MIU_CI_MIRRORS_DIR:-$HOME/mirrors}
+# The account's own home from passwd, not $HOME.
+home=${MIU_CI_MIRRORS_DIR:-$(getent passwd "$(id -un)" | cut -d: -f6)/mirrors}
 git_host=${MIU_CI_MIRROR_HOST:-git@github.com:}
 root_uid=${MIU_CI_ROOT_UID:-0}
 max_age_minutes=${MIU_CI_MIRROR_MAX_AGE_MINUTES:-1440}
