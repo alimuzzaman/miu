@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos, deployKeyRepos, NO_TOKEN } from '../lib/sandboxci.mjs';
+import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos, deployKeyRepos } from '../lib/sandboxci.mjs';
 import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling } from '../lib/ci.mjs';
 
 const WORKER = fileURLToPath(new URL('../bin/miu-sandbox-ci', import.meta.url));
@@ -703,7 +703,7 @@ test('a repo Composer reads is read with this server\'s deploy key, not the App:
   assert.equal(s.head(), 'miu-ci-secrets 3 mirrors=Acme/licensing');
 });
 
-test('a run that then reads nothing with a token gets a stand-in for the token its workflow names, and no token is made', needsYaml, async () => {
+test('a run whose only private package comes by deploy key, but whose workflow names a token, gets one that reads no code', needsYaml, async () => {
   const s = headerWorker();
   const app = fakeApp();
   const wf = `jobs:\n  php:\n    runs-on: ubuntu-22.04\n    steps:\n      - name: Check out Free\n        if: \${{ !env.ACT }}\n        uses: actions/checkout@v4\n        with: { repository: Acme/free, token: "\${{ secrets.FREE_REPO_TOKEN || github.token }}" }\n      - run: composer install --prefer-dist\n        env:\n          COMPOSER_AUTH: '{"github-oauth":{"github.com":"\${{ secrets.FREE_REPO_TOKEN || github.token }}"}}'\n`;
@@ -711,13 +711,12 @@ test('a run that then reads nothing with a token gets a stand-in for the token i
   const base = git(dir, 'rev-parse', 'HEAD').stdout.trim();
   const r = await runSandboxCi(proCheck, dir, { ...s.env, MIU_CI_MIRRORS_CONF: keyList('acme/LICENSING /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
   assert.equal(r.status, 0, JSON.stringify(r));
-  assert.deepEqual(app.calls.mint, []);
-  assert.deepEqual(app.calls.revoked, []);
-  // Never GITHUB_TOKEN: act fetches public actions with it.
-  assert.equal(s.head(), 'miu-ci-secrets 1 mirrors=Acme/licensing');
-  assert.deepEqual(s.secrets(), [`FREE_REPO_TOKEN=${NO_TOKEN}`]);
-  // Composer takes it as a github-oauth token; it opens nothing.
-  assert.match(NO_TOKEN, /^[.A-Za-z0-9_]+$/);
+  // Composer sends it with public downloads too, so it must be a real token: metadata of the own repo only.
+  assert.deepEqual(app.calls.mint, [['Acme', ['pro'], []]]);
+  assert.deepEqual(app.calls.opts[0].permissions, { metadata: 'read' });
+  assert.deepEqual(app.calls.revoked, [TOKEN]);
+  assert.equal(s.head(), 'miu-ci-secrets 2 mirrors=Acme/licensing');
+  assert.deepEqual(s.secrets(), [`FREE_REPO_TOKEN=${TOKEN}`, `GITHUB_TOKEN=${TOKEN}`]);
 });
 
 test('a repo the workflow checks out still needs the App: actions/checkout does not read the mirror', needsYaml, async () => {
@@ -844,14 +843,14 @@ test('the worker refuses a deploy-key repo unless root\'s list, the key and its 
   notRun(/refused: the base branch's .env sets GIT_CONFIG_/, () => fs.writeFileSync(path.join(k.src, '.env'), 'GIT_CONFIG_COUNT=1\n'), () => fs.rmSync(path.join(k.src, '.env')));
 });
 
-test('the worker revokes only an installation token, not the stand-in', () => {
+test('the worker revokes only an installation token, nothing else', () => {
   const sandbox = sandboxHome();
   const src = fs.mkdtempSync(path.join(tmp, 'hdr-'));
   fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
   fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), OK);
   const tar = spawnSync('tar', ['-c', '-C', src, '.']).stdout;
   const s = server({ home: sandbox.home });
-  const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from(`miu-ci-secrets 1\nGITHUB_TOKEN=${NO_TOKEN}\n`), tar]), env: s.env, encoding: 'utf8' });
+  const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from(`miu-ci-secrets 1\nGITHUB_TOKEN=not_an_installation_token\n`), tar]), env: s.env, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(s.curl('argv'), '');
 });

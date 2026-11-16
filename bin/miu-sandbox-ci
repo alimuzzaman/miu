@@ -56,7 +56,7 @@ unset header line
 revoke_token() {
   local l
   for l in ${secret_lines[@]+"${secret_lines[@]}"}; do
-    # Only an installation token: a run that reads nothing gets a stand-in.
+    # Only an installation token (ghs_), never anything else in that line.
     [[ $l == GITHUB_TOKEN=ghs_* ]] || continue
     printf 'header = "Authorization: token %s"\n' "${l#GITHUB_TOKEN=}" \
       | timeout -k 5 30 curl -sS --fail --retry 2 -o /dev/null -X DELETE -H 'Accept: application/vnd.github+json' -H 'User-Agent: miu' -K - https://api.github.com/installation/token >/dev/null 2>&1 \
