@@ -105,7 +105,7 @@ reserve_mem_gb=${MIU_CI_RESERVE_MEM_GB:-4} reserve_cpus=${MIU_CI_RESERVE_CPUS:-1
 slots=${MIU_CI_SLOTS_DIR:-$HOME/.cache/miu-sandbox-ci-slots}
 mkdir -p -m 0700 "$slots"
 slot=$(python3 -I - "$slots" "$run_mem_gb" "$run_cpus" "$pool_mem_gb" "$pool_cpus" "$reserve_mem_gb" "$reserve_cpus" <<'SLOTS'
-import fcntl, os, sys
+import fcntl, os, sys, time
 folder = sys.argv[1]
 run_mem, run_cpus, pool_mem, pool_cpus, reserve_mem, reserve_cpus = map(float, sys.argv[2:8])
 most = int(min(pool_mem // run_mem, pool_cpus // run_cpus))
@@ -122,8 +122,28 @@ def free_now():
         except (OSError, KeyError, ValueError):
             mem = float("inf")
     if cpus is None:
-        cpus = (os.cpu_count() or 1) - os.getloadavg()[0]
+        cpus = idle_cpus()
     return float(mem), float(cpus)
+
+def idle_cpus():
+    # Cores left idle, sampled over a few seconds from /proc/stat. Not the load
+    # average: on a server with many short processes (container healthchecks)
+    # it stays above the core count while cores sit idle. Tests give two sample
+    # files and no wait.
+    first, _, second = os.environ.get("MIU_CI_PROC_STAT", "/proc/stat:/proc/stat").partition(":")
+    wait = float(os.environ.get("MIU_CI_CPU_SAMPLE_SECONDS", "5"))
+    def sample(p):
+        with open(p) as f:
+            v = [int(x) for x in f.readline().split()[1:9]]
+        # idle + iowait, out of user..steal
+        return v[3] + v[4], sum(v)
+    try:
+        i1, t1 = sample(first)
+        time.sleep(wait)
+        i2, t2 = sample(second or first)
+    except (OSError, ValueError, IndexError):
+        return (os.cpu_count() or 1) - os.getloadavg()[0]
+    return (os.cpu_count() or 1) * (i2 - i1) / max(t2 - t1, 1)
 
 def busy(index):
     fd = os.open(os.path.join(folder, f"{index}.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -140,8 +160,10 @@ def busy(index):
 if most < 1:
     sys.exit("not run: Sandbox CI has no room configured on this server")
 mem, cpus = free_now()
-if mem - run_mem < reserve_mem or cpus - run_cpus < reserve_cpus:
-    sys.exit(f"not run: this server is busy ({mem:.1f} GB memory and {max(cpus, 0):.1f} CPUs free); try again later")
+# A run's container is capped by miu-ci.slice, so on a busy server it runs
+# slower rather than starving the rest; it needs at least one idle core.
+if mem - run_mem < reserve_mem or cpus < max(reserve_cpus, 1):
+    sys.exit(f"not run: this server is busy ({mem:.1f} GB memory free and {max(cpus, 0):.1f} CPUs idle); try again later")
 for index in range(most):
     if not busy(index):
         print(index)

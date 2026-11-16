@@ -175,12 +175,27 @@ test('a bigger pool allows more runs at once', async () => {
 });
 
 test('does not start when the server is short of memory or CPU', async () => {
-  for (const [free, why] of [[{ MIU_CI_FREE_MEM_GB: '5', MIU_CI_FREE_CPUS: '8' }, 'memory'], [{ MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '2.5' }, 'CPU']]) {
+  for (const [free, why] of [[{ MIU_CI_FREE_MEM_GB: '5', MIU_CI_FREE_CPUS: '8' }, 'memory'], [{ MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '0.5' }, 'CPU']]) {
     const sandbox = sandboxHome();
     const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
     const r = await runSandboxCi(check, repo(), { ...server({ home: sandbox.home }).env, ...free, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots') });
     assert.match(r.notRun ?? '', /this server is busy/, `short of ${why}`);
     assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false, `nothing ran when short of ${why}`);
+  }
+});
+
+// Idle cores come from /proc/stat sampled over a few seconds, not the load
+// average, which a server full of healthchecks keeps above its core count.
+test('the CPU check counts idle cores from /proc/stat: none idle waits, idle cores run', async () => {
+  const stat = (name, user, idle) => { const f = path.join(tmp, `${name}-${process.hrtime.bigint()}`); fs.writeFileSync(f, `cpu  ${user} 0 0 ${idle} 0 0 0 0 0 0\ncpu0 1 2 3 4\n`); return f; };
+  for (const [after, busy] of [[stat('b', 1100, 1000), true], [stat('b', 1000, 1100), false]]) {
+    const sandbox = sandboxHome();
+    const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
+    const env = { ...server({ home: sandbox.home }).env, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots'), MIU_CI_PROC_STAT: `${stat('a', 1000, 1000)}:${after}`, MIU_CI_CPU_SAMPLE_SECONDS: '0' };
+    delete env.MIU_CI_FREE_CPUS;
+    const r = await runSandboxCi(check, repo(), env);
+    if (busy) assert.match(r.notRun ?? '', /this server is busy \(20\.0 GB memory free and 0\.0 CPUs idle\)/);
+    else assert.equal(r.status, 0, JSON.stringify(r));
   }
 });
 

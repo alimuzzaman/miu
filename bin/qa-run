@@ -34,7 +34,7 @@ import { askToResolve, askToClose } from '../lib/conflict.mjs';
 import { findPartners, roleOf, keyOf } from '../lib/pairs.mjs';
 import { startStub } from '../lib/stub-renderer.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
-import { fetchRef, checkoutSlot, ensureDeps, CACHE } from '../lib/worktrees.mjs';
+import { fetchRef, checkoutSlot, ensureDeps, checkEnv, CACHE } from '../lib/worktrees.mjs';
 import { runSandboxCi, changesCiDefinition } from '../lib/sandboxci.mjs';
 import { ensureSites, mount, reset, setConstants, writeGuardHosts, GUARD } from '../lib/warmsites.mjs';
 import { project, projectText, profileOf, roles, mainFile } from '../lib/project.mjs';
@@ -603,7 +603,7 @@ let devSrc = null;
 const fastLines = new Map((profile.fast_checks ?? []).map((c) => [c.label, `- ${c.label}: waiting`]));
 const writeFast = (done) => write('fast-checks.md', ['# Fast checks on the PR head', '', done ? '' : '_Still running; read this file again later._', '', ...fastLines.values()].join('\n'));
 const runCmd = (cmd, dir) => new Promise((resolve) => {
-  const child = spawn('bash', ['-c', cmd], { cwd: dir, env: { ...envVars, PATH: `${path.dirname(process.execPath)}:${envVars.PATH}`, XSPEED_DIR: srcs['free-pr'] ?? srcs['free-dev'] ?? '' } });
+  const child = spawn('bash', ['-c', cmd], { cwd: dir, env: checkEnv({ ...envVars, PATH: `${path.dirname(process.execPath)}:${envVars.PATH}`, XSPEED_DIR: srcs['free-pr'] ?? srcs['free-dev'] ?? '' }, runDir) });
   let out = '';
   child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { out += d; });
   const timer = setTimeout(() => child.kill('SIGTERM'), 20 * 60 * 1000);

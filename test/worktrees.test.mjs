@@ -12,7 +12,7 @@ import { spawnSync } from 'node:child_process';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-wt-test-'));
 process.env.QA_CACHE_DIR = path.join(tmp, 'cache');
-const { ensureDeps } = await import('../lib/worktrees.mjs');
+const { ensureDeps, checkEnv } = await import('../lib/worktrees.mjs');
 
 const script = (f, body) => fs.writeFileSync(f, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
 const git = (dir, ...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
@@ -36,6 +36,7 @@ if [ -n "\${COMPOSER:-}" ]; then
   cp "\${COMPOSER%.json}.lock" "${log}/lock-seen"; cp "$COMPOSER" "${log}/json-seen"; printf '%s' "\${COMPOSER_CACHE_VCS_DIR:-}" > "${log}/vcs-dir"; printf '%s' "\${GIT_CONFIG_KEY_0:-}=\${GIT_CONFIG_VALUE_0:-}" > "${log}/config-0"
   for u in \${LS_URLS:-}; do git ls-remote "$u" HEAD | cut -f1 >> "${log}/ls"; done
 fi
+if [ -n "\${TOUCH:-}" ]; then echo regenerated >> "$TOUCH"; fi
 mkdir -p vendor`);
   const tmpdir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
   return {
@@ -125,4 +126,29 @@ test('a lock URL without .git still reads the copy, and config the environment c
   assert.equal(did[0], 'composer install (Acme/licensing by the server\'s deploy key)');
   assert.equal(s.log('ls').trim(), head);
   assert.equal(s.log('config-0'), 'core.askPass=true');
+});
+
+test('committed files the install rewrites go back to the commit; the PR\'s own changes stay', () => {
+  const s = server();
+  const dir = path.join(fs.mkdtempSync(path.join(tmp, 'wt-')), 'pro-restore');
+  fs.mkdirSync(path.join(dir, 'includes/Dependencies'), { recursive: true });
+  spawnSync('git', ['init', '-q', dir]);
+  fs.writeFileSync(path.join(dir, 'composer.json'), '{}');
+  fs.writeFileSync(path.join(dir, 'includes/Dependencies/Api.php'), 'committed\n');
+  fs.writeFileSync(path.join(dir, 'own.php'), 'committed\n');
+  git(dir, 'add', '-A'); git(dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x');
+  fs.writeFileSync(path.join(dir, 'own.php'), 'changed before the install\n');
+  const did = ensureDeps(dir, { env: { ...s.env, MIU_CI_MIRRORS_CONF: keyList(''), TOUCH: path.join(dir, 'includes/Dependencies/Api.php') } });
+  assert.deepEqual(did, ['composer install', 'restored 1 committed file the install rewrote']);
+  assert.equal(fs.readFileSync(path.join(dir, 'includes/Dependencies/Api.php'), 'utf8'), 'committed\n');
+  assert.equal(fs.readFileSync(path.join(dir, 'own.php'), 'utf8'), 'changed before the install\n');
+});
+
+test('each fast check gets its own empty temp folder in the run folder', () => {
+  const runDir = fs.mkdtempSync(path.join(tmp, 'run-'));
+  const a = checkEnv({ PATH: '/bin', TMPDIR: '/tmp' }, runDir), b = checkEnv({ PATH: '/bin' }, runDir);
+  assert.ok(a.TMPDIR.startsWith(path.join(runDir, 'check-tmp') + path.sep));
+  assert.notEqual(a.TMPDIR, b.TMPDIR);
+  assert.equal(a.TMP, a.TMPDIR); assert.equal(a.TEMP, a.TMPDIR); assert.equal(a.PATH, '/bin');
+  assert.deepEqual(fs.readdirSync(a.TMPDIR), []);
 });
