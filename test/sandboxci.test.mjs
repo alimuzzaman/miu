@@ -38,10 +38,12 @@ function server({ worker, home, docker = 'exit 0' }) {
   script(path.join(bin, 'sudo'), `printf '%s\\n' "$@" > "${bin}/sudo-argv"\nshift 4\nexec "$@"`);
   script(path.join(bin, 'timeout'), 'shift 3\nexec "$@"');
   script(path.join(bin, 'docker'), docker);
+  script(path.join(bin, 'curl'), `cat >> "${bin}/curl-stdin"\nprintf '%s\\n' "$@" >> "${bin}/curl-argv"`);
   if (!hasYaml) script(path.join(bin, 'python3'), 'exit 0');
   return {
     env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '8' },
     sudoArgv: () => fs.readFileSync(path.join(bin, 'sudo-argv'), 'utf8').trim().split('\n'),
+    curl: (f) => { try { return fs.readFileSync(path.join(bin, `curl-${f}`), 'utf8'); } catch { return ''; } },
   };
 }
 
@@ -512,33 +514,57 @@ test('a run gets one token for the pull request\'s repo and every one it reaches
   // The log never shows it, in any form; and it is revoked when the run ends.
   assert.doesNotMatch(r.log + r.out, new RegExp(`${TOKEN}|${Buffer.from(`x-access-token:${TOKEN}`).toString('base64')}`));
   assert.deepEqual(app.calls.revoked, [TOKEN]);
+  // The worker revokes it as well, with the token on curl's stdin, not its arguments.
+  assert.equal(s.curl('stdin'), `header = "Authorization: token ${TOKEN}"\n`);
+  assert.match(s.curl('argv'), /DELETE[\s\S]*https:\/\/api\.github\.com\/installation\/token/);
+  assert.doesNotMatch(s.curl('argv'), new RegExp(TOKEN));
 });
 
-test('the pull request cannot widen its token through its own composer.json', needsYaml, async () => {
+test('the pull request cannot widen its token through its own composer.json: a need outside the grant is not run', needsYaml, async () => {
   const app = fakeApp();
+  const sandbox = sandboxHome();
   const { dir, base } = proRepo({ prComposer: JSON.stringify({ repositories: [{ type: 'vcs', url: 'https://github.com/Acme/secret-plans' }] }) });
-  await runSandboxCi(proCheck, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
-  assert.ok(!app.calls.mint[0][1].includes('secret-plans'));
-  assert.ok(app.calls.mint[0][1].includes('licensing'));
-  // With no base branch to read (a QA run's fast check), no manifest is read at all.
-  const app2 = fakeApp();
-  await runSandboxCi(proCheck, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app2.mint, revoke: app2.revoke });
-  assert.deepEqual(app2.calls.mint[0][1], ['pro', 'free', 'tools', 'hub']);
+  const r = await runSandboxCi(proCheck, dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
+  assert.deepEqual(r, { notRun: 'no access to Acme/secret-plans: the pull request needs it and its base branch does not' });
+  assert.deepEqual(app.calls.mint, []);
+  assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
+});
+
+test('a fast check reads nothing from the pull request to grant: only its own repo and the profile\'s repos', needsYaml, async () => {
+  // A workflow on the branch the pull request targets is the pull request's too.
+  const app = fakeApp();
+  const r = await runSandboxCi(proCheck, proRepo().dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
+  assert.match(r.notRun, /^no access to Acme\/free, Acme\/tools, Acme\/hub, Acme\/licensing: a fast check gets only its own repository and the profile's sandbox_ci.repos$/);
+  assert.deepEqual(app.calls.mint, []);
+  const listed = { label: 'CI', sandbox_ci: { ...proCheck.sandbox_ci, repos: ['Acme/free', 'Acme/tools', 'Acme/hub', 'Acme/licensing'] } };
+  const ok = await runSandboxCi(listed, proRepo().dir, server({ home: sandboxHome({ plan: '{"jobs":[{"id":"php","cells":[{"matrix":{}}]}]}' }).home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
+  assert.equal(ok.status, 0, JSON.stringify(ok));
+  assert.deepEqual(app.calls.mint[0][1], ['pro', 'free', 'tools', 'hub', 'licensing']);
 });
 
 test('a profile can add a repository the run reads', needsYaml, async () => {
   const app = fakeApp();
-  await runSandboxCi({ label: 'CI', sandbox_ci: { ...proCheck.sandbox_ci, repos: ['Acme/extra', 'acme/free'] } }, proRepo().dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
-  assert.deepEqual(app.calls.mint[0][1], ['pro', 'free', 'tools', 'hub', 'extra']);
+  const { dir, base } = proRepo();
+  await runSandboxCi({ label: 'CI', sandbox_ci: { ...proCheck.sandbox_ci, repos: ['Acme/extra', 'acme/free'] } }, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
+  assert.deepEqual(app.calls.mint[0][1], ['pro', 'extra', 'free', 'tools', 'hub', 'licensing']);
 });
 
 test('no access to a repository it needs: not run, and says which', needsYaml, async () => {
   const sandbox = sandboxHome();
-  const r = await runSandboxCi(proCheck, proRepo().dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', ...fakeApp({ missing: ['Acme/free'] }) });
-  assert.deepEqual(r, { notRun: 'no access to Acme/free: install the Miu GitHub App there' });
+  const { dir, base } = proRepo();
+  const r = await runSandboxCi(proCheck, dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', trustedRef: base, ...fakeApp({ missing: ['Acme/licensing'] }) });
+  assert.deepEqual(r, { notRun: 'no access to Acme/licensing: install the Miu GitHub App there' });
   assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
-  const failed = await runSandboxCi(proCheck, proRepo().dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', mint: async () => { throw new Error('GitHub: HTTP 500'); }, revoke: async () => {} });
+  const failed = await runSandboxCi(proCheck, dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', trustedRef: base, mint: async () => { throw new Error('GitHub: HTTP 500'); }, revoke: async () => {} });
   assert.match(failed.notRun, /^could not get access to Acme\/pro, Acme\/free/);
+});
+
+test('more GitHub-token secrets than the worker takes: not run, before any token is made', needsYaml, async () => {
+  const app = fakeApp();
+  const steps = Array.from({ length: 9 }, (_, i) => `      - run: echo "\${{ secrets.T${i} || github.token }}"`).join('\n');
+  const r = await runSandboxCi(check, repo({ '.github/workflows/test.yml': `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n${steps}\n` }), server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
+  assert.match(r.notRun, /uses 9 secrets as a GitHub token; Miu gives at most 8/);
+  assert.deepEqual(app.calls.mint, []);
 });
 
 test('another owner\'s checkout must be public; one named by an expression is not run', needsYaml, async () => {

@@ -45,6 +45,19 @@ for ((i = 0; i < secret_count; i++)); do
 done
 unset header line
 
+# The token ends with this run, revoked here as well as by Miu, so it ends
+# also when Miu restarted or stopped waiting. curl reads its header from
+# stdin (-K -), so the token is in no process's arguments.
+revoke_token() {
+  local l
+  for l in ${secret_lines[@]+"${secret_lines[@]}"}; do
+    [[ $l == GITHUB_TOKEN=* ]] || continue
+    printf 'header = "Authorization: token %s"\n' "${l#GITHUB_TOKEN=}" \
+      | timeout -k 5 30 curl -sS -o /dev/null -X DELETE -H 'Accept: application/vnd.github+json' -H 'User-Agent: miu' -K - https://api.github.com/installation/token >/dev/null 2>&1 || true
+  done
+}
+trap revoke_token EXIT
+
 sb="$HOME/sandbox/sb-src/sb"
 [ -x "$sb" ] || die "no Sandbox CLI at $sb"
 
@@ -142,6 +155,7 @@ except OSError:
 root=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci.XXXXXX")
 config=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci-config.XXXXXX")
 cleanup() {
+  revoke_token
   # A job stopped at its time limit leaves its containers behind.
   for id in $(bounded 30 docker ps -aq --filter name=act- 2>/dev/null || true); do
     if bounded 30 docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$id" 2>/dev/null | grep -qF "${root##*/}"; then
