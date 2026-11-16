@@ -85,4 +85,4 @@ if [ "$fetched" = 0 ]; then
 else
   touch "$dir"
 fi
-bounded 300 git -C "$dir" "${nohooks[@]}" bundle create --quiet - --branches --tags || die "not run: could not bundle the $repo mirror"
+bounded 300 git -C "$dir" "${nohooks[@]}" bundle create --quiet - HEAD --branches --tags || die "not run: could not bundle the $repo mirror"
