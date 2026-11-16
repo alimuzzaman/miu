@@ -923,14 +923,33 @@ test('the worker refuses a link or special file in the copies, and a missing cop
     return spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from('miu-ci-secrets 0 mirrors=Acme/licensing\n'), tar]), env, encoding: 'utf8' });
   };
   assert.equal(send(() => {}).status, 0);
+  // Modes a plain tar of this account's files cannot carry: made by hand.
+  const crafted = (entries) => spawnSync('python3', ['-c', `
+import io, json, sys, tarfile
+out = io.BytesIO()
+with tarfile.open(fileobj=out, mode="w") as t:
+    for name, kind, mode, data in json.loads(sys.argv[1]):
+        i = tarfile.TarInfo(name); i.mode = mode
+        if kind == "dir": i.type = tarfile.DIRTYPE; t.addfile(i)
+        elif kind == "link": i.type = tarfile.SYMTYPE; i.linkname = data; t.addfile(i)
+        else: b = data.encode(); i.size = len(b); t.addfile(i, io.BytesIO(b))
+sys.stdout.buffer.write(out.getvalue())`, JSON.stringify(entries)]).stdout;
+  const base = [['.github', 'dir', 0o755, ''], ['.github/workflows', 'dir', 0o755, ''], ['.github/workflows/test.yml', 'file', 0o644, OK], ['.miu-ci', 'dir', 0o755, ''], ['.miu-ci/mirrors', 'dir', 0o755, '']];
+  const sendTar = (entries) => spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from('miu-ci-secrets 0 mirrors=Acme/licensing\n'), crafted(entries)]), env, encoding: 'utf8' });
+  const copyOk = [['.miu-ci/mirrors/acme', 'dir', 0o755, ''], ['.miu-ci/mirrors/acme/licensing.git', 'dir', 0o755, ''], ['.miu-ci/mirrors/acme/licensing.git/HEAD', 'file', 0o644, 'ref: refs/heads/main\n'], ['.miu-ci/mirrors/acme/licensing.git/objects', 'dir', 0o755, '']];
+  // A folder locked to this account still gets checked: a link inside it is found.
+  const locked = sendTar([...base, ['.miu-ci/mirrors/acme', 'dir', 0o755, ''], ['.miu-ci/mirrors/acme/licensing.git', 'dir', 0o755, ''], ['.miu-ci/mirrors/acme/licensing.git/HEAD', 'file', 0o644, 'x'], ['.miu-ci/mirrors/acme/licensing.git/objects', 'link', 0o777, '/etc'], ['.miu-ci/mirrors/acme', 'dir', 0o100, '']]);
+  assert.equal(locked.status, 2, locked.stderr);
+  assert.match(locked.stderr, /refused: a link or special file under .miu-ci/);
+  const unreadable = sendTar([...base, ...copyOk, ['.env', 'file', 0o200, 'A=1\n']]);
+  assert.equal(unreadable.status, 2, unreadable.stderr);
+  assert.match(unreadable.stderr, /refused: \.env is not readable/);
   for (const [setup, why] of [
     [(src, copy) => fs.symlinkSync('/etc', path.join(copy, 'objects/x')), /refused: a link or special file under .miu-ci/],
     [(src, copy) => spawnSync('mkfifo', [path.join(copy, 'objects/f')]), /refused: a link or special file under .miu-ci/],
     [(src, copy) => fs.rmSync(path.join(copy, 'HEAD')), /not run: Miu sent no copy of Acme\/licensing/],
     [(src) => fs.writeFileSync(path.join(src, '.env'), 'A="open\n'), /unclosed quote/],
     [(src) => fs.writeFileSync(path.join(src, '.env'), "A='open\n"), /unclosed quote/],
-    [(src) => fs.writeFileSync(path.join(src, '.env'), 'A=1\n', { mode: 0o200 }), /refused: \.env is not readable/],
-    [(src, copy) => { fs.rmSync(copy, { recursive: true }); fs.mkdirSync(copy); fs.symlinkSync('/etc', path.join(copy, 'objects')); fs.writeFileSync(path.join(copy, 'HEAD'), 'x'); fs.chmodSync(path.dirname(copy), 0o100); }, /refused: (a link or special file under|\.miu-ci has a folder this account cannot read)/],
     [(src) => fs.writeFileSync(path.join(src, '.env'), 'GIT_CONFIG_COUNT=1\n'), /sets GIT_CONFIG_COUNT/],
     [(src) => spawnSync('mkfifo', [path.join(src, '.env')]), /refused: \.env is not a plain file/],
   ]) {
