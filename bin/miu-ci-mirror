@@ -26,7 +26,9 @@ repo=$1 asked=$1
 conf=${MIU_CI_MIRRORS_CONF:-/etc/miu/ci-mirrors}
 known_hosts=${MIU_CI_KNOWN_HOSTS:-/usr/local/lib/miu/github-known-hosts}
 # The account's own home from passwd, not $HOME.
-home=${MIU_CI_MIRRORS_DIR:-$(getent passwd "$(id -un)" | cut -d: -f6)/mirrors}
+own_home=$(getent passwd "$(id -un)" | cut -d: -f6) || true
+[ -n "$own_home" ] || [ -n "${MIU_CI_MIRRORS_DIR:-}" ] || die "not run: this account has no home folder for its mirrors"
+home=${MIU_CI_MIRRORS_DIR:-$own_home/mirrors}
 git_host=${MIU_CI_MIRROR_HOST:-git@github.com:}
 root_uid=${MIU_CI_ROOT_UID:-0}
 max_age_minutes=${MIU_CI_MIRROR_MAX_AGE_MINUTES:-1440}

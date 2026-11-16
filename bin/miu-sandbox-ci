@@ -320,18 +320,17 @@ if [ -n "$mirror_list" ]; then
   if [ -f "$root/.env" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?GIT_CONFIG_(COUNT|KEY_|VALUE_|PARAMETERS)' "$root/.env"; then
     die "refused: the base branch's .env sets GIT_CONFIG_COUNT, _KEY_ or _VALUE_ variables, which Miu needs for a deploy-key repository"
   fi
-  # act reads a quoted value across lines, so an open quote would take in the lines added here.
-  if [ -f "$root/.env" ] && { [ $(( $(tr -cd '"' < "$root/.env" | wc -c) % 2 )) -ne 0 ] || [ $(( $(tr -cd "'" < "$root/.env" | wc -c) % 2 )) -ne 0 ]; }; then
-    die "refused: the base branch's .env has an unclosed quote"
-  fi
-  [ ! -s "$root/.env" ] || [ -z "$(tail -c1 "$root/.env")" ] || echo >> "$root/.env"
+  # First in .env: act reads a quoted value across lines, and an open quote
+  # can only take in what comes after it.
   {
     echo "GIT_CONFIG_COUNT=$(( ${#mirror_config[@]} / 2 ))"
     for ((i = 0; i < ${#mirror_config[@]}; i += 2)); do
       echo "GIT_CONFIG_KEY_$((i / 2))=${mirror_config[i]}"
       echo "GIT_CONFIG_VALUE_$((i / 2))=${mirror_config[i + 1]}"
     done
-  } >> "$root/.env"
+    if [ -f "$root/.env" ]; then cat "$root/.env"; fi
+  } > "$root/.env.miu-ci"
+  mv -f "$root/.env.miu-ci" "$root/.env"
 else
   bounded 60 rm -rf "$root/.miu-ci"
 fi

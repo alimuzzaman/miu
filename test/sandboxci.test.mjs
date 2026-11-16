@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos, deployKeyRepos, lockWithoutDists } from '../lib/sandboxci.mjs';
+import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos, deployKeyRepos, lockWithoutDists, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling, runningJobs } from '../lib/ci.mjs';
 
 const WORKER = fileURLToPath(new URL('../bin/miu-sandbox-ci', import.meta.url));
@@ -861,7 +861,7 @@ echo '{"ok":true,"cells":[{"label":"php","status":"passed","exit_code":0,"output
   const env = { ...s.env, ...k.knobs, MIU_CI_MIRROR_USER: 'miu-mirror', MIU_CI_MIRROR_HELPER: MIRROR };
   const lock = { 'content-hash': 'h', packages: [{ name: 'acme/licensing', version: 'dev-main', source: { type: 'git', url: 'git@github.com:Acme/licensing.git', reference: 'abc' }, dist: { type: 'zip', url: 'https://api.github.com/repos/Acme/licensing/zipball/abc' } }] };
   const wf = 'jobs:\n  php:\n    runs-on: ubuntu-22.04\n    steps:\n      - run: composer install\n';
-  const dir = repo({ '.github/workflows/test.yml': wf, 'composer.json': JSON.stringify({ repositories: [{ type: 'vcs', url: 'git@github.com:acme/LICENSING.git' }] }), 'composer.lock': JSON.stringify(lock) });
+  const dir = repo({ '.github/workflows/test.yml': wf, '.env': "# Don't commit real keys here\nAPP=1\n", 'composer.json': JSON.stringify({ repositories: [{ type: 'vcs', url: 'git@github.com:acme/LICENSING.git' }] }), 'composer.lock': JSON.stringify(lock) });
   const base = git(dir, 'rev-parse', 'HEAD').stdout.trim();
   const app = fakeApp();
   const objectsBefore = git(dir, 'count-objects', '-v').stdout;
@@ -885,6 +885,8 @@ test('end to end: the job installs the deploy-key repo from its copy; no key, no
   assert.equal(t.read('committed-copy'), '0');
   assert.equal(JSON.parse(t.read('lock')).packages[0].dist, undefined);
   assert.match(t.read('env'), /^GIT_CONFIG_VALUE_0=git@github\.com:Acme\/licensing\.git$/m);
+  // Miu's lines first, the base branch's after: an open quote there could only take in what follows it.
+  assert.match(t.read('env'), /^GIT_CONFIG_COUNT=4\n[\s\S]*\n# Don't commit real keys here\nAPP=1$/);
   // The pull request's clone has no new branch or tag, its tree is as it was,
   // and it holds no copy: the commit with the copies lived in a throwaway store.
   assert.equal(git(t.dir, 'status', '--porcelain', '--untracked-files=no').stdout, '');
@@ -948,8 +950,6 @@ sys.stdout.buffer.write(out.getvalue())`, JSON.stringify(entries)]).stdout;
     [(src, copy) => fs.symlinkSync('/etc', path.join(copy, 'objects/x')), /refused: a link or special file under .miu-ci/],
     [(src, copy) => spawnSync('mkfifo', [path.join(copy, 'objects/f')]), /refused: a link or special file under .miu-ci/],
     [(src, copy) => fs.rmSync(path.join(copy, 'HEAD')), /not run: Miu sent no copy of Acme\/licensing/],
-    [(src) => fs.writeFileSync(path.join(src, '.env'), 'A="open\n'), /unclosed quote/],
-    [(src) => fs.writeFileSync(path.join(src, '.env'), "A='open\n"), /unclosed quote/],
     [(src) => fs.writeFileSync(path.join(src, '.env'), 'GIT_CONFIG_COUNT=1\n'), /sets GIT_CONFIG_COUNT/],
     [(src) => spawnSync('mkfifo', [path.join(src, '.env')]), /refused: \.env is not a plain file/],
   ]) {
@@ -1018,7 +1018,16 @@ test('only the jobs a run runs pick the sibling\'s ref: a release workflow\'s ow
   const clash = [{ path: '.github/workflows/ci.yml', doc: { on: { pull_request: {} }, jobs: { php: job('${{ steps.freeref.outputs.ref }}'), lint: job('release/2.1') } } }];
   const running = runningJobs(clash, {});
   await assert.rejects(shipSibling({ git, siblingRepo: 'Acme/free', headRef: 'x', docs: clash.map((w) => w.doc), names: clash.map((w) => w.path), keep: (i, id) => running.has(`${i}:${id}`), auth: null }),
-    /two jobs this run runs check Acme\/free out at xspeed-free at different refs: ci\.yml job (php|lint) asks for (an expression|release\/2\.1), ci\.yml job (php|lint) for (an expression|release\/2\.1)/);
+    (e) => /two jobs this run runs check Acme\/free out at xspeed-free at different refs: ci\.yml job (php|lint) asks for (an expression|release\/2\.1), ci\.yml job (php|lint) for (an expression|release\/2\.1)/.test(e.message) && e.lasting === true);
   // A job a running job needs counts too.
   assert.deepEqual([...runningJobs([{ path: '.github/workflows/ci.yml', doc: { on: { pull_request: {} }, jobs: { setup: job('main'), test: { ...job('main'), needs: 'setup' } } } }], {})].sort(), ['0:setup', '0:test']);
+});
+
+test('deploy-key copies left by a run that never finished are swept; a running one is kept', () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'sweep-'));
+  for (const n of ['miu-ci-mirror-old', 'miu-ci-mirror-new', 'other-old']) fs.mkdirSync(path.join(dir, n, 'objects'), { recursive: true });
+  const old = new Date(Date.now() - 6 * 3600 * 1000);
+  for (const n of ['miu-ci-mirror-old', 'other-old']) fs.utimesSync(path.join(dir, n), old, old);
+  assert.equal(sweepMirrorCopies(undefined, dir), 1);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['miu-ci-mirror-new', 'other-old']);
 });

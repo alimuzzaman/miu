@@ -38,7 +38,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
 import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem } from '../lib/ci.mjs';
-import { runSandboxCi, changesCiDefinition } from '../lib/sandboxci.mjs';
+import { runSandboxCi, changesCiDefinition, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -616,7 +616,7 @@ async function prepareNow(repo, pr, sha) {
   const workflows = [];
   for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${tip}:${f}`])).slice(0, 512 * 1024) });
   // Without the sibling the run would use whatever the pull request has at that path: tried again later instead.
-  const sibling = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw new Error(`could not fetch the sibling repository's source: ${e.message}`); });
+  const sibling = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw Object.assign(new Error(e.lasting ? e.message : `could not fetch the sibling repository's source: ${e.message}`), { lasting: e.lasting }); });
   const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, tip, `Miu CI: ${sha.slice(0, 12)} with the workflows of ${workflowsFrom}${sibling ? `, ${sibling.from} beside it` : ''}`, sibling?.extra ?? []);
   // Kept under a ref so a gc of the clone does not take it while it waits.
   const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
@@ -629,12 +629,15 @@ async function prepareNow(repo, pr, sha) {
 async function siblingSource(repo, bare, headRef, workflows, { base, changed }) {
   const profile = profiles().find((x) => x.repo === repo);
   const sib = profile?.sibling;
-  if (!sib?.repo || !gh.validRepo(sib.repo)) return null;
+  // A bad pr_ci is reported by the CI line itself (createCi).
+  if (!sib?.repo || !gh.validRepo(sib.repo) || prCiProblem(profile.pr_ci)) return null;
   const parsed = (await parseWorkflows(workflows)).map((w) => ({ path: w.path, doc: w.doc }));
-  const running = runningJobs(parsed, { list: prCiProblem(profile.pr_ci) ? undefined : profile.pr_ci, base, changed });
+  const running = runningJobs(parsed, { list: profile.pr_ci, base, changed });
   return shipSibling({ git: (args, env) => gitAsync(['-C', bare, ...args], env), siblingRepo: sib.repo, headRef, docs: parsed.map((w) => w.doc), names: parsed.map((w) => w.path), keep: (i, id) => running.has(`${i}:${id}`), auth: await gh.gitAuthEnv(sib.repo).catch(() => null) });
 }
 fs.mkdirSync(RUNS, { recursive: true });
+// Deploy-key copies of runs that a stop cut short (lib/sandboxci.mjs).
+try { const n = sweepMirrorCopies(); if (n) console.log(`ci: removed ${n} deploy-key copies left by runs that did not finish`); } catch { /* nothing to sweep */ }
 const ci = createCi({
   dir: CI_DIR, prepare: ciPrepare, parallel: ciParallel, isPaused: () => queueState().paused, scrub: ciScrub,
   coveredBy: (repo) => profiles().find((p) => p.repo === repo)?.fast_checks ?? [],
