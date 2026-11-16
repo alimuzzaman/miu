@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runSandboxCi, sandboxCiProblem, changesCiDefinition } from '../lib/sandboxci.mjs';
+import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos } from '../lib/sandboxci.mjs';
+import { prCiProblem, jobsOf } from '../lib/ci.mjs';
 
 const WORKER = fileURLToPath(new URL('../bin/miu-sandbox-ci', import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-sandboxci-'));
@@ -59,7 +60,7 @@ function sandboxHome({ stdout = '{"ok":true,"cells":[{"label":"a","status":"pass
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
-  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\nproject="$6"\necho "$project" > "${home}/project"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | LC_ALL=C sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
+  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\ncat > "${home}/stdin"\necho "$TMPDIR" > "${home}/tmpdir"\nproject="$6"\necho "$project" > "${home}/project"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | LC_ALL=C sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
   return { home, read: (f) => fs.readFileSync(path.join(home, f), 'utf8').trim() };
 }
 
@@ -201,7 +202,7 @@ test('a .git in the tar is thrown away, hooks and all', () => {
   fs.writeFileSync(path.join(src, '.git/hooks/post-commit'), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
   const tar = spawnSync('tar', ['-c', '-C', src, '.']);
   const { env } = server({ home: sandbox.home });
-  const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: tar.stdout, env });
+  const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from('miu-ci-secrets 0\n'), tar.stdout]), env });
   assert.equal(r.status, 0, String(r.stderr));
   assert.equal(fs.existsSync(marker), false);
   assert.equal(sandbox.read('git'), 'true');
@@ -411,7 +412,7 @@ test('ref sends that commit from a bare clone, and every job\'s output comes bac
   spawnSync('git', ['clone', '-q', '--bare', src, bare]);
   const dir = fs.mkdtempSync(path.join(tmp, 'worker-'));
   const worker = path.join(dir, 'worker');
-  script(worker, `tar -t | LC_ALL=C sort > "${dir}/files"\necho '${report([{ label: 'a', status: 'passed', exit_code: 0, output: 'step one\n[t/a]   🏁  Job succeeded' }]).trim()}'`);
+  script(worker, `IFS= read -r header\ntar -t | LC_ALL=C sort > "${dir}/files"\necho '${report([{ label: 'a', status: 'passed', exit_code: 0, output: 'step one\n[t/a]   🏁  Job succeeded' }]).trim()}'`);
   let pid = null;
   const r = await runSandboxCi(check, bare, server({ worker }).env, { ref: first, onStart: (p) => { pid = p; } });
   assert.equal(r.status, 0);
@@ -421,4 +422,172 @@ test('ref sends that commit from a bare clone, and every job\'s output comes bac
   assert.doesNotMatch(files, /later\.php/);
   assert.match(r.log, /## a \(passed, exit 0\)\nstep one/);
   assert.deepEqual(await runSandboxCi(check, bare, server({ worker }).env, { ref: 'main; rm -rf /' }), { notRun: 'not a commit to run' });
+});
+
+// ---- a token for the repositories a run reaches
+
+const PRO = `jobs:
+  php:
+    runs-on: ubuntu-22.04
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out Free (xspeed) as sibling
+        uses: actions/checkout@v4
+        with:
+          repository: Acme/free
+          token: \${{ secrets.FREE_REPO_TOKEN || github.token }}
+          path: free
+      - run: composer install
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"\${{ secrets.PKG_TOKEN || github.token }}"}}'
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "\${{ github.repository }}" }
+      - run: |
+          git clone https://github.com/Acme/tools.git
+          gh api repos/Acme/hub/contents/x.json
+          curl -sL https://github.com/wp-cli/wp-cli/releases/download/v2/wp-cli.phar -o wp
+  other:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: Acme/elsewhere }
+`;
+const COMPOSER = JSON.stringify({ repositories: [{ type: 'vcs', url: 'git@github.com:Acme/licensing.git' }, { type: 'composer', url: 'https://wpackagist.org' }] });
+const TOKEN = 'ghs_0123456789abcdefghijABCDEFGHIJ012345';
+const proCheck = { label: 'CI', sandbox_ci: { workflow: '.github/workflows/test.yml', job: 'php' } };
+const fakeApp = (answer = { token: TOKEN }) => {
+  const calls = { mint: [], revoked: [] };
+  return { calls, mint: async (owner, names, opts) => { calls.mint.push([owner, names, opts.publicRepos]); return answer; }, revoke: async (t) => { calls.revoked.push(t); } };
+};
+// The pull request's commit, and a base branch tip with the trusted composer.json.
+function proRepo({ prComposer } = {}) {
+  const dir = repo({ '.github/workflows/test.yml': PRO, 'composer.json': COMPOSER });
+  const base = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+  if (prComposer) { fs.writeFileSync(path.join(dir, 'composer.json'), prComposer); git(dir, 'commit', '-qam', 'pr'); }
+  return { dir, base };
+}
+
+test('finds every repository a job and the jobs it needs reach, and the secrets used as a GitHub token', () => {
+  const doc = { jobs: {
+    php: { needs: 'lint', steps: [{ uses: 'actions/checkout@v4' }, { uses: 'actions/checkout@v4', with: { repository: 'Acme/free', token: '${{ secrets.FREE_REPO_TOKEN || github.token }}' } }, { run: 'composer install', env: { A: '${{ secrets.PKG_TOKEN || github.token }}', B: '${{ secrets.OTHER }}' } }] },
+    lint: { steps: [{ uses: 'actions/checkout@v4', with: { repository: '${{ github.repository }}' } }, { run: 'git clone git@github.com:Acme/tools.git\ngh repo clone Acme/cli\ngh pr list -R Acme/hub\nnpm ci' }] },
+    other: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/elsewhere' } }] },
+  } };
+  const r = reposNeeded(doc, 'php', 'Acme/pro');
+  assert.deepEqual(r.checkouts.sort(), ['Acme/free', 'Acme/pro']);
+  assert.deepEqual(r.fetches.sort(), ['Acme/cli', 'Acme/hub', 'Acme/tools']);
+  assert.deepEqual(r.secrets.sort(), ['FREE_REPO_TOKEN', 'PKG_TOKEN']);
+  assert.equal(r.composer, true);
+  assert.equal(r.npm, true);
+  assert.deepEqual(reposNeeded(doc, 'other', 'Acme/pro').checkouts, ['Acme/elsewhere']);
+  assert.match(reposNeeded({ jobs: { a: { steps: [{ uses: 'actions/checkout@v4', with: { repository: '${{ inputs.repo }}' } }] } } }, 'a').problem, /expression/);
+});
+
+test('private Composer and npm dependencies on GitHub', () => {
+  assert.deepEqual(manifestRepos(COMPOSER, JSON.stringify({ dependencies: { a: '^1.0', b: 'github:Acme/ui#v2', c: 'Acme/icons', d: 'git+ssh://git@github.com/Acme/lib.git', e: 'file:../x', f: 'npm:left-pad@1' } })).sort(),
+    ['Acme/icons', 'Acme/licensing', 'Acme/lib', 'Acme/ui']);
+  assert.deepEqual(manifestRepos('not json', null), []);
+});
+
+test('a run gets one token for the pull request\'s repo and every one it reaches, on a pipe and never on a command line', needsYaml, async () => {
+  const sandbox = sandboxHome({ stdout: `{"ok":true,"cells":[{"label":"a","status":"passed","exit_code":0,"output":"token ${TOKEN} basic ${Buffer.from(`x-access-token:${TOKEN}`).toString('base64')}\\n[t/a]   🏁  Job succeeded"}]}` });
+  const s = server({ home: sandbox.home });
+  const app = fakeApp();
+  const { dir, base } = proRepo();
+  const r = await runSandboxCi(proCheck, dir, s.env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
+  assert.equal(r.status, 0);
+  // The own repo first, then what it checks out, fetches and installs; a download from another owner is left alone.
+  assert.deepEqual(app.calls.mint, [['Acme', ['pro', 'free', 'tools', 'hub', 'licensing'], []]]);
+  assert.deepEqual(sandbox.read('stdin').split('\n').sort(), [`FREE_REPO_TOKEN=${TOKEN}`, `GITHUB_TOKEN=${TOKEN}`, `PKG_TOKEN=${TOKEN}`]);
+  const argv = sandbox.read('argv');
+  assert.match(argv, /--secrets-stdin/);
+  assert.doesNotMatch(argv + s.sudoArgv().join(' '), new RegExp(TOKEN));
+  // Sandbox's temporary files go to the run's own folder, which is removed.
+  assert.match(sandbox.read('tmpdir'), /miu-ci-config\./);
+  assert.equal(fs.existsSync(sandbox.read('tmpdir')), false);
+  // The log never shows it, in any form; and it is revoked when the run ends.
+  assert.doesNotMatch(r.log + r.out, new RegExp(`${TOKEN}|${Buffer.from(`x-access-token:${TOKEN}`).toString('base64')}`));
+  assert.deepEqual(app.calls.revoked, [TOKEN]);
+});
+
+test('the pull request cannot widen its token through its own composer.json', needsYaml, async () => {
+  const app = fakeApp();
+  const { dir, base } = proRepo({ prComposer: JSON.stringify({ repositories: [{ type: 'vcs', url: 'https://github.com/Acme/secret-plans' }] }) });
+  await runSandboxCi(proCheck, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
+  assert.ok(!app.calls.mint[0][1].includes('secret-plans'));
+  assert.ok(app.calls.mint[0][1].includes('licensing'));
+  // With no base branch to read (a QA run's fast check), no manifest is read at all.
+  const app2 = fakeApp();
+  await runSandboxCi(proCheck, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app2.mint, revoke: app2.revoke });
+  assert.deepEqual(app2.calls.mint[0][1], ['pro', 'free', 'tools', 'hub']);
+});
+
+test('a profile can add a repository the run reads', needsYaml, async () => {
+  const app = fakeApp();
+  await runSandboxCi({ label: 'CI', sandbox_ci: { ...proCheck.sandbox_ci, repos: ['Acme/extra', 'acme/free'] } }, proRepo().dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
+  assert.deepEqual(app.calls.mint[0][1], ['pro', 'free', 'tools', 'hub', 'extra']);
+});
+
+test('no access to a repository it needs: not run, and says which', needsYaml, async () => {
+  const sandbox = sandboxHome();
+  const r = await runSandboxCi(proCheck, proRepo().dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', ...fakeApp({ missing: ['Acme/free'] }) });
+  assert.deepEqual(r, { notRun: 'no access to Acme/free: install the Miu GitHub App there' });
+  assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
+  const failed = await runSandboxCi(proCheck, proRepo().dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', mint: async () => { throw new Error('GitHub: HTTP 500'); }, revoke: async () => {} });
+  assert.match(failed.notRun, /^could not get access to Acme\/pro, Acme\/free/);
+});
+
+test('another owner\'s checkout must be public; one named by an expression is not run', needsYaml, async () => {
+  const app = fakeApp();
+  const other = 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { repository: Other/lib }\n';
+  await runSandboxCi(check, repo({ '.github/workflows/test.yml': other }), server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
+  assert.deepEqual(app.calls.mint, [['Acme', ['pro'], ['Other/lib']]]);
+  const expr = await runSandboxCi(check, repo({ '.github/workflows/test.yml': 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { repository: "${{ github.event.inputs.repo }}" }\n' }), server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', ...fakeApp() });
+  assert.match(expr.notRun, /expression/);
+});
+
+test('a run that reaches nothing else still gets a token for its own repo', async () => {
+  const sandbox = sandboxHome();
+  const app = fakeApp();
+  const r = await runSandboxCi(check, repo(), server({ home: sandbox.home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
+  assert.equal(r.status, 0);
+  assert.deepEqual(app.calls.mint, [['Acme', ['pro'], []]]);
+  assert.equal(sandbox.read('stdin'), `GITHUB_TOKEN=${TOKEN}`);
+});
+
+test('the worker reads its secrets header before the tar, and refuses one that is missing or not plain', () => {
+  const sandbox = sandboxHome();
+  const src = fs.mkdtempSync(path.join(tmp, 'hdr-'));
+  fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
+  fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), OK);
+  const tar = spawnSync('tar', ['-c', '-C', src, '.']).stdout;
+  const { env } = server({ home: sandbox.home });
+  const run = (head) => spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from(head), tar]), env, encoding: 'utf8' });
+  const ok = run('miu-ci-secrets 1\nGITHUB_TOKEN=ghs_abc\n');
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(sandbox.read('stdin'), 'GITHUB_TOKEN=ghs_abc');
+  const none = run('miu-ci-secrets 0\n');
+  assert.equal(none.status, 0, none.stderr);
+  assert.doesNotMatch(sandbox.read('argv'), /--secrets-stdin/);
+  for (const [head, why] of [['', /no secrets header/], ['miu-ci-secrets 2\nA=b\n', /not a plain NAME=value|cut short/], ['miu-ci-secrets 1\nA=b c\n', /not a plain NAME=value/], ['miu-ci-secrets 1\nA=$(id)\n', /not a plain NAME=value/]]) {
+    fs.rmSync(path.join(sandbox.home, 'argv'), { force: true });
+    const r = run(head);
+    assert.equal(r.status, 2, head);
+    assert.match(r.stderr, why);
+    assert.doesNotMatch(r.stderr, /\$\(id\)|b c/);
+    assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
+  }
+});
+
+test('profile validation: repos is a short list of owner/name', () => {
+  assert.equal(sandboxCiProblem({ label: 'x', sandbox_ci: { workflow: '.github/workflows/a.yml', job: 'a', repos: ['Acme/lib'] } }), null);
+  assert.match(sandboxCiProblem({ label: 'x', sandbox_ci: { workflow: '.github/workflows/a.yml', job: 'a', repos: ['../x'] } }), /sandbox_ci.repos/);
+  assert.equal(prCiProblem([{ workflow: '.github/workflows/ci.yml', repos: ['Acme/lib'] }]), null);
+  assert.match(prCiProblem([{ workflow: '.github/workflows/ci.yml', repos: 'Acme/lib' }]), /repos/);
+  const [j] = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { a: { 'runs-on': 'ubuntu-latest', steps: [{ run: 'id' }] } } }, { listed: { workflow: '.github/workflows/ci.yml', repos: ['Acme/lib'] } });
+  assert.deepEqual(j.check.sandbox_ci.repos, ['Acme/lib']);
 });

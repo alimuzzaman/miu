@@ -8,6 +8,11 @@
 #
 #   sandbox-ci <workflow> <event> <timeout-seconds> <job> [matrix-key=value...]
 #
+# Before the tar, stdin carries a header: a line `miu-ci-secrets <n>`, then n
+# lines NAME=value. They are this run's secrets (a GitHub token Miu minted for
+# the repositories the workflow checks out), handed to Sandbox on a pipe; they
+# are never in an argument, the environment, or a file this script keeps.
+#
 # Prints the JSON report of `sb ci run` on stdout. Nothing on stdin or in the
 # tar is trusted: that account can reach Docker, and Miu's account cannot.
 set -euo pipefail
@@ -26,6 +31,19 @@ for pair in "$@"; do
   [[ $pair =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*=[A-Za-z0-9_.-]+$ ]] || die "not a matrix value: $pair"
   matrix_args+=(--matrix-filter "$pair")
 done
+
+# Read before anything else touches stdin. The values stay in this shell.
+IFS= read -r header || die "not run: no secrets header from Miu"
+[[ $header =~ ^miu-ci-secrets\ ([0-9])$ ]] || die "not run: no secrets header from Miu; update Miu and this worker together"
+secret_count=${BASH_REMATCH[1]}
+secret_lines=()
+for ((i = 0; i < secret_count; i++)); do
+  IFS= read -r line || die "not run: the secrets header is cut short"
+  # Never echo the line: it holds a secret.
+  [[ $line =~ ^[A-Za-z_][A-Za-z0-9_]{0,63}=[A-Za-z0-9_.-]{1,4096}$ ]] || die "not run: a secret from Miu is not a plain NAME=value"
+  secret_lines+=("$line")
+done
+unset header line
 
 sb="$HOME/sandbox/sb-src/sb"
 [ -x "$sb" ] || die "no Sandbox CLI at $sb"
@@ -230,6 +248,9 @@ done
 mkdir "$config/act"
 echo '--container-daemon-socket=-' > "$config/act/actrc"
 export XDG_CONFIG_HOME="$config"
+# Sandbox writes act's secret file to TMPDIR; here it is gone with the folder
+# even if Sandbox is stopped before it can delete it.
+export TMPDIR="$config"
 
 # Workflows expect a git checkout, and an archive has none. Any .git that came
 # in the tar is not ours, and its hooks would run here.
@@ -257,6 +278,15 @@ if len(cells) != 1:
 # Every job container is capped and placed in miu-ci.slice (install.sh makes it),
 # so CI cannot crowd out what else runs on this server. A Sandbox too old for
 # --container-limit refuses the run, so CI never runs uncapped.
-bounded "$((seconds + 60))" "$sb" ci run "$root/$workflow" --local --project-dir "$root" --json \
-  --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"} \
-  --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice
+# The secrets go to Sandbox on a pipe (printf is a shell builtin, so they are
+# in no process's arguments). A Sandbox too old for --secrets-stdin refuses.
+run_ci() {
+  bounded "$((seconds + 60))" "$sb" ci run "$root/$workflow" --local --project-dir "$root" --json \
+    --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"} \
+    --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice "$@"
+}
+if [ ${#secret_lines[@]} -gt 0 ]; then
+  printf '%s\n' "${secret_lines[@]}" | run_ci --secrets-stdin
+else
+  run_ci </dev/null
+fi

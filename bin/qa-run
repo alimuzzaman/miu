@@ -610,7 +610,7 @@ const runCmd = (cmd, dir) => new Promise((resolve) => {
   child.on('close', (status) => { clearTimeout(timer); resolve({ status, out }); });
   child.on('error', (e) => { clearTimeout(timer); resolve({ status: -1, out: String(e) }); });
 });
-const runCheck = (c, dir) => (c.sandbox_ci ? runSandboxCi(c, dir, envVars) : runCmd(c.cmd, dir));
+const runCheck = (c, dir) => (c.sandbox_ci ? runSandboxCi(c, dir, envVars, { repo }) : runCmd(c.cmd, dir));
 const secs = (t0) => `${Math.round((Date.now() - t0) / 1000)}s`;
 async function runFastChecks() {
   writeFast(false);

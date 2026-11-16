@@ -619,14 +619,14 @@ async function prepareNow(repo, pr, sha) {
   // Kept under a ref so a gc of the clone does not take it while it waits.
   const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
   await gitAsync(['-C', bare, 'update-ref', runRef, runSha]);
-  return { gitDir: bare, sha, runSha, runRef, workflows, workflowsFrom, changesCi: false, base, changed };
+  return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, workflowsFrom, changesCi: false, base, changed };
 }
 fs.mkdirSync(RUNS, { recursive: true });
 const ci = createCi({
   dir: CI_DIR, prepare: ciPrepare, parallel: ciParallel, isPaused: () => queueState().paused, scrub: ciScrub,
   coveredBy: (repo) => profiles().find((p) => p.repo === repo)?.fast_checks ?? [],
   prCiFor: (repo) => profiles().find((p) => p.repo === repo)?.pr_ci,
-  runJob: (check, gitDir, sha, { onStart }) => runSandboxCi(check, gitDir, process.env, { ref: sha, onStart }),
+  runJob: (check, gitDir, sha, { onStart, repo, trustedRef }) => runSandboxCi(check, gitDir, process.env, { ref: sha, onStart, repo, trustedRef }),
   log: (m) => console.log(m),
 });
 // A pull request's CI at its head, lined up once per commit.
