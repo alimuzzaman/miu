@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos } from '../lib/sandboxci.mjs';
-import { prCiProblem, jobsOf } from '../lib/ci.mjs';
+import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling } from '../lib/ci.mjs';
 
 const WORKER = fileURLToPath(new URL('../bin/miu-sandbox-ci', import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-sandboxci-'));
@@ -463,7 +463,7 @@ const TOKEN = 'ghs_0123456789abcdefghijABCDEFGHIJ012345';
 const proCheck = { label: 'CI', sandbox_ci: { workflow: '.github/workflows/test.yml', job: 'php' } };
 const fakeApp = (answer = { token: TOKEN }) => {
   const calls = { mint: [], revoked: [] };
-  return { calls, mint: async (owner, names, opts) => { calls.mint.push([owner, names, opts.publicRepos]); return answer; }, revoke: async (t) => { calls.revoked.push(t); } };
+  return { calls, mint: async (owner, names, opts) => { calls.mint.push([owner, names, opts.publicRepos]); (calls.opts ??= []).push(opts); return answer; }, revoke: async (t) => { calls.revoked.push(t); } };
 };
 // The pull request's commit, and a base branch tip with the trusted composer.json.
 function proRepo({ prComposer } = {}) {
@@ -495,15 +495,15 @@ test('private Composer and npm dependencies on GitHub', () => {
   assert.deepEqual(manifestRepos('not json', null), []);
 });
 
-test('a run gets one token for the pull request\'s repo and every one it reaches, on a pipe and never on a command line', needsYaml, async () => {
+test('a run gets one token for every repo it reaches, the own one when named, on a pipe and never on a command line', needsYaml, async () => {
   const sandbox = sandboxHome({ stdout: `{"ok":true,"cells":[{"label":"a","status":"passed","exit_code":0,"output":"token ${TOKEN} basic ${Buffer.from(`x-access-token:${TOKEN}`).toString('base64')}\\n[t/a]   🏁  Job succeeded"}]}`, plan: '{"jobs":[{"id":"php","cells":[{"matrix":{}}]}]}' });
   const s = server({ home: sandbox.home });
   const app = fakeApp();
   const { dir, base } = proRepo();
   const r = await runSandboxCi(proCheck, dir, s.env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
   assert.equal(r.status, 0, JSON.stringify(r));
-  // The own repo first, then what it checks out, fetches and installs; a download from another owner is left alone.
-  assert.deepEqual(app.calls.mint, [['Acme', ['pro', 'free', 'tools', 'hub', 'licensing'], []]]);
+  // What it checks out (the own repo by ${{ github.repository }}), fetches and installs; a download from another owner is left alone.
+  assert.deepEqual(app.calls.mint, [['Acme', ['free', 'pro', 'tools', 'hub', 'licensing'], []]]);
   assert.deepEqual(sandbox.read('stdin').split('\n').sort(), [`FREE_REPO_TOKEN=${TOKEN}`, `GITHUB_TOKEN=${TOKEN}`, `PKG_TOKEN=${TOKEN}`]);
   const argv = sandbox.read('argv');
   assert.match(argv, /--secrets-stdin/);
@@ -534,9 +534,9 @@ test('a fast check reads nothing from the pull request to grant: only its own re
   // A workflow on the branch the pull request targets is the pull request's too.
   const app = fakeApp();
   const r = await runSandboxCi(proCheck, proRepo().dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
-  assert.match(r.notRun, /^no access to Acme\/free, Acme\/tools, Acme\/hub, Acme\/licensing: a fast check gets only its own repository and the profile's sandbox_ci.repos$/);
+  assert.match(r.notRun, /^no access to Acme\/free, Acme\/pro, Acme\/tools, Acme\/hub, Acme\/licensing: a fast check gets only its own repository and the profile's sandbox_ci.repos$/);
   assert.deepEqual(app.calls.mint, []);
-  const listed = { label: 'CI', sandbox_ci: { ...proCheck.sandbox_ci, repos: ['Acme/free', 'Acme/tools', 'Acme/hub', 'Acme/licensing'] } };
+  const listed = { label: 'CI', sandbox_ci: { ...proCheck.sandbox_ci, repos: ['Acme/pro', 'Acme/free', 'Acme/tools', 'Acme/hub', 'Acme/licensing'] } };
   const ok = await runSandboxCi(listed, proRepo().dir, server({ home: sandboxHome({ plan: '{"jobs":[{"id":"php","cells":[{"matrix":{}}]}]}' }).home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
   assert.equal(ok.status, 0, JSON.stringify(ok));
   assert.deepEqual(app.calls.mint[0][1], ['pro', 'free', 'tools', 'hub', 'licensing']);
@@ -546,7 +546,7 @@ test('a profile can add a repository the run reads', needsYaml, async () => {
   const app = fakeApp();
   const { dir, base } = proRepo();
   await runSandboxCi({ label: 'CI', sandbox_ci: { ...proCheck.sandbox_ci, repos: ['Acme/extra', 'acme/free'] } }, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
-  assert.deepEqual(app.calls.mint[0][1], ['pro', 'extra', 'free', 'tools', 'hub', 'licensing']);
+  assert.deepEqual(app.calls.mint[0][1], ['extra', 'free', 'pro', 'tools', 'hub', 'licensing']);
 });
 
 test('no access to a repository it needs: not run, and says which', needsYaml, async () => {
@@ -556,13 +556,13 @@ test('no access to a repository it needs: not run, and says which', needsYaml, a
   assert.deepEqual(r, { notRun: 'no access to Acme/licensing: install the Miu GitHub App there' });
   assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
   const failed = await runSandboxCi(proCheck, dir, server({ home: sandbox.home }).env, { repo: 'Acme/pro', trustedRef: base, mint: async () => { throw new Error('GitHub: HTTP 500'); }, revoke: async () => {} });
-  assert.match(failed.notRun, /^could not get access to Acme\/pro, Acme\/free/);
+  assert.match(failed.notRun, /^could not get access to Acme\/free, Acme\/pro/);
 });
 
 test('more GitHub-token secrets than the worker takes: not run, before any token is made', needsYaml, async () => {
   const app = fakeApp();
   const steps = Array.from({ length: 9 }, (_, i) => `      - run: echo "\${{ secrets.T${i} || github.token }}"`).join('\n');
-  const r = await runSandboxCi(check, repo({ '.github/workflows/test.yml': `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n${steps}\n` }), server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
+  const r = await runSandboxCi(check, repo({ '.github/workflows/test.yml': `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { repository: Acme/free }\n${steps}\n` }), server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
   assert.match(r.notRun, /uses 9 secrets as a GitHub token; Miu gives at most 8/);
   assert.deepEqual(app.calls.mint, []);
 });
@@ -571,18 +571,46 @@ test('another owner\'s checkout must be public; one named by an expression is no
   const app = fakeApp();
   const other = 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { repository: Other/lib }\n';
   await runSandboxCi(check, repo({ '.github/workflows/test.yml': other }), server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
+  // Only another owner's public repo: a token that reads no code of this owner's.
   assert.deepEqual(app.calls.mint, [['Acme', ['pro'], ['Other/lib']]]);
+  assert.deepEqual(app.calls.opts[0].permissions, { metadata: 'read' });
   const expr = await runSandboxCi(check, repo({ '.github/workflows/test.yml': 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { repository: "${{ github.event.inputs.repo }}" }\n' }), server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', ...fakeApp() });
   assert.match(expr.notRun, /expression/);
 });
 
-test('a run that reaches nothing else still gets a token for its own repo', async () => {
+test('a run that reaches nothing over the network gets no token and no secrets', async () => {
   const sandbox = sandboxHome();
   const app = fakeApp();
   const r = await runSandboxCi(check, repo(), server({ home: sandbox.home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
   assert.equal(r.status, 0);
-  assert.deepEqual(app.calls.mint, [['Acme', ['pro'], []]]);
-  assert.equal(sandbox.read('stdin'), `GITHUB_TOKEN=${TOKEN}`);
+  assert.deepEqual(app.calls.mint, []);
+  assert.doesNotMatch(sandbox.read('argv'), /--secrets-stdin/);
+  assert.equal(sandbox.read('stdin'), '');
+});
+
+test('a download the workflow skips under act needs no token: Miu ships the sibling instead', needsYaml, async () => {
+  const app = fakeApp();
+  const skipped = PRO.replace('        uses: actions/checkout@v4\n        with:\n          repository: Acme/free', '        if: ${{ !env.ACT }}\n        uses: actions/checkout@v4\n        with:\n          repository: Acme/free');
+  assert.notEqual(skipped, PRO);
+  const dir = repo({ '.github/workflows/test.yml': skipped });
+  await runSandboxCi(proCheck, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', trustedRef: git(dir, 'rev-parse', 'HEAD').stdout.trim(), mint: app.mint, revoke: app.revoke });
+  assert.ok(!app.calls.mint[0][1].includes('free'), JSON.stringify(app.calls.mint));
+  assert.deepEqual(app.calls.mint[0][1], ['pro', 'tools', 'hub']);
+});
+
+test('the sibling is shipped where the trusted workflow checks it out, in place of the pull request\'s copy', async () => {
+  assert.deepEqual(siblingPaths([{ jobs: { a: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'acme/FREE', path: 'xspeed-free/' } }, { uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: '../escape' } }, { uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: '.github' } }, { uses: 'actions/checkout@v4', with: { repository: 'Acme/other', path: 'x' } }] } } }], 'Acme/free'), ['xspeed-free']);
+  const dir = repo({ 'xspeed-free/planted.php': '<?php // from the PR\n' });
+  const sha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+  git(dir, 'checkout', '-q', '--orphan', 'sib'); git(dir, 'rm', '-rqf', '.');
+  fs.writeFileSync(path.join(dir, 'free.php'), '<?php\n'); git(dir, 'add', 'free.php'); git(dir, 'commit', '-qm', 'free');
+  const tree = git(dir, 'rev-parse', 'HEAD^{tree}').stdout.trim();
+  const run = (args, env, input) => Promise.resolve(spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8', input, env: { ...process.env, ...(env ?? {}) } }).stdout.trim());
+  const out = await ciRunCommit(run, sha, sha, 'm', [{ path: 'xspeed-free', tree }]);
+  const files = git(dir, 'ls-tree', '-r', '--name-only', out).stdout.trim().split('\n');
+  assert.ok(files.includes('xspeed-free/free.php'));
+  assert.ok(!files.includes('xspeed-free/planted.php'));
+  assert.ok(files.includes('code.php'));
 });
 
 test('the worker reads its secrets header before the tar, and refuses one that is missing or not plain', () => {
@@ -619,4 +647,17 @@ test('profile validation: repos is a short list of owner/name', () => {
   assert.match(prCiProblem([{ workflow: '.github/workflows/ci.yml', repos: ['../x'] }]), /repos/);
   const [j] = jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { a: { 'runs-on': 'ubuntu-latest', steps: [{ run: 'id' }] } } }, { listed: { workflow: '.github/workflows/ci.yml', repos: ['Acme/lib'] } });
   assert.deepEqual(j.check.sandbox_ci.repos, ['Acme/lib']);
+});
+
+test('the sibling ships at the pull request\'s branch name when it has one, else main', async () => {
+  const docs = [{ jobs: { a: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: 'free' } }] } } }];
+  for (const [head, has, want] of [['feat/x', true, 'feat/x'], ['feat/x', false, 'main'], ['dev', true, 'dev'], ['--upload-pack=x', true, 'main']]) {
+    const calls = [];
+    const git = async (args) => { calls.push(args); if (args[0] === 'ls-remote') return has ? 'abc\trefs/heads/x' : ''; return args[0] === 'rev-parse' ? '1234567890' : ''; };
+    const r = await shipSibling({ git, siblingRepo: 'Acme/free', headRef: head, docs, auth: null });
+    assert.equal(r.ref, want, head);
+    assert.ok(calls.some((c) => c[0] === 'fetch' && c.includes(`+refs/heads/${want}:refs/miu-ci/sibling-${Buffer.from(want).toString('hex')}`)));
+    assert.deepEqual(r.extra.map((x) => x.path), ['free']);
+  }
+  assert.equal(await shipSibling({ git: async () => '', siblingRepo: 'Acme/other', headRef: 'dev', docs, auth: null }), null);
 });
