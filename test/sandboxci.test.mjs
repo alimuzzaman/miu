@@ -830,7 +830,7 @@ test('the worker refuses a deploy-key repo unless root\'s list, the key and its 
   notRun(/not root's own file/, () => { k.env.MIU_CI_ROOT_UID = '0'; }, () => { k.env.MIU_CI_ROOT_UID = String(process.getuid()); });
   notRun(/must be this account's own, mode 600 or 400/, () => fs.chmodSync(k.key, 0o640), () => fs.chmodSync(k.key, 0o600));
   const text = fs.readFileSync(k.conf, 'utf8');
-  notRun(/is not the one .* names/, () => fs.writeFileSync(k.conf, text.replace(/SHA256:\S+/, 'SHA256:somethingelse')), () => fs.writeFileSync(k.conf, text));
+  notRun(/is not the one .* names/, () => fs.writeFileSync(k.conf, text.replace(/SHA256:\S+/, `SHA256:${'A'.repeat(43)}`)), () => fs.writeFileSync(k.conf, text));
   notRun(/more than repository, key file and fingerprint/, () => fs.writeFileSync(k.conf, text.replace(/\n$/, ' extra\n')), () => fs.writeFileSync(k.conf, text));
   notRun(/no root-owned GitHub host key file/, () => fs.chmodSync(k.hosts, 0o666), () => fs.chmodSync(k.hosts, 0o644));
   // A first fetch that fails leaves nothing to read.

@@ -392,7 +392,9 @@ if [ -n "$mirror_list" ]; then
   } >> "$root/.env"
 fi
 
-quiet_git add -A -- . ':(exclude,top).miu-ci'
+quiet_git add -A
+# Never in the pull request's commit, whatever its .gitignore says.
+quiet_git rm -r -q --cached --ignore-unmatch -- .miu-ci
 quiet_git commit -q --no-verify --no-gpg-sign --allow-empty -m "pull request"
 
 # One job and one matrix combination, so one act process. A job can write to the
