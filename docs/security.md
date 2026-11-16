@@ -37,6 +37,17 @@ Rules the code keeps:
   stdin and to Sandbox on a pipe: never in an argument, the environment of a
   Miu process, a file Miu keeps, or the tar. Miu removes it, and its base64
   forms, from the CI log. Forks and Dependabot get no run, so no token.
+- **A repository listed in `/etc/miu/ci-mirrors` is read with a deploy key**
+  ([install.md](install.md#a-repository-the-app-may-not-read-a-deploy-key)).
+  The key never leaves the Sandbox account. Only the worker uses it, as that
+  account, for one fetch into a mirror in that account's home. The job gets a
+  copy of the mirror with no key and no remote, so the pull request's code can
+  read that repository's code, as it could with a token for it, but cannot
+  use the key. Miu's account can only name a listed repository: root's list
+  picks the key, and the worker checks the key's owner, its mode and its
+  fingerprint, and GitHub's host key. Miu's account runs pull request code in
+  fast checks, so anything that runs as `miu` can get a copy of a listed
+  repository. List only what every repository Miu tests may read.
 - A comment can be edited only by whoever wrote it: editing one posted before
   the App was installed uses the fallback account (`fallback: true`).
 

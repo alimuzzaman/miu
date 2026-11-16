@@ -12,6 +12,10 @@
 # lines NAME=value. They are this run's secrets (a GitHub token Miu minted for
 # the repositories the workflow checks out), handed to Sandbox on a pipe; they
 # are never in an argument, the environment, or a file this script keeps.
+# The first line may end in ` mirrors=owner/name,...`: repositories this
+# server reads with a deploy key (/etc/miu/ci-mirrors). The job gets a copy of
+# each one's bare mirror in its workspace, and git in the job reads that copy
+# for the repository's GitHub URLs. The key never reaches the job.
 #
 # Prints the JSON report of `sb ci run` on stdout. Nothing on stdin or in the
 # tar is trusted: that account can reach Docker, and Miu's account cannot.
@@ -34,8 +38,9 @@ done
 
 # Read before anything else touches stdin. The values stay in this shell.
 IFS= read -r header || die "not run: no secrets header from Miu"
-[[ $header =~ ^miu-ci-secrets\ ([0-9])$ ]] || die "not run: no secrets header from Miu; update Miu and this worker together"
+[[ $header =~ ^miu-ci-secrets\ ([0-9])(\ mirrors=([A-Za-z0-9_.,/-]{1,512}))?$ ]] || die "not run: no secrets header from Miu; update Miu and this worker together"
 secret_count=${BASH_REMATCH[1]}
+mirror_list=${BASH_REMATCH[3]}
 secret_lines=()
 for ((i = 0; i < secret_count; i++)); do
   IFS= read -r line || die "not run: the secrets header is cut short"
@@ -51,7 +56,8 @@ unset header line
 revoke_token() {
   local l
   for l in ${secret_lines[@]+"${secret_lines[@]}"}; do
-    [[ $l == GITHUB_TOKEN=* ]] || continue
+    # Only an installation token: a run that reads nothing gets a stand-in.
+    [[ $l == GITHUB_TOKEN=ghs_* ]] || continue
     printf 'header = "Authorization: token %s"\n' "${l#GITHUB_TOKEN=}" \
       | timeout -k 5 30 curl -sS --fail --retry 2 -o /dev/null -X DELETE -H 'Accept: application/vnd.github+json' -H 'User-Agent: miu' -K - https://api.github.com/installation/token >/dev/null 2>&1 \
       || echo "sandbox-ci: could not revoke the run's GitHub token; Miu tries too, and it expires within the hour" >&2
@@ -272,6 +278,104 @@ export TMPDIR="$config"
 bounded 120 rm -rf "$root/.git"
 quiet_git() { bounded 120 git -C "$root" -c core.hooksPath=/dev/null -c user.name=miu -c user.email=miu@localhost "$@"; }
 quiet_git init -q
+
+# Repositories read with a deploy key, for a job that needs one that the GitHub
+# App cannot reach. Only the root-owned list names them, each with the key file
+# and that key's fingerprint, so Miu's account can ask for one of them but
+# never pick a key or a URL. The key is used here, for one fetch into a
+# mirror in this account's home; the job gets a copy of that mirror inside its
+# workspace (no key, no remote) and git config, through the job's .env, that
+# reads the copy for the repository's GitHub URLs. sudo resets the
+# environment, so only a test can point these elsewhere.
+mirrors_conf=${MIU_CI_MIRRORS_CONF:-/etc/miu/ci-mirrors}
+known_hosts=${MIU_CI_KNOWN_HOSTS:-/usr/local/lib/miu/github-known-hosts}
+mirrors_home=${MIU_CI_MIRRORS_DIR:-$HOME/.cache/miu-ci-mirrors}
+mirror_git_host=${MIU_CI_MIRROR_HOST:-git@github.com:}
+root_uid=${MIU_CI_ROOT_UID:-0}
+# root's own file that only root can change, and that Miu's account may read.
+owned_by_root() { [ -f "$1" ] && [ ! -L "$1" ] && [[ $(stat -c '%u %a' "$1") =~ ^$root_uid\ [0-7][0145][45]$ ]]; }
+mirror_config=()
+add_mirror() { # add_mirror owner/name: fetch it with its key, copy it into the job
+  local repo=$1 asked=$1 conf_repo key fp extra got dir copy lock
+  [[ $repo =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ && $repo != */. && $repo != */.. ]] || die "not run: not a repository name: $repo"
+  owned_by_root "$mirrors_conf" || die "not run: $mirrors_conf is missing or not root's own file, so no deploy-key repository can be read"
+  key=
+  while read -r conf_repo got fp extra; do
+    [[ -z $conf_repo || $conf_repo == \#* ]] && continue
+    [ -z "$extra" ] || die "not run: a line of $mirrors_conf has more than repository, key file and fingerprint"
+    # The list's spelling, for the URLs git rewrites.
+    if [ "${conf_repo,,}" = "${repo,,}" ]; then key=$got repo=$conf_repo; break; fi
+  done < "$mirrors_conf"
+  [ -n "$key" ] || die "not run: this server has no deploy key for $repo"
+  # A plain path: GIT_SSH_COMMAND is read by a shell.
+  [[ $key =~ ^/[A-Za-z0-9_./-]+$ && -f $key && ! -L $key ]] || die "not run: the deploy key for $repo is not a plain file"
+  # This account's own key, unreadable by anyone else, and the one the list names.
+  [[ $(stat -c '%u %a' "$key") =~ ^$(id -u)\ [46]00$ ]] || die "not run: the deploy key for $repo must be this account's own, mode 600 or 400"
+  [ "$(ssh-keygen -lf "$key" -E sha256 2>/dev/null | awk '{print $2}')" = "$fp" ] || die "not run: the deploy key for $repo is not the one $mirrors_conf names"
+  owned_by_root "$known_hosts" || die "not run: no root-owned GitHub host key file at $known_hosts"
+  dir=$mirrors_home/${repo,,}.git
+  mkdir -p -m 0700 "$mirrors_home" "${dir%/*}"
+  lock=$dir.lock
+  # Two runs at once fetch one after the other.
+  exec 8>>"$lock"
+  bounded 300 python3 -I -c '
+import fcntl, sys
+fcntl.flock(8, fcntl.LOCK_EX)
+' || die "not run: another run held the $repo mirror too long"
+  local ssh="ssh -F /dev/null -i $key -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts -o HostKeyAlgorithms=ssh-ed25519"
+  local url=$mirror_git_host$repo.git fetched=1
+  if [ -d "$dir/objects" ]; then
+    GIT_SSH_COMMAND=$ssh bounded 300 git -C "$dir" -c core.hooksPath=/dev/null fetch --quiet --prune "$url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' >&2 || fetched=0
+  else
+    rm -rf "$dir.tmp"
+    GIT_SSH_COMMAND=$ssh bounded 300 git -c core.hooksPath=/dev/null clone --quiet --bare "$url" "$dir.tmp" >&2 && git -C "$dir.tmp" remote remove origin && mv "$dir.tmp" "$dir" || fetched=0
+  fi
+  if [ "$fetched" = 0 ]; then
+    [ -d "$dir/objects" ] || die "not run: could not fetch $repo with its deploy key"
+    echo "sandbox-ci: could not fetch $repo with its deploy key; the job reads the copy from $(stat -c %y "$dir" | cut -c1-16)" >&2
+  else
+    touch "$dir"
+  fi
+  copy=$root/.miu-ci/mirrors/${repo,,}.git
+  mkdir -p "${copy%/*}"
+  bounded 300 git -c core.hooksPath=/dev/null clone --quiet --bare --no-hardlinks "file://$dir" "$copy" >&2 || die "not run: could not copy the $repo mirror into the job"
+  git -C "$copy" remote remove origin
+  exec 8>&-
+  # The job's git reads the copy for the repository's GitHub URLs. The job runs as
+  # root in its container, and the copy is this account's, hence safe.directory.
+  # insteadOf matches case-sensitively: the list's spelling and the one Miu
+  # asked for (the workflow's composer.json or package.json).
+  local u name names=("$repo")
+  [ "$asked" = "$repo" ] || names+=("$asked")
+  for name in "${names[@]}"; do
+    for u in "git@github.com:$name.git" "ssh://git@github.com/$name.git" "https://github.com/$name.git"; do
+      mirror_config+=("url.$copy.insteadOf" "$u")
+    done
+  done
+  mirror_config+=(safe.directory "$copy")
+}
+if [ -n "$mirror_list" ]; then
+  # Not part of the pull request: never committed, out of git status in the job.
+  echo /.miu-ci/ >> "$root/.git/info/exclude"
+  IFS=, read -r -a mirror_repos <<<"$mirror_list"
+  [ ${#mirror_repos[@]} -le 4 ] || die "not run: more than 4 deploy-key repositories"
+  for r in "${mirror_repos[@]}"; do add_mirror "$r"; done
+  # act gives the job the variables in .env (the base branch's own, which Miu
+  # put in the run commit). Git config through the environment adds to the
+  # job's own config instead of replacing it.
+  if [ -f "$root/.env" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?GIT_CONFIG_' "$root/.env"; then
+    die "refused: the base branch's .env sets GIT_CONFIG_ variables, which Miu needs for a deploy-key repository"
+  fi
+  [ ! -s "$root/.env" ] || [ -z "$(tail -c1 "$root/.env")" ] || echo >> "$root/.env"
+  {
+    echo "GIT_CONFIG_COUNT=$(( ${#mirror_config[@]} / 2 ))"
+    for ((i = 0; i < ${#mirror_config[@]}; i += 2)); do
+      echo "GIT_CONFIG_KEY_$((i / 2))=${mirror_config[i]}"
+      echo "GIT_CONFIG_VALUE_$((i / 2))=${mirror_config[i + 1]}"
+    done
+  } >> "$root/.env"
+fi
+
 quiet_git add -A
 quiet_git commit -q --no-verify --no-gpg-sign --allow-empty -m "pull request"
 

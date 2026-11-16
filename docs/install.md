@@ -55,6 +55,16 @@ sudo bash install.sh --sandbox-user ubuntu
 
 Workflow steps run the pull request's code in Docker containers on this server, without the Docker socket. Give a workflow only the CI secrets you would give that code: the `ci_secrets` in the Sandbox account's `sandbox.local.yml`. A workflow that needs a secret with no entry there is reported as not run, also when it has a fallback (`${{ secrets.X || github.token }}`). Miu adds one secret itself: a read-only GitHub App token for the repositories the run reaches, as `GITHUB_TOKEN` and the secrets used beside `github.token` ([profiles.md](profiles.md#choosing-the-workflows-pr_ci)). It reaches the script on stdin, before the tar, and Sandbox on a pipe (`sb ci run --secrets-stdin`, which needs a Sandbox that has it).
 
+### A repository the App may not read: a deploy key
+
+A private dependency (a Composer or npm package on GitHub) that the App is not installed on can be read with a read-only deploy key instead. The key must belong to the Sandbox account, mode `600`, and be added on GitHub as that repository's deploy key without write access. List it in `/etc/miu/ci-mirrors`, a file owned by root, mode `644`. Each line holds the repository, the key's path and its fingerprint (`ssh-keygen -lf <key> -E sha256`):
+
+```text
+acme/licensing /home/ubuntu/keys/licensing SHA256:...
+```
+
+For a job that needs a listed repository, other than through `actions/checkout`, the script fetches it with the key into a bare mirror in the account's `~/.cache/miu-ci-mirrors`. It checks GitHub's host key against `/usr/local/lib/miu/github-known-hosts`. The job then gets a copy of the mirror in its workspace (`.miu-ci/mirrors`, with no key and no remote). The job's `.env` gets git config (`GIT_CONFIG_*`) that reads that copy for the repository's `git@github.com:`, `ssh://` and `https://` URLs, so Composer and npm install it from there. The repository's own `composer.json` stays as it is. When the fetch fails, the job reads the last copy, and the log says how old it is. A run that then needs no token still gets the secrets its workflow names, as a value that opens nothing (`miu_no_github_token`), so the workflow runs as it would on GitHub.
+
 ## After the installer
 
 1. **Owner account.** Open the address and go to `/auth/setup`. Enter the setup code the installer printed. You can also read it with `sudo cat /home/miu/.config/miu/setup-code`.

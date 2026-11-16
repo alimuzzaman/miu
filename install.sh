@@ -289,6 +289,8 @@ if [ -n "$SANDBOX_USER" ]; then
   install -d -m 0755 "$LIB"
   echo "$SANDBOX_USER" > "$LIB/sandbox-user"
   install -o root -g root -m 0755 "$APP/bin/miu-sandbox-ci" "$LIB/sandbox-ci"
+  # GitHub's SSH host key, for repositories CI reads with a deploy key (/etc/miu/ci-mirrors).
+  install -o root -g root -m 0644 "$APP/lib/github-known-hosts" "$LIB/github-known-hosts"
   # CI job containers go here (bin/miu-sandbox-ci passes --cgroup-parent), capped
   # together; stop them all with: systemctl stop miu-ci.slice
   cat > /etc/systemd/system/miu-ci.slice <<SLICE
