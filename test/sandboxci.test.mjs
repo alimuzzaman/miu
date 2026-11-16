@@ -186,6 +186,16 @@ test('does not start when the server is short of memory or CPU', async () => {
 
 // Idle cores come from /proc/stat sampled over a few seconds, not the load
 // average, which a server full of healthchecks keeps above its core count.
+test('one idle core is enough now: 0.9 waits, 1.0 and 1.5 run (the old rule needed 3)', async () => {
+  for (const [cpus, runs] of [['0.9', false], ['1.0', true], ['1.5', true]]) {
+    const sandbox = sandboxHome();
+    const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
+    const r = await runSandboxCi(check, repo(), { ...server({ home: sandbox.home }).env, MIU_CI_FREE_CPUS: cpus, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots') });
+    if (runs) assert.equal(r.status, 0, `${cpus}: ${JSON.stringify(r)}`);
+    else assert.match(r.notRun ?? '', /this server is busy/, cpus);
+  }
+});
+
 test('the CPU check counts idle cores from /proc/stat: none idle waits, idle cores run', async () => {
   const stat = (name, user, idle) => { const f = path.join(tmp, `${name}-${process.hrtime.bigint()}`); fs.writeFileSync(f, `cpu  ${user} 0 0 ${idle} 0 0 0 0 0 0\ncpu0 1 2 3 4\n`); return f; };
   for (const [after, busy] of [[stat('b', 1100, 1000), true], [stat('b', 1000, 1100), false]]) {

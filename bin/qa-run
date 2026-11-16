@@ -603,12 +603,13 @@ let devSrc = null;
 const fastLines = new Map((profile.fast_checks ?? []).map((c) => [c.label, `- ${c.label}: waiting`]));
 const writeFast = (done) => write('fast-checks.md', ['# Fast checks on the PR head', '', done ? '' : '_Still running; read this file again later._', '', ...fastLines.values()].join('\n'));
 const runCmd = (cmd, dir) => new Promise((resolve) => {
-  const child = spawn('bash', ['-c', cmd], { cwd: dir, env: checkEnv({ ...envVars, PATH: `${path.dirname(process.execPath)}:${envVars.PATH}`, XSPEED_DIR: srcs['free-pr'] ?? srcs['free-dev'] ?? '' }, runDir) });
+  const tmp = checkEnv({ ...envVars, PATH: `${path.dirname(process.execPath)}:${envVars.PATH}`, XSPEED_DIR: srcs['free-pr'] ?? srcs['free-dev'] ?? '' });
+  const child = spawn('bash', ['-c', cmd], { cwd: dir, env: tmp.env });
   let out = '';
   child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { out += d; });
   const timer = setTimeout(() => child.kill('SIGTERM'), 20 * 60 * 1000);
-  child.on('close', (status) => { clearTimeout(timer); resolve({ status, out }); });
-  child.on('error', (e) => { clearTimeout(timer); resolve({ status: -1, out: String(e) }); });
+  child.on('close', (status) => { clearTimeout(timer); tmp.done(); resolve({ status, out }); });
+  child.on('error', (e) => { clearTimeout(timer); tmp.done(); resolve({ status: -1, out: String(e) }); });
 });
 const runCheck = (c, dir) => (c.sandbox_ci ? runSandboxCi(c, dir, envVars, { repo }) : runCmd(c.cmd, dir));
 const secs = (t0) => `${Math.round((Date.now() - t0) / 1000)}s`;

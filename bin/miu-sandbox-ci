@@ -131,13 +131,13 @@ def idle_cpus():
     # it stays above the core count while cores sit idle. Tests give two sample
     # files and no wait.
     first, _, second = os.environ.get("MIU_CI_PROC_STAT", "/proc/stat:/proc/stat").partition(":")
-    wait = float(os.environ.get("MIU_CI_CPU_SAMPLE_SECONDS", "5"))
     def sample(p):
         with open(p) as f:
             v = [int(x) for x in f.readline().split()[1:9]]
         # idle + iowait, out of user..steal
         return v[3] + v[4], sum(v)
     try:
+        wait = float(os.environ.get("MIU_CI_CPU_SAMPLE_SECONDS", "5"))
         i1, t1 = sample(first)
         time.sleep(wait)
         i2, t2 = sample(second or first)

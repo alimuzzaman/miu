@@ -139,16 +139,46 @@ test('committed files the install rewrites go back to the commit; the PR\'s own 
   git(dir, 'add', '-A'); git(dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x');
   fs.writeFileSync(path.join(dir, 'own.php'), 'changed before the install\n');
   const did = ensureDeps(dir, { env: { ...s.env, MIU_CI_MIRRORS_CONF: keyList(''), TOUCH: path.join(dir, 'includes/Dependencies/Api.php') } });
-  assert.deepEqual(did, ['composer install', 'restored 1 committed file the install rewrote']);
+  assert.deepEqual(did, ['composer install', 'restored 1 committed file the install rewrote: includes/Dependencies/Api.php']);
   assert.equal(fs.readFileSync(path.join(dir, 'includes/Dependencies/Api.php'), 'utf8'), 'committed\n');
   assert.equal(fs.readFileSync(path.join(dir, 'own.php'), 'utf8'), 'changed before the install\n');
 });
 
-test('each fast check gets its own empty temp folder in the run folder', () => {
-  const runDir = fs.mkdtempSync(path.join(tmp, 'run-'));
-  const a = checkEnv({ PATH: '/bin', TMPDIR: '/tmp' }, runDir), b = checkEnv({ PATH: '/bin' }, runDir);
-  assert.ok(a.TMPDIR.startsWith(path.join(runDir, 'check-tmp') + path.sep));
-  assert.notEqual(a.TMPDIR, b.TMPDIR);
-  assert.equal(a.TMP, a.TMPDIR); assert.equal(a.TEMP, a.TMPDIR); assert.equal(a.PATH, '/bin');
-  assert.deepEqual(fs.readdirSync(a.TMPDIR), []);
+test('each fast check gets its own private, empty temp folder outside the run folder, removed when it ends', () => {
+  const a = checkEnv({ PATH: '/bin', TMPDIR: '/tmp' }), b = checkEnv({ PATH: '/bin' });
+  try {
+    assert.notEqual(a.env.TMPDIR, b.env.TMPDIR);
+    assert.equal(a.env.TMP, a.env.TMPDIR); assert.equal(a.env.TEMP, a.env.TMPDIR); assert.equal(a.env.PATH, '/bin');
+    assert.deepEqual(fs.readdirSync(a.env.TMPDIR), []);
+    // Nobody else's: the agent account may write the run folder, never this one.
+    assert.equal(fs.statSync(a.env.TMPDIR).mode & 0o777, 0o700);
+    assert.ok(path.basename(a.env.TMPDIR).startsWith('miu-check-'));
+    fs.writeFileSync(path.join(a.env.TMPDIR, 'wp-config.php'), 'x');
+  } finally { a.done(); b.done(); }
+  assert.equal(fs.existsSync(a.env.TMPDIR), false);
+  assert.equal(fs.existsSync(b.env.TMPDIR), false);
+});
+
+test('a committed PR change to a file the install rewrites stays the PR\'s; names with glob characters are taken literally', () => {
+  const s = server();
+  const dir = path.join(fs.mkdtempSync(path.join(tmp, 'wt-')), 'pro-glob');
+  fs.mkdirSync(dir);
+  spawnSync('git', ['init', '-q', dir]);
+  fs.writeFileSync(path.join(dir, 'composer.json'), '{}');
+  for (const f of ['a[1].php', 'a1.php']) fs.writeFileSync(path.join(dir, f), 'base\n');
+  git(dir, 'add', '-A'); git(dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base');
+  fs.writeFileSync(path.join(dir, 'a[1].php'), 'the PR\'s version\n');
+  git(dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qam', 'pr');
+  // Dirty before the install: a glob "a[1].php" would match it and undo it.
+  fs.writeFileSync(path.join(dir, 'a1.php'), 'dirty before\n');
+  const did = ensureDeps(dir, { env: { ...s.env, MIU_CI_MIRRORS_CONF: keyList(''), TOUCH: path.join(dir, 'a[1].php') } });
+  assert.deepEqual(did, ['composer install', 'restored 1 committed file the install rewrote: a[1].php']);
+  assert.equal(fs.readFileSync(path.join(dir, 'a[1].php'), 'utf8'), 'the PR\'s version\n');
+  assert.equal(fs.readFileSync(path.join(dir, 'a1.php'), 'utf8'), 'dirty before\n');
+});
+
+test('a folder that is not a git repository installs without any restore', () => {
+  const s = server();
+  const dir = worktree('not-git', { packages: [lock.packages[1]] });
+  assert.deepEqual(ensureDeps(dir, { env: { ...s.env, MIU_CI_MIRRORS_CONF: keyList(''), TOUCH: path.join(dir, 'composer.json') } }), ['composer install']);
 });
