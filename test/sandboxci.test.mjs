@@ -688,6 +688,15 @@ function headerWorker() {
   const read = (f) => { try { return fs.readFileSync(path.join(dir, f), 'utf8').trim(); } catch { return ''; } };
   return { ...s, head: () => read('head'), secrets: () => read('secrets').split('\n').filter(Boolean).sort() };
 }
+// A stand-in for bin/miu-ci-mirror: a bundle of a one-commit repository.
+function fakeMirror() {
+  const dir = fs.mkdtempSync(path.join(tmp, 'fm-'));
+  spawnSync('git', ['init', '-q', '--initial-branch=main', dir]);
+  fs.writeFileSync(path.join(dir, 'f'), 'x'); git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'x');
+  const helper = path.join(dir, 'helper');
+  script(helper, `git -C "${dir}" bundle create -q - --branches`);
+  return { MIU_CI_MIRROR_USER: 'miu-mirror', MIU_CI_MIRROR_HELPER: helper };
+}
 const keyList = (lines) => { const f = path.join(tmp, `keys-${process.hrtime.bigint()}`); fs.writeFileSync(f, lines); return f; };
 
 test('the deploy-key list names repositories by their first word; comments and junk are skipped', () => {
@@ -699,7 +708,7 @@ test('a repo Composer reads is read with this server\'s deploy key, not the App:
   const s = headerWorker();
   const app = fakeApp();
   const { dir, base } = proRepo();
-  const r = await runSandboxCi(proCheck, dir, { ...s.env, MIU_CI_MIRRORS_CONF: keyList('Acme/licensing /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
+  const r = await runSandboxCi(proCheck, dir, { ...s.env, ...fakeMirror(), MIU_CI_MIRRORS_CONF: keyList('Acme/licensing /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
   assert.equal(r.status, 0, JSON.stringify(r));
   assert.deepEqual(app.calls.mint, [['Acme', ['free', 'pro', 'tools', 'hub'], []]]);
   assert.equal(s.head(), 'miu-ci-secrets 3 mirrors=Acme/licensing');
@@ -711,13 +720,14 @@ test('a run whose only private package comes by deploy key, but whose workflow n
   const wf = `jobs:\n  php:\n    runs-on: ubuntu-22.04\n    steps:\n      - name: Check out Free\n        if: \${{ !env.ACT }}\n        uses: actions/checkout@v4\n        with: { repository: Acme/free, token: "\${{ secrets.FREE_REPO_TOKEN || github.token }}" }\n      - run: composer install --prefer-dist\n        env:\n          COMPOSER_AUTH: '{"github-oauth":{"github.com":"\${{ secrets.FREE_REPO_TOKEN || github.token }}"}}'\n`;
   const dir = repo({ '.github/workflows/test.yml': wf, 'composer.json': JSON.stringify({ repositories: [{ type: 'vcs', url: 'git@github.com:Acme/licensing.git' }] }) });
   const base = git(dir, 'rev-parse', 'HEAD').stdout.trim();
-  const r = await runSandboxCi(proCheck, dir, { ...s.env, MIU_CI_MIRRORS_CONF: keyList('acme/LICENSING /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
+  const r = await runSandboxCi(proCheck, dir, { ...s.env, ...fakeMirror(), MIU_CI_MIRRORS_CONF: keyList('acme/LICENSING /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
   assert.equal(r.status, 0, JSON.stringify(r));
   // Composer sends it with public downloads too, so it must be a real token: metadata of the own repo only.
   assert.deepEqual(app.calls.mint, [['Acme', ['pro'], []]]);
   assert.deepEqual(app.calls.opts[0].permissions, { metadata: 'read' });
   assert.deepEqual(app.calls.revoked, [TOKEN]);
-  assert.equal(s.head(), 'miu-ci-secrets 2 mirrors=Acme/licensing');
+  // The list's spelling, which the sudo rule names.
+  assert.equal(s.head(), 'miu-ci-secrets 2 mirrors=acme/LICENSING');
   assert.deepEqual(s.secrets(), [`FREE_REPO_TOKEN=${TOKEN}`, `GITHUB_TOKEN=${TOKEN}`]);
 });
 
@@ -727,7 +737,7 @@ test('a repo the workflow checks out still needs the App: actions/checkout does 
   const wf = 'jobs:\n  php:\n    runs-on: ubuntu-22.04\n    steps:\n      - uses: actions/checkout@v4\n        with: { repository: Acme/licensing }\n';
   const dir = repo({ '.github/workflows/test.yml': wf });
   const base = git(dir, 'rev-parse', 'HEAD').stdout.trim();
-  await runSandboxCi(proCheck, dir, { ...s.env, MIU_CI_MIRRORS_CONF: keyList('Acme/licensing /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
+  await runSandboxCi(proCheck, dir, { ...s.env, ...fakeMirror(), MIU_CI_MIRRORS_CONF: keyList('Acme/licensing /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
   assert.deepEqual(app.calls.mint, [['Acme', ['licensing'], []]]);
   assert.equal(s.head(), 'miu-ci-secrets 1');
 });
