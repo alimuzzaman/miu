@@ -42,7 +42,7 @@ function server({ worker, home, docker = 'exit 0' }) {
   script(path.join(bin, 'curl'), `cat >> "${bin}/curl-stdin"\nprintf '%s\\n' "$@" >> "${bin}/curl-argv"`);
   if (!hasYaml) script(path.join(bin, 'python3'), 'exit 0');
   return {
-    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '8', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-deploy-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no-apply.lock') },
+    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '8', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-deploy-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no-apply.lock'), MIU_CI_RUNNER_UID: String(process.getuid()) },
     sudoArgv: () => fs.readFileSync(path.join(bin, 'sudo-argv'), 'utf8').trim().split('\n'),
     sudoAll: () => fs.readFileSync(path.join(bin, 'sudo-all'), 'utf8').trim().split('\n'),
     curl: (f) => { try { return fs.readFileSync(path.join(bin, `curl-${f}`), 'utf8'); } catch { return ''; } },
@@ -255,9 +255,25 @@ test('the cleanup removes what root-run containers wrote, as root in the runner 
   const log = path.join(sandbox.home, 'docker-log');
   await runSandboxCi(check, repo(), server({ home: sandbox.home, docker: `[ "$1" = run ] && printf '%s\\n' "$@" > "${log}"; exit 0` }).env);
   const argv = fs.readFileSync(log, 'utf8').trim().split('\n');
+  const image = argv.indexOf('catthehacker/ubuntu:runner-22.04');
+  assert.ok(argv.indexOf('--user') < image && argv.indexOf('--pull=never') < image, argv.join(' '));
   assert.equal(argv[argv.indexOf('--user') + 1], '0');
-  assert.ok(argv.includes('catthehacker/ubuntu:runner-22.04'));
-  assert.ok(argv.includes('--pull=never'));
+  assert.match(argv[argv.indexOf('-v') + 1], /\/miu-ci\.[^/]+:\/work$/);
+  assert.deepEqual(argv.slice(image + 1), ['/work', '-mindepth', '1', '-delete']);
+});
+
+test('the cleanup falls back to act-22.04 where runner-22.04 is not pulled yet', async () => {
+  const sandbox = sandboxHome();
+  const log = path.join(sandbox.home, 'docker-log');
+  await runSandboxCi(check, repo(), server({ home: sandbox.home, docker: `[ "$1" = run ] || exit 0; printf '%s\\n' "$@" | grep '^catthehacker' >> "${log}"; case "$*" in *runner-22.04*) exit 125;; esac` }).env);
+  assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n'), ['catthehacker/ubuntu:runner-22.04', 'catthehacker/ubuntu:act-22.04']);
+});
+
+test('an account that is not the runner uid is not run, never a failure of the pull request', async () => {
+  const sandbox = sandboxHome();
+  const r = await runSandboxCi(check, repo(), { ...server({ home: sandbox.home }).env, MIU_CI_RUNNER_UID: String(process.getuid() + 1) });
+  assert.match(r.notRun ?? '', /uid \d+, and CI jobs run as runner, uid 1001/, JSON.stringify(r));
+  assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false, 'Sandbox was not called');
 });
 
 test('the worker never asks Sandbox for a site', async () => {
@@ -363,7 +379,7 @@ test('a real failure is reported even when another cell could not start', async 
 // A broken server must never read as a broken pull request.
 for (const [name, sb, expected] of [
   ['a cell that could not start', { exit: 1, stdout: report([{ label: 'a', status: 'provision_failed', error: 'no port left' }]) }, /no port left/],
-  ['act failing before the job ran', { exit: 1, stdout: report([{ label: 'a', status: 'failed', exit_code: 1, output: 'Error: No such image: catthehacker/ubuntu:act-22.04' }]) }, /No such image/],
+  ['act failing before the job ran', { exit: 1, stdout: report([{ label: 'a', status: 'failed', exit_code: 1, output: 'Error: No such image: catthehacker/ubuntu:runner-22.04' }]) }, /No such image/],
   ['act exiting 0 without running a job', { stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: 'nothing selected' }]) }, /no job ran/],
   ['a skipped job whose label says it succeeded', { stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: '[t/a] 🚧  Skipping unsupported platform -- Try running with -P Job succeeded=image' }]) }, /no job ran/],
   ['a step that prints the failure line', { exit: 1, stdout: report([{ label: 'a', status: 'failed', exit_code: 1, output: '[t/a]   | 🏁  Job failed\nError: No such image' }]) }, /No such image/],

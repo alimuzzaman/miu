@@ -71,6 +71,11 @@ sb="$HOME/sandbox/sb-src/sb"
 # Inside this script, because Miu's account cannot signal this one to stop it.
 bounded() { timeout -k 10 "$1" "${@:2}"; }
 
+# Jobs run as runner, uid 1001 (sb ci run --as-runner), in a workspace this
+# account owns, so another uid here fails every job the way a broken pull
+# request would. sudo resets the environment, so only a test sets the uid.
+[ "$(id -u)" = "${MIU_CI_RUNNER_UID:-1001}" ] || die "not run: the Sandbox account $(id -un) is uid $(id -u), and CI jobs run as runner, uid 1001, which cannot write to its workspace"
+
 # This server is shared: never start while Sandbox is applying a hosting change.
 # These are the locks a host apply holds (Sandbox's sandbox/resources/host_guard.py),
 # probed shared and non-blocking the same way. sudo resets the environment, so
@@ -192,8 +197,11 @@ cleanup() {
     fi
   done
   # Jobs run as runner (uid 1001), but a container: job or a service keeps its
-  # image's user, often root, so what they wrote needs root to remove.
-  bounded 120 docker run --rm --pull=never --user 0 -v "$root:/work" --entrypoint find catthehacker/ubuntu:runner-22.04 /work -mindepth 1 -delete >/dev/null 2>&1 || true
+  # image's user, often root, so what they wrote needs root to remove. act-22.04
+  # is there on a server whose install.sh has not pulled runner-22.04 yet.
+  for image in catthehacker/ubuntu:runner-22.04 catthehacker/ubuntu:act-22.04; do
+    bounded 120 docker run --rm --pull=never --user 0 -v "$root:/work" --entrypoint find "$image" /work -mindepth 1 -delete >/dev/null 2>&1 && break
+  done
   bounded 120 rm -rf "$root" "$config" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -333,7 +341,7 @@ if [ -n "$mirror_list" ]; then
     [[ $repo =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ && $repo != */. && $repo != */.. ]] || die "not run: not a repository name: $repo"
     copy=$root/.miu-ci/mirrors/${repo,,}.git
     [ -d "$copy/objects" ] && [ -f "$copy/HEAD" ] || die "not run: Miu sent no copy of $repo"
-    # A container: job may run as another user than this account, which owns the copy, hence safe.directory.
+    # A container: job may run as another uid than this account, which owns the copy, hence safe.directory.
     for u in "git@github.com:$repo.git" "ssh://git@github.com/$repo.git" "https://github.com/$repo.git"; do
       mirror_config+=("url.$copy.insteadOf" "$u")
     done

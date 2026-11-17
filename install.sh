@@ -345,7 +345,7 @@ EOF
   # Miu runs jobs with --as-runner: ubuntu-latest and ubuntu-22.04 run in this image.
   sudo -u "$SANDBOX_USER" -H docker pull -q catthehacker/ubuntu:runner-22.04 >/dev/null || say "Could not pull the CI runner image as $SANDBOX_USER; CI workflows will fail until it is there."
   # The job's runner user is uid 1001 and writes to the workspace this account owns.
-  [ "$(id -u "$SANDBOX_USER")" = 1001 ] || say "$SANDBOX_USER is not uid 1001, the runner user in CI jobs; jobs that write to their workspace will fail."
+  [ "$(id -u "$SANDBOX_USER")" = 1001 ] || say "$SANDBOX_USER is uid $(id -u "$SANDBOX_USER"), not 1001, the runner user in CI jobs; CI reports \"not run\" until the Sandbox account is uid 1001."
   sudo -u "$SANDBOX_USER" -H sh -c 'command -v act' >/dev/null || say "act is not installed for $SANDBOX_USER; CI workflows will report \"not run\" until it is."
 fi
 
