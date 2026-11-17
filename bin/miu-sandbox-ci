@@ -235,6 +235,9 @@ for n in ${asked[@]+"${asked[@]}"}; do
   [ -n "$n" ] || continue
   if [ -n "${listed[$n]+x}" ]; then allowed+=",$n"; else unlisted+=",$n"; fi
 done
+# Names Miu sends a value for need no list: Sandbox gives --secrets-stdin values
+# precedence over ci_secrets, and a value is never empty (above), so a forged
+# NAME=x line reaches only its own x, never the server's secret of that name.
 for l in ${secret_lines[@]+"${secret_lines[@]}"}; do allowed+=",${l%%=*}"; done
 
 # Miu's account runs pull request code in its fast checks, so it can call this
