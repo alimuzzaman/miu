@@ -161,7 +161,7 @@ MIU_SHA=$(git -C "$RELEASES/repo.git" rev-parse --verify "refs/miu-release/insta
 git -C "$RELEASES/repo.git" show "$MIU_SHA:bin/miu-release" > "$LIB/.miu-release.new" 2>/dev/null || die "$MIU_REF has no bin/miu-release: this installer needs a Miu with side-by-side releases"
 install -o root -g root -m 0755 "$LIB/.miu-release.new" "$LIB/miu-release" && rm -f "$LIB/.miu-release.new"
 # It also writes miu.service.d/20-miu-release.conf: MIU_RUNS and QA_CACHE_DIR
-# name the data through /srv/miu, the same folders in every release.
+# name the data by its real folders in $DATA, the same in every release.
 MIU_USER="$MIU_USER" MIU_REPO_URL="$MIU_REPO" "$LIB/miu-release" deploy "$MIU_SHA" --no-restart
 install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$DATA/runs" "$DATA/.cache"
 if [ "$AGENT_USER_ON" = 1 ]; then

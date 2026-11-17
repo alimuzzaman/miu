@@ -193,6 +193,7 @@ convert() {
   done
   for e in "${SHARED[@]}"; do
     if [ -e "$APP/$e" ] && [ ! -L "$APP/$e" ] && [ -e "$DATA/$e" ]; then die "$DATA/$e is there already and so is $APP/$e; move one by hand"; fi
+    if [ -L "$APP/$e" ] && [ "$(readlink "$APP/$e")" != "$DATA/$e" ]; then die "$APP/$e is a symlink to $(readlink "$APP/$e"); move that folder to $DATA/$e by hand first"; fi
   done
   main=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || echo 0)
   busy=$(runs_from "$APP" "$main")
@@ -237,9 +238,12 @@ EOF
   if ! cmp -s "$d/20-miu-release.conf.tmp" "$d/20-miu-release.conf"; then mv "$d/20-miu-release.conf.tmp" "$d/20-miu-release.conf"; systemctl daemon-reload; else rm -f "$d/20-miu-release.conf.tmp"; fi
 }
 
-# The release's CI worker behind $LIB/sandbox-ci (and ci-mirror), when this
-# server runs CI (install.sh --sandbox-user). A worker already running keeps
-# its own file. The sudo rules name $LIB/sandbox-ci, which stays the path.
+# The release's CI worker in $LIB/versions/<release>, and $LIB/sandbox-ci
+# (and ci-mirror) pointing at it, when this server runs CI (install.sh
+# --sandbox-user). A worker already running keeps its own file. Each release
+# calls its own copy (lib/sandboxci.mjs ownWorker) only when the sudo rule
+# allows $LIB/versions/*/sandbox-ci: $LIB/versions/.per-release says so.
+SUDOERS_CI=${MIU_SUDOERS_CI:-/etc/sudoers.d/miu-sandbox-ci}
 worker() {
   local name=${1:-$(current)} src
   [ -f "$LIB/sandbox-user" ] || { say "No Sandbox CI on this server; no worker to install"; return 0; }
@@ -254,6 +258,12 @@ worker() {
   fi
   flip "$LIB/sandbox-ci" "versions/$name/sandbox-ci"
   [ ! -f "$LIB/versions/$name/ci-mirror" ] || flip "$LIB/ci-mirror" "versions/$name/ci-mirror"
+  if grep -qF "$LIB/versions/*/sandbox-ci" "$SUDOERS_CI" 2>/dev/null; then
+    touch "$LIB/versions/.per-release"
+  else
+    rm -f "$LIB/versions/.per-release"
+    say "The sudo rule ($SUDOERS_CI) names only $LIB/sandbox-ci: every release uses the newest worker. Run install.sh again to give each release its own."
+  fi
   say "CI worker: $LIB/sandbox-ci -> versions/$name"
 }
 
@@ -290,8 +300,8 @@ prune() {
 go_to() {
   local name=$1 before restart_it=$2
   before=$(current)
-  flip "$APP" "$RELEASES/$name"
   worker "$name"
+  flip "$APP" "$RELEASES/$name"
   if [ "$restart_it" != 1 ]; then
     record "$name"
     if [ "$CONVERTED" = 1 ]; then say "Switched $APP to $name; $SERVICE stays stopped until it is started"; else say "Switched $APP to $name; not restarted"; fi
@@ -303,8 +313,8 @@ go_to() {
   if restart; then record "$name"; say "$SERVICE answers on $name"; return 0; fi
   [ -n "$before" ] && [ "$before" != "$name" ] || die "$SERVICE did not come up on $name; see: journalctl -u $SERVICE -n 50"
   say "$SERVICE did not come up on $name; switching back to $before"
-  flip "$APP" "$RELEASES/$before"
   worker "$before"
+  flip "$APP" "$RELEASES/$before"
   restart || die "$SERVICE did not come up on $before either; see: journalctl -u $SERVICE -n 50"
   die "$name did not start; back on $before"
 }

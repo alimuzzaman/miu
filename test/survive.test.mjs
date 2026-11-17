@@ -94,6 +94,8 @@ test('a release runs its own copy of the worker when one is installed', () => {
   assert.equal(ownWorker(worker, sha), worker, 'none installed: the shared one');
   fs.mkdirSync(path.join(lib, 'versions', sha), { recursive: true });
   fs.writeFileSync(path.join(lib, 'versions', sha, 'sandbox-ci'), '');
+  assert.equal(ownWorker(worker, sha), worker, 'the sudo rule does not allow the copies yet');
+  fs.writeFileSync(path.join(lib, 'versions', '.per-release'), '');
   assert.equal(ownWorker(worker, sha), path.join(lib, 'versions', sha, 'sandbox-ci'));
   assert.equal(ownWorker(worker, ''), worker, 'a checkout with no REVISION');
 });
