@@ -1945,7 +1945,7 @@ function ciTab(d) {
   return '<div class="cihead"><span><b>CI at ' + esc(at) + '</b>, ' + esc(line + from) + '</span><span class="sp"></span>' + again +
     (c.checksUrl ? '<a class="btn" href="' + esc(c.checksUrl) + '" target="_blank" rel="noopener" data-ext title="GitHub\'s own checks, read only">GitHub checks</a>' : '') + '</div>' +
     (c.jobs && c.jobs.length ? '<div class="cijobs">' + c.jobs.map((j) => ciJob(c, j)).join('') + '</div>' : '') +
-    '<p class="h" style="margin-top:10px">Jobs run in Miu\'s Sandbox CI containers on this server, up to ' + esc(c.parallel) + ' at once across all pull requests, never on GitHub Actions. The workflows come from the profile\'s base branch, not the pull request; a pull request that changes .github/ is not run here, and Miu never runs a job that deploys, publishes, comments or notifies.</p>' + fast;
+    '<p class="h" style="margin-top:10px">Jobs run in Miu\'s Sandbox CI containers on this server, up to ' + esc(c.parallel) + ' at once across all pull requests, never on GitHub Actions. A pull request from this repository runs the workflows on its own branch; one from a fork or from Dependabot is not run here. A job may name only the CI secrets its job on the base branch uses, and Miu never runs a job that deploys, publishes, comments or notifies.</p>' + fast;
 }
 
 // The pull request's test stack (lib/prstackctl.mjs): a Sandbox site that
