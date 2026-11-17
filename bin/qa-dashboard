@@ -33,6 +33,7 @@ import * as gh from '../lib/github.mjs';
 import * as fixLib from '../lib/fix.mjs';
 import * as steer from '../lib/steer.mjs';
 import * as auth from '../lib/auth.mjs';
+import { needsReply, waitsReply } from '../lib/cmdreply.mjs';
 import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -1388,6 +1389,7 @@ const CMD_FILE = path.join(RUNS, '.commands.json');
 async function scanCommands() {
   if (!getConfig().commands) return;
   const st = readJson(CMD_FILE) ?? { since: new Date().toISOString(), done: [] };
+  st.replied ??= [];
   const started = new Date().toISOString();
   for (const repo of repos()) {
     let comments;
@@ -1401,9 +1403,20 @@ async function scanCommands() {
       const rest = m[2].trim();
       const full = /^full\b/i.test(rest);
       const note = (full ? rest.replace(/^full\b/i, '') : rest).trim();
-      enqueue(repo, pr, `/miu from ${c.user.login}`, { full, note: note ? `${c.user.login}: ${note}` : '', by: 'github' });
+      const q = enqueue(repo, pr, `/miu from ${c.user.login}`, { full, note: note ? `${c.user.login}: ${note}` : '', by: 'github' });
       await gh.rest('POST', `repos/${repo}/issues/comments/${c.id}/reactions`, { body: { content: 'eyes' } }).catch(() => {});
       console.log(`queued ${repo}#${pr} from /miu by ${c.user.login}${full ? ' (full)' : ''}`);
+      // Manual mode: say it waits for a person, once per trigger (lib/cmdreply.mjs).
+      // Recorded before the post, so nothing ever posts it twice.
+      if (needsReply({ mode: queueState().mode, waits: q?.waits, replied: st.replied, commentId: c.id })) {
+        st.replied.push(c.id);
+        st.replied = st.replied.slice(-500);
+        fs.writeFileSync(CMD_FILE, JSON.stringify(st, null, 2));
+        const body = waitsReply({ publicUrl: authCfg().publicUrl, marker: project().marker, commentId: c.id });
+        await withAppToken(() => gh.rest('POST', `repos/${repo}/issues/${pr}/comments`, { body: { body } }))
+          .then(() => console.log(`replied on ${repo}#${pr}: waits for a manual start`))
+          .catch((e) => console.error(`reply on ${repo}#${pr}:`, e.message));
+      }
     }
   }
   st.since = started;
