@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createStacks, fromStatus } from '../lib/prstackctl.mjs';
+import { createStacks, fromStatus, totpPath } from '../lib/prstackctl.mjs';
 import { CAP } from '../lib/prstacks.mjs';
 
 const pr = (n, extra = {}) => ({ headRepo: 'WPDevelopers/xspeed', headRefName: `fix/${n}`, headRefOid: `sha${n}`, ...extra });
@@ -106,4 +106,45 @@ test('fromStatus: ready, building, failed, licensing key missing', () => {
   assert.equal(f.failedReason, 'stack_up_failed');
   const k = fromStatus({ applied: null, last_check: { reason: 'fetch_failed', error: 'fetch of WPDevelopers/licensing main failed: Permission denied (publickey)' } }, 'free');
   assert.match(k.failedReason, /licensing deploy key missing/);
+});
+
+const hubPr = (n, extra = {}) => ({ repo: 'WPDevelopers/xspeed-hub', number: n, headRepo: 'WPDevelopers/xspeed-hub', headRefName: `feat/h${n}`, headRefOid: `hsha${n}`, ...extra });
+
+test('a Free PR that names a Hub PR shares the Hub PR\'s stack, pr-hub-<n>', async () => {
+  const s = setup();
+  s.st.want('WPDevelopers/xspeed', 21, 'free', pr(21), { hub: hubPr(88) });
+  await s.st.scan({ open: new Map([['WPDevelopers/xspeed#21', 'sha21'], ['WPDevelopers/xspeed-hub#88', 'hsha88']]) });
+  assert.deepEqual(s.calls.at(-1), ['add', 'pr-hub-88', 'full', 'free=fix/21', 'pro=dev', 'hub=feat/h88']);
+  assert.equal(s.st.view('WPDevelopers/xspeed#21').name, 'pr-hub-88', 'the Free PR\'s run page shows the shared stack');
+  assert.equal(s.st.view('WPDevelopers/xspeed-hub#88').name, 'pr-hub-88');
+  assert.equal(s.st.list().length, 1, 'one stack, not two');
+});
+
+test('a partner that arrives later re-declares the follow; one that closes goes back to dev', async () => {
+  const s = setup();
+  s.st.want('WPDevelopers/xspeed-hub', 88, 'hub', hubPr(88));
+  const both = new Map([['WPDevelopers/xspeed-hub#88', 'hsha88'], ['WPDevelopers/xspeed#21', 'sha21']]);
+  await s.st.scan({ open: both });
+  assert.deepEqual(s.calls.at(-1), ['add', 'pr-hub-88', 'full', 'free=dev', 'pro=dev', 'hub=feat/h88']);
+  s.st.want('WPDevelopers/xspeed', 21, 'free', pr(21), { hub: hubPr(88) });
+  await s.st.scan({ open: both });
+  assert.deepEqual(s.calls.filter((c) => c[0] === 'add').at(-1), ['add', 'pr-hub-88', 'full', 'free=fix/21', 'pro=dev', 'hub=feat/h88']);
+  await s.st.scan({ open: new Map([['WPDevelopers/xspeed-hub#88', 'hsha88']]) });
+  assert.deepEqual(s.calls.filter((c) => c[0] === 'add').at(-1), ['add', 'pr-hub-88', 'full', 'free=dev', 'pro=dev', 'hub=feat/h88']);
+  assert.equal(s.st.view('WPDevelopers/xspeed-hub#88').state, 'following');
+  assert.ok(!s.calls.some((c) => c[0] === 'remove'), 'the Hub PR is still open: its stack stays');
+});
+
+test('the Hub authenticator file goes with its stack, and a new stack of that name never inherits one', async () => {
+  const s = setup();
+  const file = totpPath(s.runsDir, 'pr-hub-88');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, '{"left":"over"}', { mode: 0o600 });
+  s.st.want('WPDevelopers/xspeed-hub', 88, 'hub', hubPr(88));
+  await s.st.scan({ open: new Map([['WPDevelopers/xspeed-hub#88', 'hsha88']]) });
+  assert.equal(fs.existsSync(file), false, 'deleted when the stack is created');
+  fs.writeFileSync(file, '{"stack":"pr-hub-88"}', { mode: 0o600 });
+  await s.st.scan({ open: new Map() });
+  assert.equal(s.st.view('WPDevelopers/xspeed-hub#88').state, 'removed');
+  assert.equal(fs.existsSync(file), false, 'deleted when the stack is removed');
 });

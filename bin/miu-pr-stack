@@ -10,6 +10,7 @@
 #   pr-stack mem                                   MB of memory available
 #   pr-stack add <stack> <wp|full> free=<branch> pro=<branch> [hub=<branch>]
 #   pr-stack status <stack>                        the follow's status, JSON
+#   pr-stack ports <stack>                         the stack's ports and incarnation, JSON
 #   pr-stack remove <stack>                        follow and stack, gone
 #
 # Fixed here, not by the caller: the org (WPDevelopers), the setup repo and
@@ -44,7 +45,7 @@ branch_ok() {
 # (Sandbox Fix 5). Every Sandbox call goes through here.
 here() { "$sb" host "$@" --here --json; }
 
-[ $# -ge 1 ] || die "usage: pr-stack mem | add <stack> <wp|full> free=<b> pro=<b> [hub=<b>] | status <stack> | remove <stack>"
+[ $# -ge 1 ] || die "usage: pr-stack mem | add <stack> <wp|full> free=<b> pro=<b> [hub=<b>] | status <stack> | ports <stack> | remove <stack>"
 verb=$1; shift
 case $verb in
   mem)
@@ -88,6 +89,24 @@ case $verb in
   status)
     [ $# -eq 1 ] && name_ok "$1" || die "usage: pr-stack status <stack>"
     here follow status --name "$1"
+    ;;
+  ports)
+    # One line: {"ok":true,"slug":..,"created_at":..,"copy_id":..,"ports":{..}}. The incarnation
+    # (created_at, copy_id) tells a stack from an earlier one of the same name.
+    [ $# -eq 1 ] && name_ok "$1" || die "usage: pr-stack ports <stack>"
+    here stack list | tail -n 1 | python3 -c '
+import json, sys
+name = sys.argv[1]
+try:
+    d = json.loads(sys.stdin.read())
+except ValueError:
+    print(json.dumps({"ok": False, "code": "stack_list_unreadable"})); sys.exit(1)
+hit = [s for s in d.get("stacks") or [] if s.get("slug") == name]
+if not hit:
+    print(json.dumps({"ok": False, "code": d.get("code") or "stack_not_found"})); sys.exit(1)
+s = hit[0]
+print(json.dumps({"ok": True, "slug": name, "created_at": s.get("created_at"), "copy_id": s.get("copy_id"), "ports": s.get("ports") or {}}))
+' "$1"
     ;;
   remove)
     [ $# -eq 1 ] && name_ok "$1" || die "usage: pr-stack remove <stack>"

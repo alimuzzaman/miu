@@ -1,0 +1,34 @@
+#!/usr/bin/env node
+// qa-hub-signin --stack pr-hub-88 --incarnation <created_at/copy_id> --mailpit-port 18123 --out <storage.json> [--runs-dir DIR]
+//
+// Signs Miu's QA address into the stack's Hub admin console (lib/hubsignin.mjs)
+// and writes the session as a Playwright storage state, 0600, at --out. qa-run
+// runs it and deletes --out after the run; the agent's browser loads it.
+// Prints one JSON line: { ok, stack, enrolled } or { ok: false, error }. No
+// link, code or cookie is ever printed.
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { signIn, writeStorageState } from '../lib/hubsignin.mjs';
+import { ZONE, NAME } from '../lib/prstacks.mjs';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const arg = (k) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : undefined; };
+const stack = arg('stack'), incarnation = arg('incarnation'), port = Number(arg('mailpit-port')), out = arg('out');
+const runs = path.resolve(arg('runs-dir') ?? process.env.MIU_RUNS_DIR ?? path.join(ROOT, 'runs'));
+const say = (o) => { console.log(JSON.stringify(o)); process.exit(o.ok ? 0 : 1); };
+
+if (!stack || !NAME.test(stack) || !/^pr-hub-\d{1,6}$/.test(stack)) say({ ok: false, error: 'a full PR stack name (pr-hub-<n>) is needed' });
+if (!incarnation || !Number.isInteger(port) || port < 1024 || port > 65535 || !out) say({ ok: false, error: 'usage: --stack --incarnation --mailpit-port --out' });
+
+try {
+  const { cookie, enrolled } = await signIn({
+    admin: `https://admin-${stack}.${ZONE}`,
+    mailpit: `http://127.0.0.1:${port}/mail`,
+    stack, incarnation,
+    totpFile: path.join(runs, '.stacks', `${stack}.totp`),
+  });
+  writeStorageState(path.resolve(out), cookie);
+  say({ ok: true, stack, enrolled });
+} catch (e) {
+  say({ ok: false, stack, error: String(e.message).slice(0, 300) });
+}
