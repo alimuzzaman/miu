@@ -12,7 +12,9 @@
 # lines NAME=value. They are this run's secrets (a GitHub token Miu minted for
 # the repositories the workflow checks out), handed to Sandbox on a pipe; they
 # are never in an argument, the environment, or a file this script keeps.
-# The first line may end in ` mirrors=owner/name,...`: repositories this
+# The first line may go on with ` repo=owner/name`: the pull request's
+# repository, which picks its line in /etc/miu/ci-secret-names (below).
+# Then ` mirrors=owner/name,...`: repositories this
 # server reads with a deploy key (/etc/miu/ci-mirrors), whose copies Miu put in
 # the tar under .miu-ci/mirrors. Git in the job reads each copy for the
 # repository's GitHub URLs. This account never holds a deploy key.
@@ -20,6 +22,15 @@
 # workflow may name besides the NAME=value lines, which are the ones the base
 # branch's same job names. The pull request wrote the workflow; any other name
 # it holds refuses the run.
+#
+# Miu's account sends that header, and it also runs pull request code in fast
+# checks, so repo= and allow= are only what Miu asks for. The server's CI
+# secrets a run may name are those allow= names that root's own list,
+# /etc/miu/ci-secret-names, gives the repo= repository: lines of
+# `owner/name NAME,NAME`, # for comments. No such file, or one that is not
+# root's or that group or others can write, gives none. Nothing here proves
+# which repository the tar came from (Miu's account could name another), so
+# every name on that list is one a pull request on this server could reach.
 #
 # Prints the JSON report of `sb ci run` on stdout. Nothing on stdin or in the
 # tar is trusted: that account can reach Docker, and Miu's account cannot.
@@ -45,10 +56,11 @@ done
 
 # Read before anything else touches stdin. The values stay in this shell.
 IFS= read -r header || die "not run: no secrets header from Miu"
-[[ $header =~ ^miu-ci-secrets\ ([0-9])(\ mirrors=([A-Za-z0-9_.,/-]{1,512}))?(\ allow=([A-Za-z0-9_,]{1,2048}))?$ ]] || die "not run: no secrets header from Miu; update Miu and this worker together"
+[[ $header =~ ^miu-ci-secrets\ ([0-9])(\ repo=([A-Za-z0-9-]+/[A-Za-z0-9_.-]+))?(\ mirrors=([A-Za-z0-9_.,/-]{1,512}))?(\ allow=([A-Za-z0-9_,]{1,2048}))?$ ]] || die "not run: no secrets header from Miu; update Miu and this worker together"
 secret_count=${BASH_REMATCH[1]}
-mirror_list=${BASH_REMATCH[3]}
-allow_list=${BASH_REMATCH[5]}
+run_repo=${BASH_REMATCH[3]}
+mirror_list=${BASH_REMATCH[5]}
+allow_list=${BASH_REMATCH[7]}
 secret_lines=()
 for ((i = 0; i < secret_count; i++)); do
   IFS= read -r line || die "not run: the secrets header is cut short"
@@ -196,15 +208,40 @@ bounded 300 tar -x -C "$root"
 [ -f "$root/$workflow" ] || die "the pull request has no $workflow"
 # Miu reads the workflow too, and stops at less than this.
 [ "$(wc -c < "$root/$workflow")" -le 524288 ] || die "refused: $workflow is over 512 KB"
-# The names Miu gives, and those the base branch's same job uses: nothing else.
-allowed=$allow_list
+# The names Miu gives, and those the base branch's same job uses that root's
+# list gives this repository: nothing else. sudo resets the environment, so
+# only a test points these elsewhere.
+names_file=${MIU_CI_SECRET_NAMES:-/etc/miu/ci-secret-names}
+names_owner=${MIU_CI_SECRET_NAMES_OWNER:-0:0}
+declare -A listed=()
+if [ -L "$names_file" ] || [ ! -f "$names_file" ]; then
+  unlisted_why="the base branch's job names, but $names_file is missing or a link, so this server gives none"
+elif ! meta=$(stat -c '%u:%g %a' "$names_file") || [[ ${meta% *} != "$names_owner" ]] || (( 8#${meta#* } & 8#022 )); then
+  unlisted_why="the base branch's job names, but $names_file is not root's own file that only root can write, so this server gives none"
+else
+  unlisted_why="the base branch's job names, but $names_file does not list for ${run_repo:-this repository (Miu named none)}"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}
+    IFS=$' \t,' read -r -a words <<<"$line"
+    [ ${#words[@]} -gt 1 ] && [ -n "$run_repo" ] && [[ ${words[0],,} == "${run_repo,,}" ]] || continue
+    for n in "${words[@]:1}"; do
+      [[ $n =~ ^[A-Za-z_][A-Za-z0-9_]{0,63}$ ]] && listed[$n]=1
+    done
+  done < "$names_file"
+fi
+allowed= unlisted=
+IFS=, read -r -a asked <<<"$allow_list"
+for n in ${asked[@]+"${asked[@]}"}; do
+  [ -n "$n" ] || continue
+  if [ -n "${listed[$n]+x}" ]; then allowed+=",$n"; else unlisted+=",$n"; fi
+done
 for l in ${secret_lines[@]+"${secret_lines[@]}"}; do allowed+=",${l%%=*}"; done
 
 # Miu's account runs pull request code in its fast checks, so it can call this
 # script with any tar. Before act sees the workflow, check what it asks of Docker.
 links=$(find "$root/.github" -type l -print -quit) || die "refused: .github has a folder this account cannot read"
 [ -z "$links" ] || die "refused: a symbolic link under .github"
-bounded 60 python3 -I - "$root/$workflow" "$job" "$allowed" <<'POLICY'
+bounded 60 python3 -I - "$root/$workflow" "$job" "$allowed" "$unlisted" "$unlisted_why" <<'POLICY'
 import json, os, re, resource, shlex, sys
 import yaml
 # The pull request wrote this YAML: aliases that expand without end stop here.
@@ -265,6 +302,10 @@ try:
 except (TypeError, ValueError, RecursionError, MemoryError):
     refuse("cannot read it as data")
 extra = sorted(names - set(filter(None, sys.argv[3].split(","))))
+# Names allow= asks for that root's list does not give this repository.
+held = [n for n in extra if n in set(sys.argv[4].split(","))]
+if held:
+    refuse(f"it names CI secrets {sys.argv[5]}: {', '.join(held[:5])}")
 if extra:
     refuse(f"it names CI secrets its base branch's job does not: {', '.join(extra[:5])}")
 for job_id, job in jobs.items():

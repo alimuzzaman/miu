@@ -17,6 +17,9 @@ const hasYaml = spawnSync('python3', ['-c', 'import yaml']).status === 0;
 const needsYaml = { skip: hasYaml ? false : 'needs python3 with PyYAML' };
 const OK = 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id }]\n';
 const script = (file, body) => fs.writeFileSync(file, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
+// Root's /etc/miu/ci-secret-names on the server; here the test's own account stands in for root.
+const SELF = `${process.getuid()}:${process.getgid()}`;
+const namesList = (text, mode = 0o644) => { const f = path.join(fs.mkdtempSync(path.join(tmp, 'names-')), 'ci-secret-names'); fs.writeFileSync(f, text); fs.chmodSync(f, mode); return f; };
 const git = (dir, ...args) => spawnSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' });
 
 // A pull request's checkout: one commit, plus a file that was never committed.
@@ -42,7 +45,7 @@ function server({ worker, home, docker = 'exit 0' }) {
   script(path.join(bin, 'curl'), `cat >> "${bin}/curl-stdin"\nprintf '%s\\n' "$@" >> "${bin}/curl-argv"`);
   if (!hasYaml) script(path.join(bin, 'python3'), 'exit 0');
   return {
-    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '8', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-deploy-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no-apply.lock'), MIU_CI_RUNNER_UID: String(process.getuid()) },
+    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '8', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-deploy-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no-apply.lock'), MIU_CI_RUNNER_UID: String(process.getuid()), MIU_CI_SECRET_NAMES: namesList('acme/r SLACK_WEBHOOK\n'), MIU_CI_SECRET_NAMES_OWNER: SELF },
     sudoArgv: () => fs.readFileSync(path.join(bin, 'sudo-argv'), 'utf8').trim().split('\n'),
     sudoAll: () => fs.readFileSync(path.join(bin, 'sudo-all'), 'utf8').trim().split('\n'),
     curl: (f) => { try { return fs.readFileSync(path.join(bin, `curl-${f}`), 'utf8'); } catch { return ''; } },
@@ -926,7 +929,7 @@ test('a repo Composer reads is read with this server\'s deploy key, not the App:
   const r = await runSandboxCi(proCheck, dir, { ...s.env, ...fakeMirror(), MIU_CI_MIRRORS_CONF: keyList('Acme/licensing /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
   assert.equal(r.status, 0, JSON.stringify(r));
   assert.deepEqual(app.calls.mint, [['Acme', ['free', 'pro', 'tools', 'hub'], []]]);
-  assert.equal(s.head(), 'miu-ci-secrets 3 mirrors=Acme/licensing');
+  assert.equal(s.head(), 'miu-ci-secrets 3 repo=Acme/pro mirrors=Acme/licensing');
 });
 
 test('a run whose only private package comes by deploy key, but whose workflow names a token, gets one that reads no code', needsYaml, async () => {
@@ -942,7 +945,7 @@ test('a run whose only private package comes by deploy key, but whose workflow n
   assert.deepEqual(app.calls.opts[0].permissions, { metadata: 'read' });
   assert.deepEqual(app.calls.revoked, [TOKEN]);
   // The list's spelling, which the sudo rule names.
-  assert.equal(s.head(), 'miu-ci-secrets 2 mirrors=acme/LICENSING');
+  assert.equal(s.head(), 'miu-ci-secrets 2 repo=Acme/pro mirrors=acme/LICENSING');
   assert.deepEqual(s.secrets(), [`FREE_REPO_TOKEN=${TOKEN}`, `GITHUB_TOKEN=${TOKEN}`]);
 });
 
@@ -954,7 +957,7 @@ test('a repo the workflow checks out still needs the App: actions/checkout does 
   const base = git(dir, 'rev-parse', 'HEAD').stdout.trim();
   await runSandboxCi(proCheck, dir, { ...s.env, ...fakeMirror(), MIU_CI_MIRRORS_CONF: keyList('Acme/licensing /k SHA256:x\n') }, { repo: 'Acme/pro', trustedRef: base, mint: app.mint, revoke: app.revoke });
   assert.deepEqual(app.calls.mint, [['Acme', ['licensing'], []]]);
-  assert.equal(s.head(), 'miu-ci-secrets 1');
+  assert.equal(s.head(), 'miu-ci-secrets 1 repo=Acme/pro');
 });
 
 test('without a deploy key, a repo the App cannot reach is still not run, and says both ways in', needsYaml, async () => {
@@ -1246,3 +1249,80 @@ test('deploy-key copies left by a run that never finished are swept; a running o
   assert.equal(sweepMirrorCopies(undefined, dir), 1);
   assert.deepEqual(fs.readdirSync(dir).sort(), ['miu-ci-mirror-new', 'other-old']);
 });
+
+// ---- root's list of the server's CI secrets per repository
+
+// Miu's account runs pull request code, so it can call the worker itself with
+// any repo= and allow=. Root's list caps what those can ask for.
+{
+  const NAMES_WF = 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id, env: { A: "${{ secrets.ALPHA }}", B: "${{ secrets.BETA }}" } }]\n';
+  const ALPHA_WF = 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id, env: { A: "${{ secrets.ALPHA }}" } }]\n';
+  const direct = (wf, head, envPlus = {}) => {
+    const sandbox = sandboxHome();
+    const src = fs.mkdtempSync(path.join(tmp, 'names-src-'));
+    fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
+    fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), wf);
+    const tar = spawnSync('tar', ['-c', '-C', src, '.']).stdout;
+    const env = { ...server({ home: sandbox.home }).env, ...envPlus };
+    const r = spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from(head), tar]), env, encoding: 'utf8' });
+    return { r, called: fs.existsSync(path.join(sandbox.home, 'argv')) };
+  };
+  const list = namesList('# CI secrets per repository\nAcme/R ALPHA # the test job\nacme/other BETA\n');
+
+  test('a name outside root\'s list for the repository is refused even when allow= has it', needsYaml, () => {
+    const { r, called } = direct(NAMES_WF, 'miu-ci-secrets 0 repo=acme/r allow=ALPHA,BETA\n', { MIU_CI_SECRET_NAMES: list });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /names CI secrets the base branch's job names, but .*ci-secret-names does not list for acme\/r: BETA/);
+    assert.equal(called, false, 'Sandbox was not called');
+  });
+
+  test('allow= and root\'s list intersect: a name on both runs, and the repository matches in any case', needsYaml, () => {
+    const { r, called } = direct(ALPHA_WF, 'miu-ci-secrets 0 repo=acme/r allow=ALPHA,BETA\n', { MIU_CI_SECRET_NAMES: list });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(called, true);
+    // On the list but not asked for by allow=: still refused.
+    const notAsked = direct(ALPHA_WF, 'miu-ci-secrets 0 repo=acme/r allow=BETA\n', { MIU_CI_SECRET_NAMES: list });
+    assert.notEqual(notAsked.r.status, 0);
+    assert.match(notAsked.r.stderr, /base branch's job does not: ALPHA/);
+    assert.equal(notAsked.called, false);
+  });
+
+  test('another repository\'s line, or no repo=, gives nothing', needsYaml, () => {
+    for (const head of ['miu-ci-secrets 0 repo=acme/other allow=ALPHA\n', 'miu-ci-secrets 0 allow=ALPHA\n']) {
+      const { r, called } = direct(ALPHA_WF, head, { MIU_CI_SECRET_NAMES: list });
+      assert.notEqual(r.status, 0, head);
+      assert.match(r.stderr, /does not list for .*: ALPHA/, head);
+      assert.equal(called, false, head);
+    }
+  });
+
+  test('a missing list, a link, or one that is not root\'s own or others can write allows nothing', needsYaml, () => {
+    const good = namesList('acme/r ALPHA\n');
+    const link = path.join(path.dirname(good), 'link');
+    fs.symlinkSync(good, link);
+    const [uid, gid] = SELF.split(':').map(Number);
+    for (const [envPlus, why] of [
+      [{ MIU_CI_SECRET_NAMES: path.join(tmp, 'no-such-names') }, /is missing or a link, so this server gives none: ALPHA/],
+      [{ MIU_CI_SECRET_NAMES: link }, /is missing or a link, so this server gives none: ALPHA/],
+      [{ MIU_CI_SECRET_NAMES: namesList('acme/r ALPHA\n', 0o664) }, /is not root's own file that only root can write, so this server gives none: ALPHA/],
+      [{ MIU_CI_SECRET_NAMES: namesList('acme/r ALPHA\n', 0o646) }, /is not root's own file/],
+      [{ MIU_CI_SECRET_NAMES: good, MIU_CI_SECRET_NAMES_OWNER: `${uid}:${gid + 1}` }, /is not root's own file/],
+      [{ MIU_CI_SECRET_NAMES: good, MIU_CI_SECRET_NAMES_OWNER: `${uid + 1}:${gid}` }, /is not root's own file/],
+    ]) {
+      const { r, called } = direct(ALPHA_WF, 'miu-ci-secrets 0 repo=acme/r allow=ALPHA\n', envPlus);
+      assert.notEqual(r.status, 0, JSON.stringify(envPlus));
+      assert.match(r.stderr, why, JSON.stringify(envPlus));
+      assert.equal(called, false, JSON.stringify(envPlus));
+    }
+    // The same file, owned as expected, runs.
+    assert.equal(direct(ALPHA_WF, 'miu-ci-secrets 0 repo=acme/r allow=ALPHA\n', { MIU_CI_SECRET_NAMES: good }).r.status, 0);
+  });
+
+  test('a workflow that names no server secret runs without any list, and Miu\'s own names need none', needsYaml, () => {
+    const none = { MIU_CI_SECRET_NAMES: path.join(tmp, 'no-such-names') };
+    assert.equal(direct(OK, 'miu-ci-secrets 0\n', none).r.status, 0);
+    const token = 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id, env: { T: "${{ secrets.GITHUB_TOKEN }}" } }]\n';
+    const r = direct(token, 'miu-ci-secrets 1 repo=acme/r\nGITHUB_TOKEN=ghs_abc\n', none).r;
+    assert.equal(r.status, 0, r.stderr);
+  });
+}

@@ -320,6 +320,15 @@ $MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/pr-stack
 EOF
   visudo -cqf /etc/sudoers.d/miu-sandbox-ci.tmp || die "the Sandbox CI sudoers rule did not validate"
   chmod 0440 /etc/sudoers.d/miu-sandbox-ci.tmp && mv /etc/sudoers.d/miu-sandbox-ci.tmp /etc/sudoers.d/miu-sandbox-ci
+  # The server's CI secrets each repository's workflows may name
+  # ($ETC/ci-secret-names: `owner/name NAME,NAME` lines). Every release's worker
+  # reads it and refuses a run that names one not listed, so it is made before
+  # the first worker is installed: empty, so no CI secret reaches a run until
+  # root lists it. An existing list is never touched.
+  if [ ! -e "$ETC/ci-secret-names" ] && [ ! -L "$ETC/ci-secret-names" ]; then
+    install -d -o root -g root -m 0755 "$ETC"
+    install -o root -g root -m 0644 /dev/null "$ETC/ci-secret-names"
+  fi
   # After the rule, which decides whether each release calls its own copy.
   # The current release's worker, ci-mirror, PR-stack helper (lib/prstackctl.mjs,
   # off until Settings has stacks.on) and GitHub's SSH host key (for repositories

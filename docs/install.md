@@ -56,6 +56,20 @@ sudo bash install.sh --sandbox-user ubuntu
 
 Workflow steps run the pull request's code in Docker containers on this server, without the Docker socket. Each job runs as `runner` (uid 1001), as on GitHub, in `catthehacker/ubuntu:runner-22.04` (`sb ci run --as-runner`), so the Sandbox account must be uid 1001: with another uid every CI job is reported as not run. Run `sudo bash install.sh` again after an update to pull that image. A pull request from the repository runs its own workflows, as on GitHub, so anyone who can push a branch there can run code here. Give a workflow only the CI secrets you would give that code: the `ci_secrets` in the Sandbox account's `sandbox.local.yml`. A pull request's workflow may name only the secrets its base branch's workflows already name. A workflow that needs a secret with no entry there is reported as not run, also when it has a fallback (`${{ secrets.X || github.token }}`). Miu adds one secret itself: a read-only GitHub App token for the repositories the run reaches, as `GITHUB_TOKEN` and the secrets used beside `github.token` ([profiles.md](profiles.md#choosing-the-workflows-pr_ci)). It reaches the script on stdin, before the tar, and Sandbox on a pipe (`sb ci run --secrets-stdin`, which needs a Sandbox that has it).
 
+### Which CI secrets each repository may use
+
+The CI script also checks root's own list, `/etc/miu/ci-secret-names`. A workflow may name a `ci_secrets` entry only when that list gives it to the pull request's repository and the base branch's job already names it. One line per repository, `#` for comments; repository names match in any case:
+
+```text
+# owner/name NAME,NAME
+acme/plugin SLACK_WEBHOOK
+acme/plugin-pro SLACK_WEBHOOK,LICENSE_KEY
+```
+
+The installer makes the file empty (owned by root, mode `644`) when there is none, and never changes one that exists. Edit it as root; the next run reads it, with no restart. Until a name is listed, a workflow that names it is reported as not run. A file that is missing, a symbolic link, not owned by `root:root`, or writable by group or others gives no repository any name. Names Miu fills itself (`GITHUB_TOKEN` and the secrets used beside `github.token`) need no line.
+
+The list is the limit, not the repository check. The CI script runs as the Sandbox account through `miu`'s sudo rule, and `miu` also runs pull request code in fast checks, so a pull request's code could call the script and name another repository. Every name on the list is one that any pull request Miu tests here could read. List only what you would give all of them.
+
 ### A repository the App may not read: a deploy key
 
 A private dependency (a Composer or npm package on GitHub) that the App is not installed on can be read with a read-only deploy key instead. The installer makes a system account for this, `miu-mirror`, with no login shell. It holds nothing but the deploy keys and its mirrors, in `/var/lib/miu-mirror`. Sandbox's account never touches a key.

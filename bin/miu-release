@@ -244,6 +244,7 @@ EOF
 # calls its own copy (lib/sandboxci.mjs ownWorker) only when the sudo rule
 # allows $LIB/versions/*/sandbox-ci: $LIB/versions/.per-release says so.
 SUDOERS_CI=${MIU_SUDOERS_CI:-/etc/sudoers.d/miu-sandbox-ci}
+SECRET_NAMES=${MIU_CI_SECRET_NAMES:-/etc/miu/ci-secret-names}
 worker() {
   local name=${1:-$(current)} src
   [ -f "$LIB/sandbox-user" ] || { say "No Sandbox CI on this server; no worker to install"; return 0; }
@@ -267,6 +268,8 @@ worker() {
     rm -f "$LIB/versions/.per-release"
     say "The sudo rule ($SUDOERS_CI) names only $LIB/sandbox-ci: every release uses the newest worker. Run install.sh again to give each release its own."
   fi
+  # Root's list of the CI secrets each repository may name (install.sh makes it).
+  [ -f "$SECRET_NAMES" ] || say "No $SECRET_NAMES: the worker lets no workflow name a CI secret. Run install.sh again to make it, then list each repository's names (docs/install.md)."
   say "CI worker: $LIB/sandbox-ci -> versions/$name"
 }
 
