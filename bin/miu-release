@@ -26,7 +26,7 @@
 # rollback. That one time it waits until no run is going.
 #
 # The last 3 releases stay (MIU_KEEP), and any release a process still runs from.
-set -euo pipefail
+set -Eeuo pipefail   # -E: the ERR trap in convert() also covers the functions it calls
 
 APP=${MIU_APP:-/srv/miu}
 RELEASES=${MIU_RELEASES:-/srv/miu-releases}
