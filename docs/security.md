@@ -165,7 +165,7 @@ With `--sandbox-user` and `"stacks": {"on": true}` in `runs/.config.json`, each
 pull request in Miu's queue gets a Sandbox stack that follows its branch (Sandbox
 `host follow`), for people to try. Miu reaches it only through
 `/usr/local/lib/miu/pr-stack` (`bin/miu-pr-stack`), run as the Sandbox account by
-one sudo rule. That command has four verbs (`mem`, `add`, `status`, `remove`) and
+one sudo rule. That command has five verbs (`mem`, `add`, `status`, `ports`, `remove`) and
 builds every Sandbox argument itself. Miu passes a stack name, a kind and branch
 names, and the command checks each one.
 
@@ -180,3 +180,17 @@ names, and the command checks each one.
   goes when its pull request is merged or closed, or 48 hours after Miu's verdict
   with no new commits. Nothing new starts while the server has under 3 GB of memory
   free.
+- A Hub pull request's stack (`pr-hub-<n>`) is a whole Hub: hub, admin console,
+  renderer, Postgres, Mailpit and a WordPress site. A Free or Pro pull request
+  that names a Hub pull request shares that stack. It uses only the secrets its
+  template names, through Sandbox; never a production key, and never
+  xspeedcache.com or app.xspeedcache.com.
+- To test the admin console, `bin/qa-hub-signin` signs `miu-qa@wpdeveloper.com`
+  in. That address is staff only on test stacks (xspeed-dev-setup's full
+  template), and every mail a stack sends lands in its own Mailpit, on this
+  server's loopback. The helper reads the link there, deletes the mail, and
+  passes the second factor itself. The agent gets only a browser storage state
+  (0600, deleted after the run); no link, code or recovery code is printed,
+  logged or written. The stack's authenticator secret is kept in
+  `runs/.stacks/<stack>.totp` (0600), bound to that stack's incarnation, and
+  deleted when the stack is made or removed.

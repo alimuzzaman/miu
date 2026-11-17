@@ -44,6 +44,7 @@ The quickest way to get one: on the dashboard's **GitHub** page, press **Make a 
 | `licence` | Optional. How to license the add-on on a test site, in words for the agent: the options to set, for example. |
 | `cross_repo` | Optional. What the agent should check across repositories, in words. |
 | `not_in_ci` | Optional. Things the QA machine cannot cover. The report lists them as not covered. |
+| `stack` | Optional, for `role: "app"`. `{ "kind": "full" }` tests the pull request on its own test stack on the Sandbox server (a whole Hub with its admin console, renderer and a WordPress site) instead of Hubs on the QA machine. Needs test stacks on in Settings. |
 
 ## A CI workflow as a fast check
 
