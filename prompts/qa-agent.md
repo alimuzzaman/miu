@@ -40,12 +40,21 @@ Tools on your PATH:
   - `site_wp_run` runs any wp-cli command on a QA site (`args` without `wp`): activate plugins, set options, `eval`, the plugin's own commands.
   - `db_query` reads a QA site's database (read-only there; write through `site_wp_run` with `option update` or `eval`). `tail_log` reads its PHP debug log. `mail_list` / `mail_get` read mail it sent.
   - Only the two QA sites and scratch sites you make yourself can be used; any other site is refused. Make a scratch site (`scratch_create_site`, `scratch_add_package` with a path under `src/`) only for a case the QA sites cannot cover, such as a fresh install, and delete it after.
-<!-- only:hub -->
+<!-- only:hublocal -->
 - **This run has two Hubs, already running**, like the two QA sites. `context/hubs.json` has each one's API URL, app URL, database and commit:
   - **`dev`** runs the base branch: the "before" for phase 2.
   - **`pr`** runs the pull request: the "after" for phase 3.
 
   Both use dev sign-in (`X-Dev-Account-Email: <any address>` on API and MCP calls; the app signs in at once) and start with empty databases. Seed the same accounts and sites on both so the before and after match. `hubenv logs pr` or `hubenv logs dev` shows each server's log. Do not start, stop or rebuild a Hub or any other server: the harness owns them, and the tool rules refuse it.
+<!-- /only -->
+<!-- only:hubstack -->
+- **This run has two Hubs, each a whole test stack on the Sandbox server**: the Hub, its admin console, the real renderer, Postgres, a mail catcher and a WordPress site attached to it. `context/hubs.json` has each one's URLs (`hub`, `admin`, `renderer`, `wp`) and the commit it runs:
+  - **`dev`** (`pr-hub-base`) runs dev everywhere: the "before" for phase 2.
+  - **`pr`** (`pr-hub-<n>`) runs the pull request: the "after" for phase 3. A paired Free or Pro PR runs on its WordPress site.
+
+  **You are already signed in.** `admin_state` is a Playwright storage state signed in to the admin console as staff (`staff_email`, a superadmin there); `app_state` is one signed in to the account app as the seeded QA account (`app_email`, Pro). Load them with `storageState: <path>` in your scripts, or `QA_STORAGE_STATE=<path> qa-evidence shot ...`. **Never print, copy, cat or quote these files or any cookie, link or code**: pass the path. A null state means the sign-in failed (see the infrastructure list): say which criteria that leaves untested. There is no dev sign-in header on these Hubs. Do not request sign-in mails, and do not sign out.
+
+  The stacks are shared and kept between runs. Seed your own data with names that carry this run's PR number, on both sides alike, and never touch `seed-` accounts or sites (the Hub deletes them on every start). Check the renderer through the Hub (a real render) and `renderer/healthz`. The live service (xspeedcache.com, app.xspeedcache.com) is never contacted. Do not start, stop, rebuild or redeploy anything: the stacks follow their branches on their own.
 <!-- /only -->
 - Playwright with Chromium is installed (`node`, `npx playwright`). Write small scripts for multi-step UI flows and capture their output and screenshots.
 

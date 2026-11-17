@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# A pull request's test stack: a Sandbox stack that follows the PR's branch.
+#
+# Installed as /usr/local/lib/miu/pr-stack. It runs as the account that owns
+# Sandbox, through one sudo rule install.sh adds, because Miu's own account
+# cannot reach Sandbox. Miu decides (lib/prstacks.mjs); this only carries out,
+# and builds every Sandbox argument itself, so Miu can name nothing but a
+# stack, a kind and branches:
+#
+#   pr-stack mem                                   MB of memory available
+#   pr-stack add <stack> <wp|full> free=<branch> pro=<branch> [hub=<branch>]
+#   pr-stack status <stack>                        the follow's status, JSON
+#   pr-stack ports <stack>                         the stack's ports and incarnation, JSON
+#   pr-stack remove <stack>                        follow and stack, gone
+#
+# Fixed here, not by the caller: the org (WPDevelopers), the setup repo and
+# its branch (xspeed-dev-setup@main, whose stacks/follow-prepare.sh is the
+# prepare step), the template, the ref and the owner. Nothing from a PR
+# branch runs on this host: follow-prepare.sh builds PR code in a container.
+set -euo pipefail
+
+die() { echo "pr-stack: $*" >&2; exit 2; }
+ORG=WPDevelopers
+SETUP_BRANCH=main
+# The licensing SDK Pro's composer needs; its default branch.
+LICENSING_BRANCH=main
+OWNER=miu
+PREPARE_TIMEOUT=3600
+# Only a test can point these elsewhere: under sudo they are dropped, whatever
+# this server's sudoers keeps.
+[ -z "${SUDO_USER:-}" ] || unset MIU_PR_STACK_SB MIU_PR_STACK_FOLLOW_ROOT MIU_PR_STACK_MEMINFO
+sb=${MIU_PR_STACK_SB:-$HOME/sandbox/sb-src/sb}
+follow_root=${MIU_PR_STACK_FOLLOW_ROOT:-$HOME/sandbox/runtime/hosting/follow}
+meminfo=${MIU_PR_STACK_MEMINFO:-/proc/meminfo}
+export SANDBOX_AUTO_UPDATE=0
+
+name_ok() { [[ $1 =~ ^(wp-)?pr-(free|pro|hub)-[0-9]{1,6}$ || $1 == pr-hub-base ]]; }
+# The same rule as lib/prstacks.mjs BRANCH and Sandbox's follow spec.
+branch_ok() {
+  [[ $1 =~ ^[A-Za-z0-9._/-]{1,200}$ ]] && [[ $1 != -* && $1 != /* && $1 != */ && $1 != *. && $1 != *.lock ]] \
+    && [[ $1 != *..* && $1 != *//* && $1 != */.* && $1 != HEAD ]]
+}
+
+# Sandbox's host-local owner path for `host follow` and `host stack down`
+# (Sandbox Fix 5). Every Sandbox call goes through here.
+here() { "$sb" host "$@" --here --json; }
+
+[ $# -ge 1 ] || die "usage: pr-stack mem | add <stack> <wp|full> free=<b> pro=<b> [hub=<b>] | status <stack> | ports <stack> | remove <stack>"
+verb=$1; shift
+case $verb in
+  mem)
+    [ $# -eq 0 ] || die "mem takes nothing"
+    kb=$(awk '$1 == "MemAvailable:" { print $2; exit }' "$meminfo")
+    [[ $kb =~ ^[0-9]+$ ]] || die "no MemAvailable in $meminfo"
+    echo $((kb / 1024))
+    ;;
+  add)
+    [ $# -ge 4 ] || die "usage: pr-stack add <stack> <wp|full> free=<branch> pro=<branch> [hub=<branch>]"
+    stack=$1 kind=$2; shift 2
+    name_ok "$stack" || die "not a PR stack name: $stack"
+    case $kind in
+      wp) [[ $stack == wp-* ]] || die "a WordPress-only stack is wp-pr-...: $stack" ;;
+      full) [[ $stack != wp-* ]] || die "a full stack is pr-...: $stack" ;;
+      *) die "kind is wp or full: $kind" ;;
+    esac
+    declare -A br=()
+    for pair in "$@"; do
+      role=${pair%%=*} b=${pair#*=}
+      [[ $role =~ ^(free|pro|hub)$ ]] && [[ $pair == *=* ]] || die "not role=branch: $pair"
+      [ -z "${br[$role]:-}" ] || die "$role given twice"
+      branch_ok "$b" || die "not a branch name Sandbox accepts: $b"
+      br[$role]=$b
+    done
+    [ -n "${br[free]:-}" ] && [ -n "${br[pro]:-}" ] || die "free and pro are both needed"
+    if [ "$kind" = full ]; then [ -n "${br[hub]:-}" ] || die "a full stack needs hub"; else [ -z "${br[hub]:-}" ] || die "a WordPress-only stack has no hub"; fi
+    args=(follow add --name "$stack"
+      --repo "setup=$ORG/xspeed-dev-setup@$SETUP_BRANCH"
+      --repo "free=$ORG/xspeed@${br[free]}"
+      --repo "pro=$ORG/xspeed-pro@${br[pro]}"
+      --repo "licensing=$ORG/licensing@$LICENSING_BRANCH")
+    if [ "$kind" = full ]; then
+      args+=(--repo "hub=$ORG/xspeed-hub@${br[hub]}" --stack-template "{dir}/hub-$stack/sandbox.full.hosting.yml" --ref "sandbox-env/$stack")
+    else
+      args+=(--stack-template "{dir}/stage/sandbox.hosting.yml" --ref "stack/$stack")
+    fi
+    args+=(--prepare "{repo:setup}/stacks/follow-prepare.sh $kind {name}" --prepare-timeout "$PREPARE_TIMEOUT" --owner "$OWNER" --generate)
+    here "${args[@]}"
+    ;;
+  status)
+    [ $# -eq 1 ] && name_ok "$1" || die "usage: pr-stack status <stack>"
+    here follow status --name "$1"
+    ;;
+  ports)
+    # One line: {"ok":true,"slug":..,"created_at":..,"copy_id":..,"ports":{..}}. The incarnation
+    # (created_at, copy_id) tells a stack from an earlier one of the same name.
+    [ $# -eq 1 ] && name_ok "$1" || die "usage: pr-stack ports <stack>"
+    here stack list | tail -n 1 | python3 -c '
+import json, sys
+name = sys.argv[1]
+try:
+    d = json.loads(sys.stdin.read())
+except ValueError:
+    print(json.dumps({"ok": False, "code": "stack_list_unreadable"})); sys.exit(1)
+hit = [s for s in d.get("stacks") or [] if s.get("slug") == name]
+if not hit:
+    print(json.dumps({"ok": False, "code": d.get("code") or "stack_not_found"})); sys.exit(1)
+s = hit[0]
+print(json.dumps({"ok": True, "slug": name, "created_at": s.get("created_at"), "copy_id": s.get("copy_id"), "ports": s.get("ports") or {}}))
+' "$1"
+    ;;
+  remove)
+    [ $# -eq 1 ] && name_ok "$1" || die "usage: pr-stack remove <stack>"
+    stack=$1
+    # A pause first, so no new attempt starts; remove is refused while one runs
+    # (follow_attempt_running), and Miu asks again on its next scan.
+    here follow pause --name "$stack" >/dev/null 2>&1 || true
+    out=$(here follow remove --name "$stack" 2>&1) || {
+      [[ $out == *follow_not_found* ]] || { printf '%s\n' "$out"; exit 1; }
+    }
+    # A stack already gone (reaped, taken down, never built) is done, not an error.
+    out=$(here stack down --name "$stack" --owner "$OWNER" --confirm 2>&1) || {
+      [[ $out == *stack_not_found* ]] || { printf '%s\n' "$out"; exit 1; }
+    }
+    printf '%s\n' "$out"
+    # Sandbox keeps the follow's clones; with the stack down nothing uses them.
+    work=$follow_root/work/$stack
+    if [ -e "$work" ]; then
+      [ ! -L "$work" ] && [ -d "$work" ] || die "$work is not a plain folder; left as it is"
+      rm -rf -- "$work"
+    fi
+    ;;
+  *) die "unknown verb: $verb" ;;
+esac

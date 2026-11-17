@@ -1948,6 +1948,20 @@ function ciTab(d) {
     '<p class="h" style="margin-top:10px">Jobs run in Miu\'s Sandbox CI containers on this server, up to ' + esc(c.parallel) + ' at once across all pull requests, never on GitHub Actions. The workflows come from the profile\'s base branch, not the pull request; a pull request that changes .github/ is not run here, and Miu never runs a job that deploys, publishes, comments or notifies.</p>' + fast;
 }
 
+// The pull request's test stack (lib/prstackctl.mjs): a Sandbox site that
+// follows its branch, for people to try it. Sign-in is the Sandbox panel's
+// WordPress admin button on the stack's page.
+function stackCard(d) {
+  const s = d.stack;
+  if (!s) return '';
+  const u = s.urls || {};
+  const link = (href, label) => '<a class="btn" href="' + esc(href) + '" target="_blank" rel="noopener" data-ext>' + esc(label) + '</a>';
+  const at = s.appliedHead ? ' at ' + esc(s.appliedHead.slice(0, 7)) : '';
+  const links = s.ready ? '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">' + link(u.site, 'Site') + (u.admin ? link(u.admin, 'Hub admin') : '') + (u.renderer ? link(u.renderer, 'Renderer') : '') + link(u.panel, 'Sign in (panel)') + '</div>' +
+    '<p class="h" style="margin-top:8px">Sign in: open the panel page and press <b>WordPress admin</b>. ' + (s.kind === 'full' ? 'This stack has its own Hub at ' + esc(u.hub) + '.' : 'The site uses the shared Hub ' + esc(u.hub) + '.') + ' Pro is unlicensed.</p>' : '';
+  return '<div class="cihead" style="margin-bottom:14px;flex-wrap:wrap"><span><b>Test stack ' + esc(s.name) + '</b>' + at + ', ' + esc(s.text || s.state) + (s.attemptJob && !s.ready ? ' (Sandbox job ' + esc(s.attemptJob) + ')' : '') + '</span>' + links + '</div>';
+}
+
 async function renderRun(force, cached) {
   const name = route();
   // A tab switch draws from the run already loaded; the next tick refreshes it.
@@ -1959,7 +1973,7 @@ async function renderRun(force, cached) {
   const fresh = ui.dataAt && Date.now() - ui.dataAt < 60000;
   const d = (cached || (ended && fresh && !force)) && ui.data && ui.dataName === name ? ui.data : await fetch('/api/runs/' + encodeURIComponent(name)).then((r) => r.ok ? r.json() : null);
   if (!d) { $('#main').innerHTML = '<div class="topbar">' + menuBtn + '<h1>Run not found</h1></div><div class="blank"><a href="#" style="color:var(--run)">Back to pull requests</a></div>'; return; }
-  const key = JSON.stringify([name, ui.tab, ui.q, ui.view, ui.panel, ui.mobPanel, d.log, $('#app').className, d.status, d.activity.length, d.activity.at(-1)?.status, d.evidence.length, d.shots.length, !!d.report, d.usage?.calls, d.reviews, d.fixes, d.steer, d.ci, d.control]);
+  const key = JSON.stringify([name, ui.tab, ui.q, ui.view, ui.panel, ui.mobPanel, d.log, $('#app').className, d.status, d.activity.length, d.activity.at(-1)?.status, d.evidence.length, d.shots.length, !!d.report, d.usage?.calls, d.reviews, d.fixes, d.steer, d.ci, d.control, d.stack]);
   if (!force && key === ui.key) return;
   ui.key = key; ui.data = d; if (ui.dataName !== name || d !== ui.dataPrev) ui.dataAt = Date.now(); ui.dataName = name; ui.dataPrev = d;
   if (ui.ov != null) return;
@@ -1973,7 +1987,7 @@ async function renderRun(force, cached) {
   const st = d.status, pr = d.pr || {};
   const pill = st.state === 'running' ? '<span class="pill running"><span class="spin" style="width:10px;height:10px"></span>Test running</span>' : '<span class="pill ' + esc(st.verdict || st.state) + '">' + esc(st.verdict ? VERDICT[st.verdict] : STATE[st.state]) + '</span>';
   const tabs = [['summary', 'Summary'], ['report', 'Report'], ['shots', 'Screenshots', d.shots.length], ['evidence', 'Evidence', d.evidence.length], ['history', 'History'], ['ci', 'CI'], ['run', 'Run']];
-  const body = (ui.tab === 'summary' ? fixCard(d) : '') + ({ summary: summaryTab, report: reportTab, shots: shotsTab, evidence: evidenceTab, history: historyTab, ci: ciTab, run: runTab }[ui.tab] || summaryTab)(d);
+  const body = (ui.tab === 'summary' ? fixCard(d) + stackCard(d) : '') + ({ summary: summaryTab, report: reportTab, shots: shotsTab, evidence: evidenceTab, history: historyTab, ci: ciTab, run: runTab }[ui.tab] || summaryTab)(d);
   const idx = Math.max(-1, ...st.reached.map((id) => d.stages.findIndex((s) => s.id === id)));
   $('#main').innerHTML =
     '<div class="topbar">' + menuBtn + showSideBtn() + '<span class="title">' + esc(pr.title || d.name) + '</span><span class="sub">' + esc(REPO[(pr.url || '').split('/')[4]] || '') + ' #' + esc(pr.number) + (st.model ? ' · ' + esc(models(st.model)) : '') + (d.usage ? ' · ' + fmtMin(d.usage.wallMs) : '') + (d.control ? ' · ' + (d.control.mode === 'manual' ? 'Manual mode' : 'Auto mode') + (d.control.paused ? ', queue paused' : '') + (d.control.waits === 'manual' ? ', a new commit waits for you' : d.control.waits === 'held' ? ', next test held' : d.control.inLine ? ', next test queued' : '') : '') + '</span>' + runPicker(d) + '<span class="sp"></span>' + pill +

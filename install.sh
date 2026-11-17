@@ -308,13 +308,16 @@ SLICE
 # $MIU_USER may hand a pull request's files to Sandbox CI as $SANDBOX_USER, nothing else.
 # Each release runs its own copy (bin/miu-release: $LIB/versions/<commit>, root's).
 $MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/sandbox-ci, $LIB/versions/*/sandbox-ci
+# ... and add, read and remove its pull requests' test stacks (fixed verbs, checked arguments).
+$MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/pr-stack
 EOF
   visudo -cqf /etc/sudoers.d/miu-sandbox-ci.tmp || die "the Sandbox CI sudoers rule did not validate"
   chmod 0440 /etc/sudoers.d/miu-sandbox-ci.tmp && mv /etc/sudoers.d/miu-sandbox-ci.tmp /etc/sudoers.d/miu-sandbox-ci
   # After the rule, which decides whether each release calls its own copy.
-  # The current release's worker, ci-mirror and GitHub's SSH host key (for
-  # repositories CI reads with a deploy key, /etc/miu/ci-mirrors), in
-  # $LIB/versions/<commit>, behind $LIB/sandbox-ci and $LIB/ci-mirror.
+  # The current release's worker, ci-mirror, PR-stack helper (lib/prstackctl.mjs,
+  # off until Settings has stacks.on) and GitHub's SSH host key (for repositories
+  # CI reads with a deploy key, /etc/miu/ci-mirrors), in $LIB/versions/<commit>,
+  # behind $LIB/sandbox-ci, $LIB/ci-mirror and $LIB/pr-stack.
   "$LIB/miu-release" worker
   setenv MIU_SANDBOX_USER "$SANDBOX_USER"
   setenv MIU_SANDBOX_WORKER "$LIB/sandbox-ci"
