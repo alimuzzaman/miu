@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# Deploy Miu side by side, as root: each commit in a folder of its own,
+# /srv/miu a symlink to the current one.
+#
+#   miu-release deploy <commit|branch|tag> [--no-restart]
+#   miu-release rollback        back to the release before the current one
+#   miu-release worker          install the current release's CI worker
+#   miu-release status
+#
+# deploy fetches the commit into /srv/miu-releases/repo.git, builds it in
+# /srv/miu-releases/<sha> (its files, then npm ci, then a check that every
+# module and import it names is there), and only then switches /srv/miu to it
+# with one rename. The CI worker (bin/miu-sandbox-ci, bin/miu-ci-mirror) goes
+# to /usr/local/lib/miu/versions/<sha>, behind the same kind of switch. Then
+# miu.service restarts.
+#
+# A restart does not stop a test or a CI job: the unit stops its main process
+# only (KillMode=process), each run keeps the release folder it started from,
+# and the next dashboard takes up what is still going (docs/install.md,
+# "Updating"). So a deploy does not wait for runs to end.
+#
+# runs/, .cache/ and .agent-codex/ live in /srv/miu-data; each release links
+# them, so /srv/miu/runs and /srv/miu/.cache name the same folders in every
+# release. The first deploy moves them there from a /srv/miu that is still a
+# folder, with the service stopped, and keeps that folder as a release, for
+# rollback. That one time it waits until no run is going.
+#
+# The last 3 releases stay (MIU_KEEP), and any release a process still runs from.
+set -euo pipefail
+
+APP=${MIU_APP:-/srv/miu}
+RELEASES=${MIU_RELEASES:-/srv/miu-releases}
+DATA=${MIU_DATA:-/srv/miu-data}
+LIB=${MIU_LIB:-/usr/local/lib/miu}
+KEEP=${MIU_KEEP:-3}
+SERVICE=${MIU_SERVICE:-miu.service}
+MIU_USER=${MIU_USER:-miu}
+URL=${MIU_URL:-http://127.0.0.1:4747/}
+export PATH="${MIU_NODE_BIN:-/opt/miu/node/bin}:$PATH"
+SHARED=(runs .cache .agent-codex)
+UNIT_DIR=${MIU_UNIT_DIR:-/etc/systemd/system}
+REPO=$RELEASES/repo.git
+# Root owns every release and worker file; the tests run as someone else.
+OWN=(-o root -g root); [ -z "${MIU_RELEASE_TEST:-}" ] || OWN=()
+HISTORY=$RELEASES/history
+
+say() { printf '==> %s\n' "$*" >&2; }
+die() { printf 'miu-release: %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || [ -n "${MIU_RELEASE_TEST:-}" ] || die "run it as root"
+# Not from inside a release: this process would count as one that runs from it.
+cd /
+BUILD_TMP=""
+trap '[ -z "$BUILD_TMP" ] || rm -rf "$BUILD_TMP"' EXIT
+CONVERTED=0
+
+# One deploy at a time.
+install -d -m 0755 "$RELEASES"
+exec 8>"$RELEASES/.lock"
+flock -w 600 8 || die "another deploy holds $RELEASES/.lock"
+
+# The release /srv/miu points at, by folder name; empty before the first deploy.
+current() { [ -L "$APP" ] && basename "$(readlink "$APP")" || true; }
+# Point link at target with one rename: a process sees the old or the new one.
+flip() {
+  local link=$1 target=$2 tmp
+  tmp="$(dirname "$link")/.$(basename "$link").new.$$"
+  ln -sfn "$target" "$tmp"
+  mv -Tf "$tmp" "$link"
+}
+# Releases in the order they were made current, oldest first, each once.
+made_current() { [ -f "$HISTORY" ] && awk '{ print $2 }' "$HISTORY" | tac | awk '!seen[$0]++' | tac || true; }
+record() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$HISTORY"; }
+
+ensure_repo() {
+  [ -d "$REPO" ] || git init -q --bare "$REPO"
+  local url=${MIU_REPO_URL:-}
+  [ -n "$url" ] || url=$(git -C "$REPO" remote get-url origin 2>/dev/null || true)
+  [ -n "$url" ] || { [ -d "$APP/.git" ] && url=$(git -C "$APP" remote get-url origin 2>/dev/null || true); }
+  [ -n "$url" ] || die "no repository to fetch Miu from: set MIU_REPO_URL"
+  git -C "$REPO" remote remove origin 2>/dev/null || true
+  git -C "$REPO" remote add origin "$url"
+}
+
+# A full commit sha for what to deploy.
+resolve() {
+  local want=$1
+  [[ $want =~ ^[A-Za-z0-9._/-]+$ && $want != -* ]] || die "not a commit, branch or tag: $want"
+  if [[ $want =~ ^[0-9a-f]{40}$ ]] && git -C "$REPO" cat-file -e "$want^{commit}" 2>/dev/null; then echo "$want"; return; fi
+  git -C "$REPO" fetch -q --no-tags origin "+$want:refs/miu-release/want" || die "could not fetch $want"
+  git -C "$REPO" rev-parse --verify -q "refs/miu-release/want^{commit}" || die "$want is not a commit"
+}
+
+# Every module the dashboard, a run, a fix and the queue tool load, and every
+# name they import from each other, without running any of them: a commit
+# that would fail at its first import never becomes current.
+LINKCHECK=$(cat <<'JS'
+import vm from 'node:vm';
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+const seen = new Map();
+async function load(file) {
+  if (seen.has(file)) return seen.get(file);
+  const m = new vm.SourceTextModule(fs.readFileSync(file, 'utf8').replace(/^#!.*/, ''), { identifier: file });
+  seen.set(file, m);
+  return m;
+}
+async function link(spec, ref) {
+  const from = ref.identifier;
+  if (spec.startsWith('.') || spec.startsWith('/')) {
+    const file = path.resolve(path.dirname(from), spec);
+    if (!fs.existsSync(file)) throw new Error(`${path.relative(process.cwd(), from)} imports ${spec}, which is not there`);
+    if (!/\.m?js$/.test(file)) throw new Error(`${spec}: not a module`);
+    return load(file);
+  }
+  const ns = await import(spec.startsWith('node:') ? spec : import.meta.resolve(spec));
+  const names = Object.keys(ns);
+  return new vm.SyntheticModule(names, function () { for (const n of names) this.setExport(n, ns[n]); }, { identifier: spec });
+}
+for (const entry of process.argv.slice(2)) {
+  const m = await load(path.resolve(entry));
+  await m.link(link);
+}
+console.log(`linked ${seen.size} modules`);
+JS
+)
+
+build() {
+  local sha=$1 dir=$RELEASES/$1 tmp
+  if [ -f "$dir/.miu-release-ok" ]; then say "Release ${sha:0:7} is built already"; return; fi
+  [ ! -e "$dir" ] || rm -rf "$dir"
+  rm -rf "$RELEASES"/.build-*
+  tmp=$RELEASES/.build-$sha-$$
+  BUILD_TMP=$tmp
+  install -d -m 0755 "$tmp"
+  say "Building ${sha:0:7} in $dir"
+  git -C "$REPO" archive --format=tar "$sha" | tar -x -C "$tmp"
+  echo "$sha" > "$tmp/REVISION"
+  (cd "$tmp" && npm ci --silent --no-fund --no-audit --omit=dev >/dev/null) || die "npm ci failed for ${sha:0:7}"
+  say "Checking ${sha:0:7}"
+  local f
+  for f in "$tmp"/bin/* "$tmp"/lib/*.mjs; do
+    head -c 64 "$f" | grep -q '^#!.*\bnode\b' || [[ $f == *.mjs ]] || continue
+    node --check "$f" || die "${f#"$tmp"/} does not parse"
+  done
+  for f in "$tmp"/bin/*; do head -c 64 "$f" | grep -q '^#!.*\bbash\b' && { bash -n "$f" || die "${f#"$tmp"/} does not parse"; }; done
+  printf '%s\n' "$LINKCHECK" > "$tmp/.miu-linkcheck.mjs"
+  local entries=() e
+  for e in bin/qa-dashboard bin/qa-run bin/qa-fix bin/miu-queue; do [ -f "$tmp/$e" ] && entries+=("$e"); done
+  (cd "$tmp" && timeout 120 node --experimental-vm-modules --no-warnings .miu-linkcheck.mjs "${entries[@]}" >&2) || die "${sha:0:7}: a module or import is missing"
+  rm -f "$tmp/.miu-linkcheck.mjs"
+  for e in "${SHARED[@]}"; do rm -rf "${tmp:?}/$e"; ln -s "$DATA/$e" "$tmp/$e"; done
+  [ -n "${MIU_RELEASE_TEST:-}" ] || chown -R root:root "$tmp"
+  chmod 0755 "$tmp"
+  touch "$tmp/.miu-release-ok"
+  mv -T "$tmp" "$dir"
+  BUILD_TMP=""
+}
+
+# Processes that run from a folder: their working folder or command line is in it.
+users_of() {
+  local dir=$1 p cwd
+  for p in /proc/[0-9]*; do
+    cwd=$(readlink "$p/cwd" 2>/dev/null || true)
+    if [[ $cwd == "$dir" || $cwd == "$dir"/* ]] || tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -qF "$dir/"; then echo "${p#/proc/}"; fi
+  done
+}
+
+# The data folders out of a /srv/miu that is still a folder, the first time.
+convert() {
+  [ -e "$APP" ] && [ ! -L "$APP" ] || return 0
+  [ -d "$APP" ] || die "$APP is neither a folder nor a symlink"
+  say "First deploy: moving runs/, .cache/ and .agent-codex/ to $DATA"
+  local busy main
+  main=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || echo 0)
+  busy=$(users_of "$APP" | grep -vx "${main:-0}" | grep -vx "$$" || true)
+  [ -z "$busy" ] || [ -n "${MIU_CONVERT_FORCE:-}" ] || die "processes still run from $APP (pids: $(echo $busy)); the first deploy needs it idle: try again when no run is going"
+  install -d -m 0755 "$DATA"
+  [ "$(stat -c %d "$APP")" = "$(stat -c %d "$DATA")" ] || die "$DATA is on another file system than $APP; the move would copy"
+  local old name e
+  old=$(git -C "$APP" rev-parse HEAD 2>/dev/null || true)
+  name=${old:-legacy-$(date -u +%Y%m%dT%H%M%SZ)}
+  [ ! -e "$RELEASES/$name" ] || name=$name-legacy-$(date -u +%Y%m%dT%H%M%SZ)
+  systemctl stop "$SERVICE" 2>/dev/null || true
+  for e in "${SHARED[@]}"; do
+    if [ -e "$APP/$e" ] && [ ! -L "$APP/$e" ]; then
+      [ ! -e "$DATA/$e" ] || die "$DATA/$e is there already and so is $APP/$e; move one by hand"
+      mv -T "$APP/$e" "$DATA/$e"
+    fi
+    rm -f "$APP/$e"; ln -s "$DATA/$e" "$APP/$e"
+  done
+  touch "$APP/.miu-release-ok"
+  mv -T "$APP" "$RELEASES/$name"
+  flip "$APP" "$RELEASES/$name"
+  record "$name"
+  CONVERTED=1
+  say "Kept the old folder as release $name, for rollback"
+}
+
+# The unit keeps naming /srv/miu; the dashboard keeps runs and the cache by
+# that name, which every release resolves to the same folders.
+unit_dropin() {
+  local d=$UNIT_DIR/${SERVICE}.d
+  install -d -m 0755 "$d"
+  cat > "$d/20-miu-release.conf.tmp" <<EOF
+# Written by bin/miu-release: data by paths that outlive a release.
+[Service]
+Environment=MIU_RUNS=$APP/runs
+Environment=QA_CACHE_DIR=$APP/.cache
+EOF
+  if ! cmp -s "$d/20-miu-release.conf.tmp" "$d/20-miu-release.conf"; then mv "$d/20-miu-release.conf.tmp" "$d/20-miu-release.conf"; systemctl daemon-reload; else rm -f "$d/20-miu-release.conf.tmp"; fi
+}
+
+# The release's CI worker behind $LIB/sandbox-ci (and ci-mirror), when this
+# server runs CI (install.sh --sandbox-user). A worker already running keeps
+# its own file. The sudo rules name $LIB/sandbox-ci, which stays the path.
+worker() {
+  local name=${1:-$(current)} src
+  [ -f "$LIB/sandbox-user" ] || { say "No Sandbox CI on this server; no worker to install"; return 0; }
+  src=$RELEASES/$name
+  [ -f "$src/bin/miu-sandbox-ci" ] || die "release $name has no bin/miu-sandbox-ci"
+  install -d -m 0755 "$LIB/versions" "$LIB/versions/$name"
+  install "${OWN[@]}" -m 0755 "$src/bin/miu-sandbox-ci" "$LIB/versions/$name/sandbox-ci"
+  [ ! -f "$src/bin/miu-ci-mirror" ] || install "${OWN[@]}" -m 0755 "$src/bin/miu-ci-mirror" "$LIB/versions/$name/ci-mirror"
+  if [ -f "$src/lib/github-known-hosts" ]; then
+    install "${OWN[@]}" -m 0644 "$src/lib/github-known-hosts" "$LIB/.github-known-hosts.new"
+    mv -f "$LIB/.github-known-hosts.new" "$LIB/github-known-hosts"
+  fi
+  flip "$LIB/sandbox-ci" "versions/$name/sandbox-ci"
+  [ ! -f "$LIB/versions/$name/ci-mirror" ] || flip "$LIB/ci-mirror" "versions/$name/ci-mirror"
+  say "CI worker: $LIB/sandbox-ci -> versions/$name"
+}
+
+answers() { [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$URL" || true)" != 000 ]; }
+restart() {
+  systemctl restart "$SERVICE"
+  for _ in $(seq 1 30); do answers && systemctl is-active -q "$SERVICE" && return 0; sleep 1; done
+  return 1
+}
+
+prune() {
+  local cur keep=() n=0 r
+  cur=$(current)
+  while read -r r; do
+    [ -n "$r" ] && [ -d "$RELEASES/$r" ] || continue
+    keep+=("$r"); n=$((n + 1)); [ "$n" -lt "$KEEP" ] || break
+  done < <( { echo "$cur"; made_current | tac; } | awk 'NF && !seen[$0]++')
+  for r in "$RELEASES"/*/; do
+    r=$(basename "$r")
+    [[ $r == repo.git ]] && continue
+    printf '%s\n' "${keep[@]}" | grep -qxF "$r" && continue
+    if [ -n "$(users_of "$RELEASES/$r")" ]; then say "Keeping $r: a process still runs from it"; continue; fi
+    say "Removing release $r"
+    rm -rf "${RELEASES:?}/$r"
+  done
+  if [ -d "$LIB/versions" ]; then
+    for r in "$LIB"/versions/*/; do
+      r=$(basename "$r")
+      [ -d "$RELEASES/$r" ] || rm -rf "${LIB:?}/versions/$r"
+    done
+  fi
+}
+
+go_to() {
+  local name=$1 before restart_it=$2
+  before=$(current)
+  flip "$APP" "$RELEASES/$name"
+  record "$name"
+  worker "$name"
+  # The first deploy stopped the service to move the data: it starts again either way.
+  [ "$restart_it" = 1 ] || [ "$CONVERTED" = 1 ] || { say "Switched $APP to $name; not restarted"; return 0; }
+  say "Restarting $SERVICE on $name"
+  if restart; then say "$SERVICE answers on $name"; return 0; fi
+  [ -n "$before" ] && [ "$before" != "$name" ] || die "$SERVICE did not come up on $name; see: journalctl -u $SERVICE -n 50"
+  say "$SERVICE did not come up on $name; switching back to $before"
+  flip "$APP" "$RELEASES/$before"
+  record "$before"
+  worker "$before"
+  restart || die "$SERVICE did not come up on $before either; see: journalctl -u $SERVICE -n 50"
+  die "$name did not start; back on $before"
+}
+
+status() {
+  echo "current: $(current)"
+  echo "made current (oldest first):"; made_current | sed 's/^/  /'
+  [ -L "$LIB/sandbox-ci" ] && echo "worker: $(readlink "$LIB/sandbox-ci")"
+  return 0
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  deploy)
+    want=${1:-}; [ -n "$want" ] || die "deploy what? miu-release deploy <commit|branch|tag>"; shift
+    restart_it=1
+    for a in "$@"; do case "$a" in --no-restart) restart_it=0 ;; *) die "unknown option $a" ;; esac; done
+    ensure_repo
+    sha=$(resolve "$want")
+    build "$sha"
+    convert
+    install -d -m 0755 "$DATA"
+    for e in "${SHARED[@]}"; do [ -d "$DATA/$e" ] || ! id "$MIU_USER" >/dev/null 2>&1 || install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$DATA/$e"; done
+    unit_dropin
+    before=$(current)
+    go_to "$sha" "$restart_it"
+    prune
+    echo "deployed $sha (before: ${before:-none}); roll back with: $0 rollback"
+    ;;
+  rollback)
+    cur=$(current); [ -n "$cur" ] || die "$APP is not a release symlink"
+    prev=$(made_current | grep -vxF "$cur" | while read -r r; do [ -f "$RELEASES/$r/.miu-release-ok" ] && echo "$r"; done | tail -1)
+    [ -n "$prev" ] || die "no earlier release to go back to"
+    go_to "$prev" 1
+    echo "rolled back from $cur to $prev"
+    ;;
+  worker) worker "$(current)" ;;
+  status) status ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+esac

@@ -38,7 +38,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
 import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem, forkOf, workflowsAt } from '../lib/ci.mjs';
-import { runSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
+import { runSandboxCi, adoptSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -47,7 +47,8 @@ const opt = (n, d) => { const i = argv.indexOf(n); return i > -1 ? argv[i + 1] :
 const PORT = Number(opt('--port', 4747));
 // 127.0.0.1 unless told otherwise; anything else turns sign-in on (lib/auth.mjs).
 const HOST = opt('--host', process.env.MIU_HOST || '127.0.0.1');
-const RUNS = path.resolve(opt('--runs', path.join(ROOT, 'runs')));
+// MIU_RUNS: the runs folder by a path that outlives this release (bin/miu-release).
+const RUNS = path.resolve(opt('--runs', process.env.MIU_RUNS || path.join(ROOT, 'runs')));
 
 // Repos Miu can test are the ones with a test profile (lib/project.mjs);
 // the settings choose which of those it does test (all of them by default).
@@ -641,7 +642,9 @@ const ci = createCi({
   dir: CI_DIR, prepare: ciPrepare, parallel: ciParallel, isPaused: () => queueState().paused, scrub: ciScrub,
   coveredBy: (repo) => profiles().find((p) => p.repo === repo)?.fast_checks ?? [],
   prCiFor: (repo) => profiles().find((p) => p.repo === repo)?.pr_ci,
-  runJob: (check, gitDir, sha, { onStart, repo, trustedRef }) => runSandboxCi(check, gitDir, process.env, { ref: sha, onStart, repo, trustedRef }),
+  runJob: (check, gitDir, sha, { onStart, repo, trustedRef, spool }) => runSandboxCi(check, gitDir, process.env, { ref: sha, onStart, repo, trustedRef, spool }),
+  // A job the previous dashboard started goes on through a restart or a deploy.
+  adoptJob: (check, job) => adoptSandboxCi(check, job),
   log: (m) => console.log(m),
 });
 // A pull request's CI at its head, lined up once per commit.

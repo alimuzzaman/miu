@@ -20,7 +20,9 @@
 #     `miu-agent` runs the AI agent and can read none of that
 #   - rexenv, headless, as `miu`, for the disposable WordPress sites
 #   - Node, the claude and codex CLIs and Chromium, in /opt/miu
-#   - Miu in /srv/miu, as the systemd service `miu`, on 127.0.0.1:4747
+#   - Miu in /srv/miu-releases/<commit>, /srv/miu a symlink to the current one
+#     (bin/miu-release), its data in /srv/miu-data, as the systemd service
+#     `miu`, on 127.0.0.1:4747
 #   - a key that seals Miu's stored tokens, kept as a systemd credential
 #
 # Running it again updates Miu and keeps its data, settings and sign-ins.
@@ -65,6 +67,8 @@ for u in "$MIU_USER" "$AGENT_USER" ${SANDBOX_USER:+"$SANDBOX_USER"}; do [[ "$u" 
 [ "$MIU_USER" != "$AGENT_USER" ] || die "--user and --agent-user must differ"
 
 APP=/srv/miu
+RELEASES=/srv/miu-releases
+DATA=/srv/miu-data
 OPT=/opt/miu
 ETC=/etc/miu
 LIB=/usr/local/lib/miu
@@ -145,26 +149,26 @@ systemctl enable --now rexenv-headless.service >/dev/null
 
 # --------------------------------------------------------------------- miu
 say "Installing Miu ($MIU_REF)"
-git config --system --add safe.directory "$APP" 2>/dev/null || true
-if [ ! -d "$APP/.git" ]; then
-  # A folder without git (Miu copied in by hand): adopt it in place, so its
-  # runs/ and .cache/ (ignored by git) stay where they are.
-  install -d -m 0755 "$APP"
-  git -C "$APP" init -q
-  git -C "$APP" remote add origin "$MIU_REPO"
-fi
-git -C "$APP" remote set-url origin "$MIU_REPO"
-git -C "$APP" fetch -q --depth 1 origin "$MIU_REF"
-git -C "$APP" reset -q --hard FETCH_HEAD
-git -C "$APP" clean -fdq   # files of an older copy; ignored data stays
-chown root:root "$APP"
-(cd "$APP" && npm ci --silent --no-fund --no-audit --omit=dev >/dev/null)
-install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$APP/runs" "$APP/.cache"
+# Each commit gets a folder of its own; /srv/miu points at the current one
+# (bin/miu-release). An older install's /srv/miu folder is kept as a release,
+# its runs/, .cache/ and .agent-codex/ moved to $DATA.
+install -d -m 0755 "$RELEASES" "$LIB"
+[ -d "$RELEASES/repo.git" ] || git init -q --bare "$RELEASES/repo.git"
+git -C "$RELEASES/repo.git" remote remove origin 2>/dev/null || true
+git -C "$RELEASES/repo.git" remote add origin "$MIU_REPO"
+git -C "$RELEASES/repo.git" fetch -q --no-tags origin "+$MIU_REF:refs/miu-release/install"
+MIU_SHA=$(git -C "$RELEASES/repo.git" rev-parse --verify "refs/miu-release/install^{commit}")
+git -C "$RELEASES/repo.git" show "$MIU_SHA:bin/miu-release" > "$LIB/.miu-release.new"
+install -o root -g root -m 0755 "$LIB/.miu-release.new" "$LIB/miu-release" && rm -f "$LIB/.miu-release.new"
+# It also writes miu.service.d/20-miu-release.conf: MIU_RUNS and QA_CACHE_DIR
+# name the data through /srv/miu, the same folders in every release.
+MIU_USER="$MIU_USER" MIU_REPO_URL="$MIU_REPO" "$LIB/miu-release" deploy "$MIU_SHA" --no-restart
+install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$DATA/runs" "$DATA/.cache"
 if [ "$AGENT_USER_ON" = 1 ]; then
   # The agent passes through runs/ to its own run folder (Miu grants each one).
-  setfacl -m "u:$AGENT_USER:--x" "$APP/runs"
-  install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$APP/.agent-codex"
-  setfacl -m "u:$AGENT_USER:--x" "$APP/.agent-codex"
+  setfacl -m "u:$AGENT_USER:--x" "$DATA/runs"
+  install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$DATA/.agent-codex"
+  setfacl -m "u:$AGENT_USER:--x" "$DATA/.agent-codex"
 fi
 
 say "Installing Chromium"
@@ -288,9 +292,10 @@ if [ -n "$SANDBOX_USER" ]; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-yaml >/dev/null
   install -d -m 0755 "$LIB"
   echo "$SANDBOX_USER" > "$LIB/sandbox-user"
-  install -o root -g root -m 0755 "$APP/bin/miu-sandbox-ci" "$LIB/sandbox-ci"
-  # GitHub's SSH host key, for repositories CI reads with a deploy key (/etc/miu/ci-mirrors).
-  install -o root -g root -m 0644 "$APP/lib/github-known-hosts" "$LIB/github-known-hosts"
+  # The current release's worker, ci-mirror and GitHub's SSH host key (for
+  # repositories CI reads with a deploy key, /etc/miu/ci-mirrors), in
+  # $LIB/versions/<commit>, behind $LIB/sandbox-ci and $LIB/ci-mirror.
+  "$LIB/miu-release" worker
   # CI job containers go here (bin/miu-sandbox-ci passes --cgroup-parent), capped
   # together; stop them all with: systemctl stop miu-ci.slice
   cat > /etc/systemd/system/miu-ci.slice <<SLICE
@@ -325,7 +330,6 @@ EOF
     && [ "$(getent group "$MIRROR_USER" | cut -d: -f3)" = "$(id -g "$MIRROR_USER")" ] \
     && [ "$(getent passwd | awk -F: -v g="$(id -g "$MIRROR_USER")" '$4 == g' | wc -l)" = 1 ] || die "$MIRROR_USER must be an ordinary account in its own group only (it is in: $(id -Gn "$MIRROR_USER")); it must hold nothing else"
   install -d -o "$MIRROR_USER" -g "$MIRROR_USER" -m 0700 /var/lib/miu-mirror /var/lib/miu-mirror/keys /var/lib/miu-mirror/mirrors
-  install -o root -g root -m 0755 "$APP/bin/miu-ci-mirror" "$LIB/ci-mirror"
   {
     echo "# $MIU_USER may fetch each repository $ETC/ci-mirrors lists, as $MIRROR_USER, and nothing else."
     if [ -f "$ETC/ci-mirrors" ]; then

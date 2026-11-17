@@ -26,7 +26,7 @@ const opt = (n) => { const i = argv.indexOf(n); if (i < 0) return null; const v 
 const asJson = flag('--json');
 const full = flag('--full');
 const again = flag('--again');
-const runs = path.resolve(opt('--runs') ?? path.join(ROOT, 'runs'));
+const runs = path.resolve(opt('--runs') ?? (process.env.MIU_RUNS || path.join(ROOT, 'runs')));
 const [action, ...rest] = argv;
 const usage = () => { console.error(fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').slice(2, 11).map((l) => l.replace(/^\/\/ ?/, '')).join('\n')); process.exit(2); };
 
