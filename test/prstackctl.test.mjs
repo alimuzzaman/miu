@@ -175,6 +175,8 @@ test('a failed pr-hub-base add is tried again after 15 minutes, and PR stacks ar
     s.calls.push(args);
     if (args[0] === 'mem') return { code: 0, out: '8000' };
     if (args[0] === 'add' && fail) { fail = false; return { code: 1, out: '{"ok":false,"code":"x"}' }; }
+    // Built: one stack builds at a time, so the base waits for the PR stack to apply.
+    if (args[0] === 'status') return { code: 0, out: JSON.stringify({ ok: true, follows: [{ applied: { free: 'a', pro: 'b' } }] }) };
     return { code: 0, out: '{"ok":true}' };
   } });
   st.wantBase();
