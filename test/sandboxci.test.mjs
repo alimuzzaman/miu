@@ -568,6 +568,14 @@ test('a secret the base job gives only to a deploy-class action is not one a run
   assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
 });
 
+test('a secret only a needed job names on the base branch is not one the job may name', needsYaml, async () => {
+  const wf = (build) => `jobs:\n  prep:\n    runs-on: ubuntu-latest\n    steps: [{ run: id, env: { X: "\${{ secrets.X }}" } }]\n  a:\n    runs-on: ubuntu-latest\n    needs: prep\n    steps: [{ run: ${build} }]\n`;
+  const p = await prBranch({ '.github/workflows/test.yml': wf('id') }, { '.github/workflows/test.yml': wf('"echo ${{ secrets.X }}"') });
+  const sandbox = sandboxHome();
+  const r = await runSandboxCi(check, p.dir, server({ home: sandbox.home }).env, { ref: p.run, trustedRef: p.base });
+  assert.match(r.notRun ?? '', /names a secret \(X\)/, JSON.stringify(r));
+});
+
 test('only a job the base branch runs the same way lends a job its reach', async () => {
   const wf = (jobs) => ({ path: '.github/workflows/ci.yml', text: JSON.stringify({ on: 'pull_request', jobs }) });
   const job = { 'runs-on': 'ubuntu-latest', steps: [{ run: 'id' }] };
