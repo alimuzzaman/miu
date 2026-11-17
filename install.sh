@@ -169,6 +169,12 @@ if [ "$AGENT_USER_ON" = 1 ]; then
   setfacl -m "u:$AGENT_USER:--x" "$DATA/runs"
   install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$DATA/.agent-codex"
   setfacl -m "u:$AGENT_USER:--x" "$DATA/.agent-codex"
+  # The checkouts a run links at src/<label> (lib/worktrees.mjs, .cache/wt): the
+  # agent reads them (read_first, the PR's source) and never writes there. The
+  # default entry gives new slots and files the same.
+  install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$DATA/.cache/wt"
+  setfacl -m "u:$AGENT_USER:--x" "$DATA/.cache"
+  setfacl -R -m "u:$AGENT_USER:rX,d:u:$AGENT_USER:rX" "$DATA/.cache/wt"
 fi
 
 say "Installing Chromium"

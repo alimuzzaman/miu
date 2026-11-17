@@ -33,7 +33,7 @@ import * as gh from '../lib/github.mjs';
 import { askToResolve, askToClose } from '../lib/conflict.mjs';
 import { findPartners, roleOf, keyOf } from '../lib/pairs.mjs';
 import { startStub } from '../lib/stub-renderer.mjs';
-import { prepareHubStacks, dropSessions, grantSessions } from '../lib/hubstack.mjs';
+import { prepareHubStacks, signInsFor, dropSessions, grantSessions } from '../lib/hubstack.mjs';
 import { sudoRunner } from '../lib/prstackctl.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
 import { fetchRef, checkoutSlot, checkoutCheckSlot, checkSiblings, freeDirFor, ensureDeps, checkEnv, CACHE } from '../lib/worktrees.mjs';
@@ -533,13 +533,15 @@ if (hubStack) {
     const r = await prepareHubStacks({
       run: sudoRunner(process.env.MIU_SANDBOX_USER), signin, selfRole, pr: Number(pr), sha, partners,
       runDir, runsDir: path.dirname(runDir), log,
+      // A plugin PR paired with a Hub PR: its own areas say nothing about the console, so both.
+      need: selfRole === 'hub' ? signInsFor(areas) : { admin: true, app: true },
       sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     });
     stackHubs = r.hubs;
     infra.push(...r.infra);
   }
   write('hubs.json', stackHubs ?? {});
-  log(`hub stacks: ${Object.entries(stackHubs ?? {}).map(([k, v]) => `${k} ${v.stack}${v.admin_state ? '' : ' (not signed in)'}`).join(', ') || 'none ready'} in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+  log(`hub stacks: ${Object.entries(stackHubs ?? {}).map(([k, v]) => `${k} ${v.stack}${v.admin_state || v.admin_skipped ? '' : ' (admin not signed in)'}${v.app_state ? '' : ' (app not signed in)'}`).join(', ') || 'none ready'} in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 }
 if (mode === 'full') {
   try {

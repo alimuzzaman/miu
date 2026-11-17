@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { waitApplied, prepareHubStacks, dropSessions, expectedHeads, prStackName } from '../lib/hubstack.mjs';
+import { waitApplied, prepareHubStacks, dropSessions, expectedHeads, prStackName, signInsFor } from '../lib/hubstack.mjs';
 
 const clock = () => { let t = Date.UTC(2026, 10, 17, 7); return { now: () => t, sleep: async (ms) => { t += ms; } }; };
 const status = (applied, extra = {}) => ({ code: 0, out: JSON.stringify({ ok: true, follows: [{ applied, ...extra }] }) });
@@ -41,7 +41,7 @@ test('prepareHubStacks writes both sides, signs in through the helper, and dropS
   const signin = async (args) => {
     signed.push(args);
     const at = (k) => args[args.indexOf(k) + 1];
-    for (const k of ['--admin-out', '--app-out']) fs.writeFileSync(at(k), '{}', { mode: 0o600 });
+    for (const k of ['--admin-out', '--app-out']) if (args.includes(k)) fs.writeFileSync(at(k), '{}', { mode: 0o600 });
     return { code: 0, out: JSON.stringify({ ok: true, stack: at('--stack'), enrolled: true }) };
   };
   const { hubs, infra } = await prepareHubStacks({ run, signin, selfRole: 'hub', pr: 621, sha: 'h1', runDir, runsDir: runDir, ...clock() });
@@ -83,4 +83,30 @@ test('no stack coming: a refused plan or a missing follow ends the wait at once'
   assert.equal(asked, 1, 'not even asked');
   const queued = await waitApplied({ run: notFound, name: 'pr-hub-7', want: { hub: 'x' }, planned: { state: 'waiting' }, timeoutMs: 3 * 60 * 1000, ...c });
   assert.match(queued.why, /in time/, 'a stack the dashboard is about to add is waited for');
+});
+
+test('the staff console is signed in to only when the pull request touches it (the Hub caps staff links at 5 an hour)', async () => {
+  assert.deepEqual(signInsFor({ hub: true, admin: false }), { admin: false, app: true });
+  assert.deepEqual(signInsFor({ admin: true }), { admin: true, app: true });
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubstack-'));
+  const run = async (args) => {
+    if (args[0] === 'status') return status(args[1] === 'pr-hub-base' ? { hub: 'd' } : { hub: 'h1' });
+    return { code: 0, out: JSON.stringify({ ok: true, created_at: 'x', copy_id: 'y', ports: { mailpit: 18100 } }) };
+  };
+  const signed = [];
+  const signin = async (args) => {
+    signed.push(args);
+    const i = args.indexOf('--app-out');
+    if (i > -1) fs.writeFileSync(args[i + 1], '{}', { mode: 0o600 });
+    return { code: 0, out: JSON.stringify({ ok: true, enrolled: false }) };
+  };
+  const { hubs, infra } = await prepareHubStacks({ run, signin, selfRole: 'hub', pr: 7, sha: 'h1', runDir, runsDir: runDir, need: signInsFor({ hub: true }), ...clock() });
+  assert.deepEqual(infra, []);
+  assert.equal(signed.length, 2);
+  assert.ok(signed.every((a) => !a.includes('--admin-out') && a.includes('--app-out')), 'no staff link is asked for');
+  for (const side of ['pr', 'dev']) {
+    assert.equal(hubs[side].admin_state, null);
+    assert.match(hubs[side].admin_skipped, /does not touch the admin console/);
+    assert.ok(fs.existsSync(hubs[side].app_state));
+  }
 });

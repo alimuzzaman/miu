@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // qa-hub-signin --stack pr-hub-88 --incarnation <created_at/copy_id> --mailpit-port 18123
-//               --admin-out <admin-state.json> --app-out <app-state.json> [--runs-dir DIR]
+//               [--admin-out <admin-state.json>] [--app-out <app-state.json>] [--runs-dir DIR]
 //
-// Signs Miu's QA address into the stack's Hub admin console, and the seeded
-// QA account into its account app (lib/hubsignin.mjs), and writes each session
-// as a Playwright storage state, 0600. qa-run runs it and deletes both after
+// Signs Miu's QA address into the stack's Hub admin console (--admin-out), and
+// the seeded QA account into its account app (--app-out), at least one of them
+// (lib/hubsignin.mjs), and writes each session as a Playwright storage state, 0600. qa-run runs it and deletes both after
 // the run; the agent's browser loads them.
 // Prints one JSON line: { ok, stack, enrolled } or { ok: false, error }. No
 // link, code or cookie is ever printed.
@@ -21,17 +21,23 @@ const runs = path.resolve(arg('runs-dir') ?? process.env.MIU_RUNS_DIR ?? path.jo
 const say = (o) => { console.log(JSON.stringify(o)); process.exit(o.ok ? 0 : 1); };
 
 if (!stack || !NAME.test(stack) || !/^pr-hub-(\d{1,6}|base)$/.test(stack)) say({ ok: false, error: 'a full PR stack name (pr-hub-<n> or pr-hub-base) is needed' });
-if (!incarnation || !Number.isInteger(port) || port < 1024 || port > 65535 || !adminOut || !appOut) say({ ok: false, error: 'usage: --stack --incarnation --mailpit-port --admin-out --app-out' });
+if (!incarnation || !Number.isInteger(port) || port < 1024 || port > 65535 || (!adminOut && !appOut)) say({ ok: false, error: 'usage: --stack --incarnation --mailpit-port [--admin-out] [--app-out]' });
 
 try {
   const mailpit = `http://127.0.0.1:${port}/mail`;
-  const { cookie, enrolled } = await signIn({
-    admin: `https://admin-${stack}.${ZONE}`, mailpit, stack, incarnation,
-    totpFile: path.join(runs, '.stacks', `${stack}.totp`),
-  });
-  writeStorageState(path.resolve(adminOut), cookie);
-  const app = await signInApp({ hub: `https://hub-${stack}.${ZONE}`, mailpit });
-  writeStorageState(path.resolve(appOut), app.cookie);
+  let enrolled = false;
+  if (adminOut) {
+    const r = await signIn({
+      admin: `https://admin-${stack}.${ZONE}`, mailpit, stack, incarnation,
+      totpFile: path.join(runs, '.stacks', `${stack}.totp`),
+    });
+    writeStorageState(path.resolve(adminOut), r.cookie);
+    enrolled = r.enrolled;
+  }
+  if (appOut) {
+    const app = await signInApp({ hub: `https://hub-${stack}.${ZONE}`, mailpit });
+    writeStorageState(path.resolve(appOut), app.cookie);
+  }
   say({ ok: true, stack, enrolled });
 } catch (e) {
   say({ ok: false, stack, error: String(e.message).slice(0, 300) });
