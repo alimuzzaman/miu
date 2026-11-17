@@ -262,11 +262,18 @@ if not isinstance(jobs, dict):
 # here, from the bytes act reads: more names than Sandbox fills, never fewer.
 EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
 REF = re.compile(r"\bsecrets\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\])")
+# A step whose condition is exactly !env.ACT is one act leaves out, and Sandbox
+# fills none of its names (_runtime_secrets_needed, the same pattern).
+ACT_SKIP = re.compile(r"\s*(?:\$\{\{\s*)?!\s*env\.ACT\s*(?:\}\})?\s*")
 def named(value):
     return {a or b for block in EXPR.findall(json.dumps(value, default=str)) for a, b in REF.findall(block)}
-names = named(doc)
+def kept(job):
+    if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+        return job
+    return {**job, "steps": [s for s in job["steps"] if not (isinstance(s, dict) and isinstance(s.get("if"), str) and ACT_SKIP.fullmatch(s["if"]))]}
+names = named({**doc, "jobs": {k: kept(v) for k, v in jobs.items()}})
 for job in jobs.values():
-    for step in (job.get("steps") if isinstance(job, dict) and isinstance(job.get("steps"), list) else []):
+    for step in (kept(job).get("steps") if isinstance(kept(job), dict) and isinstance(kept(job).get("steps"), list) else []):
         names |= named(step)
 extra = sorted(names - set(filter(None, sys.argv[3].split(","))))
 if extra:
