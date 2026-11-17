@@ -131,7 +131,7 @@ reserve_mem_gb=${MIU_CI_RESERVE_MEM_GB:-2}
 slots=${MIU_CI_SLOTS_DIR:-$HOME/.cache/miu-sandbox-ci-slots}
 mkdir -p -m 0700 "$slots"
 slot=$(python3 -I - "$slots" "$run_mem_gb" "$run_cpus" "$pool_mem_gb" "$pool_cpus" "$reserve_mem_gb" <<'SLOTS'
-import fcntl, os, sys, time
+import fcntl, os, sys
 folder = sys.argv[1]
 run_mem, run_cpus, pool_mem, pool_cpus, reserve_mem = map(float, sys.argv[2:7])
 most = int(min(pool_mem // run_mem, pool_cpus // run_cpus))

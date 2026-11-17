@@ -45,7 +45,7 @@ function server({ worker, home, docker = 'exit 0' }) {
   script(path.join(bin, 'curl'), `cat >> "${bin}/curl-stdin"\nprintf '%s\\n' "$@" >> "${bin}/curl-argv"`);
   if (!hasYaml) script(path.join(bin, 'python3'), 'exit 0');
   return {
-    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '8', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-deploy-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no-apply.lock'), MIU_CI_RUNNER_UID: String(process.getuid()), MIU_CI_SECRET_NAMES: namesList('acme/r SLACK_WEBHOOK\n'), MIU_CI_SECRET_NAMES_OWNER: SELF },
+    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-deploy-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no-apply.lock'), MIU_CI_RUNNER_UID: String(process.getuid()), MIU_CI_SECRET_NAMES: namesList('acme/r SLACK_WEBHOOK\n'), MIU_CI_SECRET_NAMES_OWNER: SELF },
     sudoArgv: () => fs.readFileSync(path.join(bin, 'sudo-argv'), 'utf8').trim().split('\n'),
     sudoAll: () => fs.readFileSync(path.join(bin, 'sudo-all'), 'utf8').trim().split('\n'),
     curl: (f) => { try { return fs.readFileSync(path.join(bin, `curl-${f}`), 'utf8'); } catch { return ''; } },
@@ -197,6 +197,7 @@ test('does not start when the server is short of memory: a job needs its 2 GB pl
 // The server's stacks keep idle cores near 0 all day: CPU never holds a job
 // back; miu-ci.slice's low CPU weight makes CI yield instead.
 test('a server with no idle CPU still runs CI when memory allows, capped at low priority', async () => {
+  // The CPU knobs below are read by nothing now: they make this test fail if an idle-CPU check comes back.
   const stat = (name, user, idle) => { const f = path.join(tmp, `${name}-${process.hrtime.bigint()}`); fs.writeFileSync(f, `cpu  ${user} 0 0 ${idle} 0 0 0 0 0 0\n`); return f; };
   const sandbox = sandboxHome();
   const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
