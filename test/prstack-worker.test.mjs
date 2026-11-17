@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'miu-pr-stack');
 
-function harness({ fail = '' } = {}) {
+function harness({ fail = '', list = '' } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-pr-stack-'));
   const log = path.join(dir, 'calls');
   const sb = path.join(dir, 'sb');
@@ -18,6 +18,7 @@ function harness({ fail = '' } = {}) {
   fs.writeFileSync(sb, `#!${process.execPath}
 const fs = require('fs'); const a = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(a) + '\\n');
+if (process.env.LIST && a.join(' ').includes('stack list')) { console.log(process.env.LIST); process.exit(0); }
 if (process.env.FAIL && a.join(' ').includes(process.env.FAIL)) { console.log('{"ok":false,"code":"' + process.env.FAIL_CODE + '"}'); process.exit(1); }
 console.log('{"ok":true}');
 `, { mode: 0o755 });
@@ -26,7 +27,7 @@ console.log('{"ok":true}');
   fs.mkdirSync(path.join(root, 'work'), { recursive: true });
   const run = (...args) => spawnSync('bash', [WORKER, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, MIU_PR_STACK_SB: sb, MIU_PR_STACK_FOLLOW_ROOT: root, MIU_PR_STACK_MEMINFO: path.join(dir, 'meminfo'), FAIL: fail.split(':')[0] ?? '', FAIL_CODE: fail.split(':')[1] ?? '' },
+    env: { ...process.env, MIU_PR_STACK_SB: sb, MIU_PR_STACK_FOLLOW_ROOT: root, MIU_PR_STACK_MEMINFO: path.join(dir, 'meminfo'), FAIL: fail.split(':')[0] ?? '', FAIL_CODE: fail.split(':')[1] ?? '', LIST: list },
   });
   const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : []);
   return { run, calls, root };
@@ -139,4 +140,27 @@ test('a symlinked work folder is left alone', () => {
   fs.symlinkSync(target, path.join(h.root, 'work', 'pr-hub-4'));
   assert.equal(h.run('remove', 'pr-hub-4').status, 2);
   assert.ok(fs.existsSync(target));
+});
+
+test('ports: a stack\'s ports and incarnation from stack list, through --here; unknown stacks and bad names refused', () => {
+  const list = JSON.stringify({ ok: true, stacks: [
+    { slug: 'pr-hub-base', created_at: '2026-11-17T07:00:00Z', copy_id: 'ab12', ports: { mailpit: 18123 }, hostnames: ['x'], owner: { label: 'miu' } },
+    { slug: 'pr-hub-9', created_at: 'other', copy_id: 'cd34', ports: {} },
+  ] });
+  const h = harness({ list });
+  const r = h.run('ports', 'pr-hub-base');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout.trim().split('\n').pop()), { ok: true, slug: 'pr-hub-base', created_at: '2026-11-17T07:00:00Z', copy_id: 'ab12', ports: { mailpit: 18123 } });
+  assert.deepEqual(h.calls().at(-1), ['host', 'stack', 'list', '--here', '--json']);
+  const missing = h.run('ports', 'pr-hub-77');
+  assert.equal(missing.status, 1);
+  assert.match(missing.stdout, /stack_not_found/);
+  assert.notEqual(h.run('ports', 'guided-setup').status, 0, 'only PR stack names');
+  assert.notEqual(h.run('ports', 'pr-hub-base;id').status, 0);
+});
+
+test('add: pr-hub-base is a full stack name; a WordPress-only base is refused', () => {
+  const h = harness();
+  assert.equal(h.run('add', 'pr-hub-base', 'full', 'free=dev', 'pro=dev', 'hub=dev').status, 0);
+  assert.notEqual(h.run('add', 'pr-hub-base', 'wp', 'free=dev', 'pro=dev').status, 0);
 });

@@ -167,18 +167,39 @@ test('pr-hub-base: added first, never removed as closed, counted toward the cap,
   assert.equal(s.st.list().find((x) => x.name === 'pr-hub-base').state, 'following');
 });
 
-test('a failed pr-hub-base add is tried again on a later scan', async () => {
+test('a failed pr-hub-base add is tried again after 15 minutes, and PR stacks are added meanwhile', async () => {
   let fail = true;
+  let t = Date.UTC(2026, 10, 17);
   const s = setup();
-  const st = createStacks({ runsDir: s.runsDir, now: () => Date.UTC(2026, 10, 17), log: () => {}, run: async (args) => {
+  const st = createStacks({ runsDir: s.runsDir, now: () => t, log: () => {}, run: async (args) => {
     s.calls.push(args);
     if (args[0] === 'mem') return { code: 0, out: '8000' };
     if (args[0] === 'add' && fail) { fail = false; return { code: 1, out: '{"ok":false,"code":"x"}' }; }
     return { code: 0, out: '{"ok":true}' };
   } });
   st.wantBase();
-  await st.scan({ open: new Map() });
-  assert.equal(st.list()[0].state, 'failed');
-  await st.scan({ open: new Map() });
-  assert.equal(st.list()[0].state, 'following');
+  st.want('WPDevelopers/xspeed', 5, 'free', pr(5));
+  const open = new Map([['WPDevelopers/xspeed#5', 'sha5']]);
+  await st.scan({ open });
+  const base = () => st.list().find((x) => x.name === 'pr-hub-base');
+  assert.equal(base().state, 'failed');
+  t += 2 * 60 * 1000;
+  await st.scan({ open });
+  assert.equal(base().state, 'failed', 'not yet');
+  assert.equal(st.view('WPDevelopers/xspeed#5').state, 'following', 'the PR stack got the add meanwhile');
+  t += 15 * 60 * 1000;
+  await st.scan({ open });
+  assert.equal(base().state, 'following');
+});
+
+test('a PR that gets paired later gives up its own stack, and its page shows the shared one', async () => {
+  const s = setup();
+  s.st.want('WPDevelopers/xspeed', 21, 'free', pr(21));
+  const open = new Map([['WPDevelopers/xspeed#21', 'sha21'], ['WPDevelopers/xspeed-hub#88', 'hsha88']]);
+  await s.st.scan({ open });
+  assert.equal(s.st.view('WPDevelopers/xspeed#21').name, 'wp-pr-free-21');
+  s.st.want('WPDevelopers/xspeed', 21, 'free', pr(21), { hub: hubPr(88) });
+  await s.st.scan({ open });
+  assert.ok(s.calls.some((c) => c[0] === 'remove' && c[1] === 'wp-pr-free-21'), 'its own stack goes');
+  assert.equal(s.st.view('WPDevelopers/xspeed#21').name, 'pr-hub-88');
 });

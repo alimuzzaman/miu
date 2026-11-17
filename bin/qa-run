@@ -33,7 +33,7 @@ import * as gh from '../lib/github.mjs';
 import { askToResolve, askToClose } from '../lib/conflict.mjs';
 import { findPartners, roleOf, keyOf } from '../lib/pairs.mjs';
 import { startStub } from '../lib/stub-renderer.mjs';
-import { prepareHubStacks, dropSessions } from '../lib/hubstack.mjs';
+import { prepareHubStacks, dropSessions, grantSessions } from '../lib/hubstack.mjs';
 import { sudoRunner } from '../lib/prstackctl.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
 import { fetchRef, checkoutSlot, checkoutCheckSlot, checkSiblings, freeDirFor, ensureDeps, checkEnv, CACHE } from '../lib/worktrees.mjs';
@@ -532,7 +532,7 @@ if (hubStack) {
     });
     const r = await prepareHubStacks({
       run: sudoRunner(process.env.MIU_SANDBOX_USER), signin, selfRole, pr: Number(pr), sha, partners,
-      runDir, runsDir: path.dirname(runDir), agentUser: AGENT_USER || null, log,
+      runDir, runsDir: path.dirname(runDir), log,
       sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
     });
     stackHubs = r.hubs;
@@ -763,6 +763,8 @@ if (!flag('--skip-agent')) {
   // as its own account the agent gets the API key in its environment instead.
   if (AGENT_USER && auth?.settings?.apiKeyHelper) auth = { ...auth, settings: undefined, env: { ...auth.env, ANTHROPIC_API_KEY: readSecret('claude', 'apiKey') } };
   if (AGENT_USER) { try { shareRunDir(runDir); log(`agent account: ${AGENT_USER}`); } catch (e) { log(e.message); infra.push({ what: e.message, blocking: true }); auth = null; } }
+  // The Hub sign-in files: the agent may read them, after shareRunDir's rw grant (lib/hubstack.mjs).
+  if (AGENT_USER && hubStack) { try { grantSessions(runDir, AGENT_USER); } catch (e) { log(e.message); infra.push({ what: e.message, impact: 'the agent cannot use the Hub sign-ins', blocking: false }); } }
   if (infra.some((p) => p.blocking)) await waitAndExit(infra.filter((p) => p.blocking));
   // Every call re-reads the whole conversation, so one 400k-character output
   // slows every later turn. Long output belongs in an evidence file.

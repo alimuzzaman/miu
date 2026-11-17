@@ -69,3 +69,18 @@ test('a stack that is not ready blocks the run; a failed sign-in leaves the stat
   assert.equal(hubs.dev.admin_state, null);
   assert.ok(infra.some((i) => !i.blocking && /could not sign in to pr-hub-base: hub sign-in: link answered 429/.test(i.what)));
 });
+
+test('no stack coming: a refused plan or a missing follow ends the wait at once', async () => {
+  const c = clock();
+  let asked = 0;
+  const notFound = async () => { asked++; return { code: 1, out: '{"ok":false,"code":"follow_not_found"}' }; };
+  const r1 = await waitApplied({ run: notFound, name: 'pr-hub-7', want: { hub: 'x' }, ...c });
+  assert.equal(r1.ok, false);
+  assert.match(r1.why, /no test stack follows it/);
+  assert.equal(asked, 1);
+  const r2 = await waitApplied({ run: notFound, name: 'pr-hub-7', want: { hub: 'x' }, planned: { state: 'refused', why: 'fork' }, ...c });
+  assert.match(r2.why, /no test stack: .*fork/);
+  assert.equal(asked, 1, 'not even asked');
+  const queued = await waitApplied({ run: notFound, name: 'pr-hub-7', want: { hub: 'x' }, planned: { state: 'waiting' }, timeoutMs: 3 * 60 * 1000, ...c });
+  assert.match(queued.why, /in time/, 'a stack the dashboard is about to add is waited for');
+});

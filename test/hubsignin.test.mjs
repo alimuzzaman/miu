@@ -155,3 +155,16 @@ test('the app side never follows a mailed link to another host, and stops at two
   const tf = fakeHub({ appTwoFactor: true });
   await assert.rejects(signInApp({ hub: 'https://hub-pr-hub-9.xspeedcdn.online', mailpit: 'http://127.0.0.1:18123/mail', fetch: tf.fetch, now: tf.now, sleep: tf.sleep }), /two-factor/);
 });
+
+test('an enrollment the Hub accepted but Miu never confirmed is recovered, not lost', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubsignin-'));
+  const hub = fakeHub();
+  await signIn(base(dir, hub));
+  const file = base(dir).totpFile;
+  const t = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...t, step: null, pending: true }), { mode: 0o600 });
+  await hub.sleep(31000);
+  const r = await signIn(base(dir, hub));
+  assert.equal(r.enrolled, false);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).pending, undefined);
+});
