@@ -112,6 +112,8 @@ You do not need to wait for tests to finish before you deploy:
 - A CI job writes its output to files. The new dashboard waits for it, still within the job's time limit, and records its result. After a reboot, a CI job that was running is run again.
 - New tests and CI jobs use the new release.
 
+To see which release a live run uses, read its working folder: `sudo readlink /proc/$(pgrep -f 'bin/qa-run ' | head -1)/cwd` prints `/srv/miu-releases/<commit>`.
+
 The last 3 releases are kept, and so is any release a process still runs from. Changes to the unit, the sudo rules or the system packages still need the installer.
 
 The first deploy on a server installed before releases existed stops the service and moves `runs/`, `.cache/` and `.agent-codex/` from the old `/srv/miu` folder to `/srv/miu-data`. It keeps that folder as a release, so `rollback` goes back to it. This one deploy refuses to run while a test is going, and with `--no-restart` (as the installer runs it) it leaves the service stopped until the installer starts it.
