@@ -16,7 +16,7 @@ import { withRex } from '../lib/rexmcp.mjs';
 import { postRun } from '../lib/postrun.mjs';
 import { qaSignals, prHistory, setLabelNames as setSignalLabels } from '../lib/prsignals.mjs';
 import { partnersOf, roleOf } from '../lib/pairs.mjs';
-import { project, profiles, roles } from '../lib/project.mjs';
+import { project, profiles, roles, profileOf } from '../lib/project.mjs';
 import { addProfile, saveProfile, profileText } from '../lib/newprofile.mjs';
 import { MODELS, ENGINES, EFFORTS, engineOf } from '../lib/engines.mjs';
 import * as conn from '../lib/connections.mjs';
@@ -1023,6 +1023,8 @@ async function stackScan() {
       try { pair = await partnersOf(p.repo, p.number); } catch (e) { console.error('stack pair lookup:', e.message); continue; }
       stacks.want(p.repo, p.number, role, p, pair);
     }
+    // Hub PRs tested on stacks compare with pr-hub-base (lib/prstacks.mjs BASE), kept while that is on.
+    if (roles().hub && profileOf(roles().hub.repo)?.stack?.kind === 'full') stacks.wantBase();
     const v = verdicts();
     for (const s of stacks.list()) stacks.observe(s.key, { head: open?.get(s.key), verdictAt: v.get(s.key)?.at, verdictHead: v.get(s.key)?.sha });
     await stacks.scan({ open, liveKeys });

@@ -130,3 +130,15 @@ test('describe says what a tester needs to know', () => {
   assert.match(describe({ state: 'following', failed: true, failedReason: 'stack_up_failed' }), /failed: stack_up_failed/);
   assert.match(describe({ state: 'removed', why: 'evicted' }), /newer pull request/);
 });
+
+test('a role "app" profile is a Hub (kind hub) unless it says otherwise', async () => {
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-profiles-'));
+  fs.writeFileSync(path.join(dir, 'hub.json'), JSON.stringify({ repo: 'WPDevelopers/xspeed-hub', role: 'app', stack: { kind: 'full' } }));
+  fs.writeFileSync(path.join(dir, 'free.json'), JSON.stringify({ repo: 'WPDevelopers/xspeed', role: 'main' }));
+  process.env.MIU_PROFILES = dir;
+  const { profileOf } = await import(`../lib/project.mjs?profiles=${Date.now()}`);
+  assert.equal(profileOf('WPDevelopers/xspeed-hub').kind, 'hub');
+  assert.deepEqual(profileOf('WPDevelopers/xspeed-hub').stack, { kind: 'full' });
+  assert.equal(profileOf('WPDevelopers/xspeed').kind, 'wp-plugin');
+});

@@ -34,7 +34,7 @@ follow_root=${MIU_PR_STACK_FOLLOW_ROOT:-$HOME/sandbox/runtime/hosting/follow}
 meminfo=${MIU_PR_STACK_MEMINFO:-/proc/meminfo}
 export SANDBOX_AUTO_UPDATE=0
 
-name_ok() { [[ $1 =~ ^(wp-)?pr-(free|pro|hub)-[0-9]{1,6}$ ]]; }
+name_ok() { [[ $1 =~ ^(wp-)?pr-(free|pro|hub)-[0-9]{1,6}$ || $1 == pr-hub-base ]]; }
 # The same rule as lib/prstacks.mjs BRANCH and Sandbox's follow spec.
 branch_ok() {
   [[ $1 =~ ^[A-Za-z0-9._/-]{1,200}$ ]] && [[ $1 != -* && $1 != /* && $1 != */ && $1 != *. && $1 != *.lock ]] \

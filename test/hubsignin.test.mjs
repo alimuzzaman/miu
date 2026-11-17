@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { signIn, totpCode, readTotp, writeStorageState, COOKIE, EMAIL } from '../lib/hubsignin.mjs';
+import { signIn, signInApp, totpCode, readTotp, writeStorageState, COOKIE, EMAIL, APP_COOKIE } from '../lib/hubsignin.mjs';
 
 // RFC 6238 appendix B, SHA-1, secret "12345678901234567890" (base32 below), 6 digits.
 test('totpCode matches the RFC 6238 vectors', () => {
@@ -14,7 +14,7 @@ test('totpCode matches the RFC 6238 vectors', () => {
 });
 
 // A fake Hub admin and Mailpit with the routes and checks lib/hubsignin.mjs relies on.
-function fakeHub({ hasFactor = false } = {}) {
+function fakeHub({ hasFactor = false, appLinkHost = 'hub-pr-hub-9.xspeedcdn.online', appTwoFactor = false } = {}) {
   let t = Date.UTC(2026, 10, 17, 6, 0, 0);
   const state = { tokens: new Set(), sessions: new Map(), mails: [], factor: hasFactor ? 'OTHERSECRETOTHERSECRETOTHERSECRE' : null, pending: null, lastStep: null, calls: [], seen: [] };
   const ok = (body, cookie) => {
@@ -34,6 +34,21 @@ function fakeHub({ hasFactor = false } = {}) {
       if (u.pathname === '/mail/api/v1/messages' && init.method === 'DELETE') { state.mails = state.mails.filter((_, i) => !body.IDs.includes(String(i))); return ok({}); }
       return no(404, 'nf');
     }
+    if (u.hostname === 'hub-pr-hub-9.xspeedcdn.online' || u.hostname === 'elsewhere.example') {
+      if (u.pathname === '/auth/email/request' && init.method === 'POST') {
+        state.mails.push({ at: t, text: `Sign in: https://${appLinkHost}/auth/email/verify?token=apptok${'y'.repeat(30)}&amp;return=https%3A%2F%2Fhub-pr-hub-9.xspeedcdn.online` });
+        return ok({ sent: true });
+      }
+      if (u.pathname === '/auth/email/verify' && u.searchParams.get('token')?.startsWith('apptok')) {
+        const headers = new Headers({ location: appTwoFactor ? 'https://hub-pr-hub-9.xspeedcdn.online/two-factor' : 'https://hub-pr-hub-9.xspeedcdn.online/' });
+        headers.append('set-cookie', `${APP_COOKIE}=app1; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000; Secure`);
+        return new Response('', { status: 302, headers });
+      }
+      return no(404, 'nf');
+    }
+    // The admin host: the console's API is under /api/ (the stack's edge), the rest is the SPA.
+    if (!u.pathname.startsWith('/api/admin/')) return no(405, 'spa');
+    u.pathname = u.pathname.slice(4);
     if (init.headers?.origin !== 'https://admin-pr-hub-9.xspeedcdn.online') return no(403, 'origin');
     const sid = (init.headers?.cookie ?? '').split('=')[1];
     const sess = sid && state.sessions.get(sid);
@@ -121,4 +136,22 @@ test('no link, code, secret or recovery code is in what signIn returns or throws
   assert.equal(saved.cookies[0].name, COOKIE);
   assert.doesNotMatch(fs.readFileSync(state, 'utf8'), /JBSWY|tok|rc-one/);
   assert.equal(EMAIL, 'miu-qa@wpdeveloper.com');
+});
+
+test('the app side: the seeded QA account is signed in by its emailed link, and the mail is deleted', async () => {
+  const hub = fakeHub();
+  const r = await signInApp({ hub: 'https://hub-pr-hub-9.xspeedcdn.online', mailpit: 'http://127.0.0.1:18123/mail', fetch: hub.fetch, now: hub.now, sleep: hub.sleep });
+  assert.equal(r.cookie.name, APP_COOKIE);
+  assert.equal(r.cookie.value, 'app1');
+  assert.equal(r.cookie.domain, 'hub-pr-hub-9.xspeedcdn.online');
+  assert.equal(r.cookie.sameSite, 'Lax');
+  assert.equal(hub.state.mails.length, 0);
+});
+
+test('the app side never follows a mailed link to another host, and stops at two-factor', async () => {
+  const away = fakeHub({ appLinkHost: 'elsewhere.example' });
+  await assert.rejects(signInApp({ hub: 'https://hub-pr-hub-9.xspeedcdn.online', mailpit: 'http://127.0.0.1:18123/mail', fetch: away.fetch, now: away.now, sleep: away.sleep }), /not for this stack/);
+  assert.ok(!away.state.calls.includes('GET /auth/email/verify'));
+  const tf = fakeHub({ appTwoFactor: true });
+  await assert.rejects(signInApp({ hub: 'https://hub-pr-hub-9.xspeedcdn.online', mailpit: 'http://127.0.0.1:18123/mail', fetch: tf.fetch, now: tf.now, sleep: tf.sleep }), /two-factor/);
 });

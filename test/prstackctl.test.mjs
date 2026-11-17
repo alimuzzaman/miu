@@ -148,3 +148,37 @@ test('the Hub authenticator file goes with its stack, and a new stack of that na
   assert.equal(s.st.view('WPDevelopers/xspeed-hub#88').state, 'removed');
   assert.equal(fs.existsSync(file), false, 'deleted when the stack is removed');
 });
+
+test('pr-hub-base: added first, never removed as closed, counted toward the cap, never evicted', async () => {
+  const s = setup({ answers: { status: { code: 0, out: JSON.stringify({ ok: true, applied: { free: 'x', pro: 'y', hub: 'z' } }) } } });
+  s.st.wantBase();
+  s.st.want('WPDevelopers/xspeed', 1, 'free', pr(1));
+  const open = new Map([['WPDevelopers/xspeed#1', 'sha1']]);
+  await s.st.scan({ open });
+  assert.deepEqual(s.calls.find((c) => c[0] === 'add'), ['add', 'pr-hub-base', 'full', 'free=dev', 'pro=dev', 'hub=dev'], 'the base goes first');
+  for (let i = 2; i <= CAP; i++) { s.st.want('WPDevelopers/xspeed', i, 'free', pr(i)); open.set(`WPDevelopers/xspeed#${i}`, `sha${i}`); }
+  for (let i = 0; i < CAP + 2; i++) { s.tick(6 * 60 * 1000); await s.st.scan({ open }); }
+  const live = s.st.list().filter((x) => x.state === 'following');
+  assert.equal(live.length, CAP, `never more than ${CAP}: the base and ${CAP - 1} PR stacks`);
+  assert.ok(live.some((x) => x.name === 'pr-hub-base'));
+  assert.deepEqual(s.calls.filter((c) => c[0] === 'remove'), [['remove', 'wp-pr-free-1']], `PR ${CAP} needed room: the oldest PR stack went, not the base`);
+  await s.st.scan({ open: new Map() });
+  assert.ok(!s.calls.some((c) => c[0] === 'remove' && c[1] === 'pr-hub-base'), 'not removed when every PR closes');
+  assert.equal(s.st.list().find((x) => x.name === 'pr-hub-base').state, 'following');
+});
+
+test('a failed pr-hub-base add is tried again on a later scan', async () => {
+  let fail = true;
+  const s = setup();
+  const st = createStacks({ runsDir: s.runsDir, now: () => Date.UTC(2026, 10, 17), log: () => {}, run: async (args) => {
+    s.calls.push(args);
+    if (args[0] === 'mem') return { code: 0, out: '8000' };
+    if (args[0] === 'add' && fail) { fail = false; return { code: 1, out: '{"ok":false,"code":"x"}' }; }
+    return { code: 0, out: '{"ok":true}' };
+  } });
+  st.wantBase();
+  await st.scan({ open: new Map() });
+  assert.equal(st.list()[0].state, 'failed');
+  await st.scan({ open: new Map() });
+  assert.equal(st.list()[0].state, 'following');
+});
