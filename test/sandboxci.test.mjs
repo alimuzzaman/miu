@@ -386,6 +386,7 @@ for (const [name, sb, expected] of [
   ['act exiting 0 without running a job', { stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: 'nothing selected' }]) }, /no job ran/],
   ['a skipped job whose label says it succeeded', { stdout: report([{ label: 'a', status: 'passed', exit_code: 0, output: '[t/a] 🚧  Skipping unsupported platform -- Try running with -P Job succeeded=image' }]) }, /no job ran/],
   ['a step that prints the failure line', { exit: 1, stdout: report([{ label: 'a', status: 'failed', exit_code: 1, output: '[t/a]   | 🏁  Job failed\nError: No such image' }]) }, /No such image/],
+  ['a JavaScript action in a container: job whose image has no node', { exit: 1, stdout: report([{ label: 'a', status: 'failed', exit_code: 1, output: '[t/a]   | OCI runtime exec failed: exec failed: unable to start container process: exec: "node": executable file not found in $PATH\n[t/a]   ❌  Failure - Main Cache Composer\n[t/a] 🏁  Job failed' }]) }, /a: act runs a JavaScript action with the node of the job's container image, which has none/],
   ['a cell that timed out', { exit: 1, stdout: report([{ label: 'a', status: 'failed', error: 'timed out after 900s' }]) }, /timed out/],
   ['a run with no cells', { stdout: report([]) }, /no jobs/i],
   ['a CLI that dies before running anything', { exit: 1, stderr: 'act not found\n' }, /act not found/],
