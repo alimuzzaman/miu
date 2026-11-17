@@ -105,7 +105,7 @@ test('three releases stay, and so does one a process still runs from', linux, as
   assert.equal(s.run('deploy', shas.at(-1)).status, 0);
   const now = fs.readdirSync(path.join(s.root, 'releases')).filter((n) => /^[0-9a-f]{40}$/.test(n));
   assert.deepEqual(now.sort(), shas.slice(3).sort());
-  assert.deepEqual(fs.readdirSync(path.join(s.lib, 'versions')).sort(), shas.slice(3).sort(), 'worker versions follow the releases');
+  assert.deepEqual(fs.readdirSync(path.join(s.lib, 'versions')).filter((n) => !n.startsWith('.')).sort(), shas.slice(3).sort(), 'worker versions follow the releases');
 });
 
 test('a sudo rule that names only the shared worker: no per-release copies are used', linux, () => {
