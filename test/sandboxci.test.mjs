@@ -478,7 +478,9 @@ test('a pull request from the repository that edits .github/workflows/x.yml runs
   assert.equal(workflows.find((w) => w.path === '.github/workflows/x.yml').text, EDITED.trim());
   const started = [];
   const ci = createCi({ dir: fs.mkdtempSync(path.join(tmp, 'line-')), parse: parseWorkflows, prepare: async () => ({ gitDir: p.dir, sha: p.sha, runSha: p.run, trustedSha: p.base, workflows, workflowsFrom: `fix/x@${p.sha.slice(0, 7)}` }), runJob: (c) => { started.push(c.sandbox_ci.job); return new Promise(() => {}); } });
-  ci.ensure('Acme/r', 1, p.sha); await new Promise((r) => setTimeout(r, 200));
+  ci.ensure('Acme/r', 1, p.sha);
+  // The line parses the YAML with python3 first: wait for it, up to 5 s.
+  for (let i = 0; i < 100 && !started.includes('edited'); i++) await new Promise((r) => setTimeout(r, 50));
   assert.ok(started.includes('edited'), JSON.stringify(started));
   // The commit the worker gets carries the edited workflow, and the worker runs that job.
   assert.equal(git(p.dir, 'show', `${p.run}:.github/workflows/x.yml`).stdout, EDITED);
