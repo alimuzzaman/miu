@@ -102,7 +102,7 @@ test('first sign-in enrolls an authenticator; the next one uses it, at a later s
   const again = await signIn(base(dir, hub));
   assert.equal(again.enrolled, false);
   assert.equal(again.cookie.value, 'a2');
-  assert.ok(hub.state.calls.includes('POST /admin/auth/mfa/totp'));
+  assert.ok(hub.state.calls.includes('POST /api/admin/auth/mfa/totp'));
 });
 
 test('a kept authenticator from an earlier stack of the same name is deleted, not used', async () => {
