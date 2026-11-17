@@ -178,39 +178,31 @@ test('a bigger pool allows more runs at once', async () => {
   } finally { held.forEach((h) => h.kill()); }
 });
 
-test('does not start when the server is short of memory or CPU', async () => {
-  for (const [free, why] of [[{ MIU_CI_FREE_MEM_GB: '5', MIU_CI_FREE_CPUS: '8' }, 'memory'], [{ MIU_CI_FREE_MEM_GB: '20', MIU_CI_FREE_CPUS: '0.5' }, 'CPU']]) {
+test('does not start when the server is short of memory: a job needs its 2 GB plus 2 GB left over', async () => {
+  for (const [mem, runs] of [['3.9', false], ['4.0', true], ['8.3', true]]) {
     const sandbox = sandboxHome();
     const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
-    const r = await runSandboxCi(check, repo(), { ...server({ home: sandbox.home }).env, ...free, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots') });
-    assert.match(r.notRun ?? '', /this server is busy/, `short of ${why}`);
-    assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false, `nothing ran when short of ${why}`);
+    const r = await runSandboxCi(check, repo(), { ...server({ home: sandbox.home }).env, MIU_CI_FREE_MEM_GB: mem, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots') });
+    if (runs) assert.equal(r.status, 0, `${mem}: ${JSON.stringify(r)}`);
+    else {
+      assert.match(r.notRun ?? '', /this server is busy \(3\.9 GB memory free; a job needs 4 GB\)/);
+      assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false, 'nothing ran when short of memory');
+    }
   }
 });
 
-// Idle cores come from /proc/stat sampled over a few seconds, not the load
-// average, which a server full of healthchecks keeps above its core count.
-test('one idle core is enough now: 0.9 waits, 1.0 and 1.5 run (the old rule needed 3)', async () => {
-  for (const [cpus, runs] of [['0.9', false], ['1.0', true], ['1.5', true]]) {
-    const sandbox = sandboxHome();
-    const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
-    const r = await runSandboxCi(check, repo(), { ...server({ home: sandbox.home }).env, MIU_CI_FREE_CPUS: cpus, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots') });
-    if (runs) assert.equal(r.status, 0, `${cpus}: ${JSON.stringify(r)}`);
-    else assert.match(r.notRun ?? '', /this server is busy/, cpus);
-  }
-});
-
-test('the CPU check counts idle cores from /proc/stat: none idle waits, idle cores run', async () => {
-  const stat = (name, user, idle) => { const f = path.join(tmp, `${name}-${process.hrtime.bigint()}`); fs.writeFileSync(f, `cpu  ${user} 0 0 ${idle} 0 0 0 0 0 0\ncpu0 1 2 3 4\n`); return f; };
-  for (const [after, busy] of [[stat('b', 1100, 1000), true], [stat('b', 1000, 1100), false]]) {
-    const sandbox = sandboxHome();
-    const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
-    const env = { ...server({ home: sandbox.home }).env, TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots'), MIU_CI_PROC_STAT: `${stat('a', 1000, 1000)}:${after}`, MIU_CI_CPU_SAMPLE_SECONDS: '0' };
-    delete env.MIU_CI_FREE_CPUS;
-    const r = await runSandboxCi(check, repo(), env);
-    if (busy) assert.match(r.notRun ?? '', /this server is busy \(20\.0 GB memory free and 0\.0 CPUs idle\)/);
-    else assert.equal(r.status, 0, JSON.stringify(r));
-  }
+// The server's stacks keep idle cores near 0 all day: CPU never holds a job
+// back; miu-ci.slice's low CPU weight makes CI yield instead.
+test('a server with no idle CPU still runs CI when memory allows, capped at low priority', async () => {
+  const stat = (name, user, idle) => { const f = path.join(tmp, `${name}-${process.hrtime.bigint()}`); fs.writeFileSync(f, `cpu  ${user} 0 0 ${idle} 0 0 0 0 0 0\n`); return f; };
+  const sandbox = sandboxHome();
+  const dir = fs.mkdtempSync(path.join(tmp, 'tmpdir-'));
+  const env = { ...server({ home: sandbox.home }).env, MIU_CI_FREE_MEM_GB: '8.3', MIU_CI_FREE_CPUS: '0', MIU_CI_PROC_STAT: `${stat('a', 1000, 1000)}:${stat('b', 2000, 1000)}`, MIU_CI_CPU_SAMPLE_SECONDS: '0', TMPDIR: dir, MIU_CI_SLOTS_DIR: path.join(dir, 'miu-sandbox-ci-slots') };
+  const r = await runSandboxCi(check, repo(), env);
+  assert.equal(r.status, 0, JSON.stringify(r));
+  const argv = sandbox.read('argv');
+  assert.match(argv, /cgroup-parent=miu-ci\.slice/);
+  assert.match(argv, /cpus=2/);
 });
 
 test('files the tar brings cannot run or read anything on the server', async () => {
