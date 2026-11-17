@@ -550,6 +550,24 @@ for (const [name, job, why] of [
   });
 }
 
+test('another job\'s secrets, and a step act leaves out, do not refuse the job that runs', needsYaml, async () => {
+  // Like xspeed-pro's ci.yml: js's only FREE_REPO_TOKEN is in a step act skips; php and a release job name more.
+  const wf = 'jobs:\n  js:\n    runs-on: ubuntu-latest\n    steps:\n      - if: ${{ !env.ACT }}\n        uses: actions/checkout@v4\n        with: { repository: Acme/free, token: "${{ secrets.FREE_REPO_TOKEN || github.token }}" }\n      - run: id\n  php:\n    runs-on: ubuntu-latest\n    steps: [{ run: id, env: { A: "${{ secrets.FREE_REPO_TOKEN || github.token }}" } }]\n  ship:\n    runs-on: ubuntu-latest\n    steps: [{ run: id, env: { P: "${{ secrets.SVN_PASSWORD }}" } }]\n';
+  const p = await prBranch({ '.github/workflows/test.yml': wf }, { 'code.php': '<?php // changed\n' });
+  const sandbox = sandboxHome({ plan: '{"jobs":[{"id":"js","cells":[{"matrix":{}}]}]}' });
+  const r = await runSandboxCi({ label: 'CI', sandbox_ci: { workflow: '.github/workflows/test.yml', job: 'js' } }, p.dir, server({ home: sandbox.home }).env, { ref: p.run, trustedRef: p.base });
+  assert.equal(r.status, 0, JSON.stringify(r));
+});
+
+test('a secret the base job gives only to a deploy-class action is not one a run step may name', needsYaml, async () => {
+  const job = (step) => `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - ${step}\n`;
+  const p = await prBranch({ '.github/workflows/test.yml': job('uses: 10up/action-wordpress-plugin-asset-update@v2\n        with: { password: "${{ secrets.SVN_PASSWORD }}" }') }, { '.github/workflows/test.yml': job('run: echo "${{ secrets.SVN_PASSWORD }}"') });
+  const sandbox = sandboxHome();
+  const r = await runSandboxCi(check, p.dir, server({ home: sandbox.home }).env, { ref: p.run, trustedRef: p.base });
+  assert.match(r.notRun ?? '', /SVN_PASSWORD/, JSON.stringify(r));
+  assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false);
+});
+
 test('only a job the base branch runs the same way lends a job its reach', async () => {
   const wf = (jobs) => ({ path: '.github/workflows/ci.yml', text: JSON.stringify({ on: 'pull_request', jobs }) });
   const job = { 'runs-on': 'ubuntu-latest', steps: [{ run: 'id' }] };

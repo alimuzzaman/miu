@@ -350,7 +350,7 @@ test('a commit read under older rules is read again', async () => {
   const now = line({ workflows: { '.github/workflows/ci.yml': manualCi }, prCi: [{ workflow: '.github/workflows/ci.yml', jobs: ['js'] }], dir });
   now.ci.ensure('o/r', 1, SHA); await settle();
   assert.equal(now.started.length, 1);
-  assert.equal(now.ci.get('o/r', 1, SHA).rules, 5);
+  assert.equal(now.ci.get('o/r', 1, SHA).rules, 6);
 });
 
 test('the run commit is the pull request\'s own tree, its .github and act\'s files included', async () => {

@@ -24,6 +24,9 @@
 # Prints the JSON report of `sb ci run` on stdout. Nothing on stdin or in the
 # tar is trusted: that account can reach Docker, and Miu's account cannot.
 set -euo pipefail
+# This script and Sandbox read the workflow as UTF-8 whatever locale sudo keeps,
+# so both see the same lines.
+export LC_ALL=C.UTF-8 PYTHONUTF8=1
 
 die() { echo "$*" >&2; exit 2; }
 [ $# -ge 4 ] || die "usage: sandbox-ci <workflow> <event> <timeout-seconds> <job> [matrix-key=value...]"
@@ -224,8 +227,10 @@ for l in ${secret_lines[@]+"${secret_lines[@]}"}; do allowed+=",${l%%=*}"; done
 links=$(find "$root/.github" -type l -print -quit) || die "refused: .github has a folder this account cannot read"
 [ -z "$links" ] || die "refused: a symbolic link under .github"
 bounded 60 python3 -I - "$root/$workflow" "$job" "$allowed" <<'POLICY'
-import json, os, re, shlex, sys
+import json, os, re, resource, shlex, sys
 import yaml
+# The pull request wrote this YAML: aliases that expand without end stop here.
+resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
 
 path = sys.argv[1]
 
@@ -251,7 +256,7 @@ def check(what, c):
 try:
     with open(path, encoding="utf-8") as f:
         doc = yaml.safe_load(f)
-except (yaml.YAMLError, UnicodeDecodeError, RecursionError):
+except (yaml.YAMLError, UnicodeDecodeError, RecursionError, MemoryError):
     refuse("not readable as YAML")
 jobs = doc.get("jobs") if isinstance(doc, dict) else None
 if not isinstance(jobs, dict):
@@ -271,10 +276,22 @@ def kept(job):
     if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
         return job
     return {**job, "steps": [s for s in job["steps"] if not (isinstance(s, dict) and isinstance(s.get("if"), str) and ACT_SKIP.fullmatch(s["if"]))]}
-names = named({**doc, "jobs": {k: kept(v) for k, v in jobs.items()}})
-for job in jobs.values():
-    for step in (kept(job).get("steps") if isinstance(kept(job), dict) and isinstance(kept(job).get("steps"), list) else []):
-        names |= named(step)
+# Sandbox fills only the --job's steps, one by one; the jobs it needs read the
+# same secrets. Deploy-class steps count here too, which only refuses more.
+names, seen, todo = set(), set(), [sys.argv[2]]
+try:
+    while todo:
+        job_id = todo.pop()
+        if job_id in seen or not isinstance(jobs.get(job_id), dict):
+            continue
+        seen.add(job_id)
+        job = kept(jobs[job_id])
+        for step in job.get("steps") if isinstance(job.get("steps"), list) else []:
+            names |= named(step)
+        needs = job.get("needs") or []
+        todo += [needs] if isinstance(needs, str) else [n for n in needs if isinstance(n, str)]
+except (TypeError, ValueError, RecursionError, MemoryError):
+    refuse("cannot read it as data")
 extra = sorted(names - set(filter(None, sys.argv[3].split(","))))
 if extra:
     refuse(f"it names CI secrets its base branch's job does not: {', '.join(extra[:5])}")
