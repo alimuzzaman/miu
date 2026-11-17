@@ -33,12 +33,13 @@ function server() {
   script(path.join(bin, 'systemctl'), `echo "$*" >> "${root}/systemctl.log"\n[ "$1" = show ] && echo 0\nexit 0`);
   script(path.join(bin, 'curl'), 'echo 200');
   script(path.join(bin, 'npm'), 'mkdir -p node_modules');
+  fs.symlinkSync(process.execPath, path.join(bin, 'node'));
   const lib = path.join(root, 'lib');
   fs.mkdirSync(lib);
   fs.writeFileSync(path.join(lib, 'sandbox-user'), 'ubuntu\n');
   const env = {
     ...process.env, PATH: `${bin}:${process.env.PATH}`, MIU_RELEASE_TEST: '1', MIU_APP: path.join(root, 'miu'), MIU_RELEASES: path.join(root, 'releases'),
-    MIU_DATA: path.join(root, 'data'), MIU_LIB: lib, MIU_UNIT_DIR: path.join(root, 'units'), MIU_USER: 'nobody-here', MIU_REPO_URL: src, MIU_NODE_BIN: path.dirname(process.execPath),
+    MIU_DATA: path.join(root, 'data'), MIU_LIB: lib, MIU_UNIT_DIR: path.join(root, 'units'), MIU_USER: 'nobody-here', MIU_REPO_URL: src, MIU_NODE_BIN: bin,
   };
   const run = (...args) => spawnSync('bash', [RELEASE, ...args], { env, encoding: 'utf8' });
   return { root, src, commit, run, env, app: env.MIU_APP, lib };
