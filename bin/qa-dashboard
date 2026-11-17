@@ -1420,7 +1420,8 @@ async function scanCommands() {
       const onDisk = readJson(CMD_FILE)?.replied ?? [];
       if (needsReply({ entry, mode: queueState().mode, replied: [...st.replied, ...onDisk], commentId: c.id })) {
         st.replied = [...new Set([...onDisk, ...st.replied, c.id])].slice(-5000);
-        fs.writeFileSync(CMD_FILE, JSON.stringify({ ...(readJson(CMD_FILE) ?? st), replied: st.replied }, null, 2));
+        // done already holds this comment and since is still the scan's start: a crash after the post neither replies nor queues again.
+        fs.writeFileSync(CMD_FILE, JSON.stringify({ ...st, replied: st.replied }, null, 2));
         const body = waitsReply({ publicUrl: authCfg().publicUrl, marker: project().marker, commentId: c.id, paused: queueState().paused });
         await gh.rest('POST', `repos/${repo}/issues/${pr}/comments`, { body: { body } })
           .then(() => console.log(`replied on ${repo}#${pr}: waits for a manual start`))
