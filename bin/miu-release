@@ -269,7 +269,7 @@ worker() {
     say "The sudo rule ($SUDOERS_CI) names only $LIB/sandbox-ci: every release uses the newest worker. Run install.sh again to give each release its own."
   fi
   # Root's list of the CI secrets each repository may name (install.sh makes it).
-  [ -f "$SECRET_NAMES" ] || say "No $SECRET_NAMES: the worker lets no workflow name a CI secret. Run install.sh again to make it, then list each repository's names (docs/install.md)."
+  { [ -f "$SECRET_NAMES" ] && [ ! -L "$SECRET_NAMES" ] && [ "$(stat -c %u:%g "$SECRET_NAMES" 2>/dev/null)" = 0:0 ]; } || say "No root-owned regular file $SECRET_NAMES: the worker lets no workflow name a CI secret. Run install.sh again to make it, then list each repository's names (docs/install.md)."
   say "CI worker: $LIB/sandbox-ci -> versions/$name"
 }
 
