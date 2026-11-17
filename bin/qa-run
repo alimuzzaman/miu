@@ -612,12 +612,21 @@ const fastLines = new Map((profile.fast_checks ?? []).map((c) => [c.label, `- ${
 const writeFast = (done) => write('fast-checks.md', ['# Fast checks on the PR head', '', done ? '' : '_Still running; read this file again later._', '', ...fastLines.values()].join('\n'));
 const runCmd = (cmd, dir) => new Promise((resolve) => {
   const tmp = checkEnv({ ...envVars, PATH: `${path.dirname(process.execPath)}:${envVars.PATH}`, XSPEED_DIR: freeDirFor(dir, srcs) });
-  const child = spawn('bash', ['-c', cmd], { cwd: dir, env: tmp.env });
-  let out = '';
+  // Its own process group: at the limit the whole check goes (composer's
+  // phpunit too, which no longer stops itself at 300 s), and a process left
+  // holding the output cannot keep the check open.
+  const child = spawn('bash', ['-c', cmd], { cwd: dir, env: tmp.env, detached: true });
+  let out = '', done = false;
+  const finish = (r) => { if (done) return; done = true; clearTimeout(timer); clearTimeout(hard); tmp.done(); resolve(r); };
+  const group = (sig) => { try { process.kill(-child.pid, sig); } catch { /* gone */ } };
   child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { out += d; });
-  const timer = setTimeout(() => child.kill('SIGTERM'), 20 * 60 * 1000);
-  child.on('close', (status) => { clearTimeout(timer); tmp.done(); resolve({ status, out }); });
-  child.on('error', (e) => { clearTimeout(timer); tmp.done(); resolve({ status: -1, out: String(e) }); });
+  let hard = null;
+  const timer = setTimeout(() => {
+    group('SIGTERM');
+    hard = setTimeout(() => { group('SIGKILL'); child.stdout.destroy(); child.stderr.destroy(); finish({ status: 124, out: `${out}\nstopped after 20 minutes` }); }, 10000);
+  }, 20 * 60 * 1000);
+  child.on('close', (status) => finish({ status, out }));
+  child.on('error', (e) => finish({ status: -1, out: String(e) }));
 });
 // A sandbox_ci check runs the PR's own workflow; the server's CI secrets it may
 // name are those the base branch's (the dev checkout's) workflows name.
