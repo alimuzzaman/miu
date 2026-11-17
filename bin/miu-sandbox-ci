@@ -16,6 +16,10 @@
 # server reads with a deploy key (/etc/miu/ci-mirrors), whose copies Miu put in
 # the tar under .miu-ci/mirrors. Git in the job reads each copy for the
 # repository's GitHub URLs. This account never holds a deploy key.
+# Then ` allow=NAME,...`: the server's CI secrets (Sandbox's ci_secrets) the
+# workflow may name besides the NAME=value lines, which are the ones the base
+# branch's same job names. The pull request wrote the workflow; any other name
+# it holds refuses the run.
 #
 # Prints the JSON report of `sb ci run` on stdout. Nothing on stdin or in the
 # tar is trusted: that account can reach Docker, and Miu's account cannot.
@@ -38,9 +42,10 @@ done
 
 # Read before anything else touches stdin. The values stay in this shell.
 IFS= read -r header || die "not run: no secrets header from Miu"
-[[ $header =~ ^miu-ci-secrets\ ([0-9])(\ mirrors=([A-Za-z0-9_.,/-]{1,512}))?$ ]] || die "not run: no secrets header from Miu; update Miu and this worker together"
+[[ $header =~ ^miu-ci-secrets\ ([0-9])(\ mirrors=([A-Za-z0-9_.,/-]{1,512}))?(\ allow=([A-Za-z0-9_,]{1,2048}))?$ ]] || die "not run: no secrets header from Miu; update Miu and this worker together"
 secret_count=${BASH_REMATCH[1]}
 mirror_list=${BASH_REMATCH[3]}
+allow_list=${BASH_REMATCH[5]}
 secret_lines=()
 for ((i = 0; i < secret_count; i++)); do
   IFS= read -r line || die "not run: the secrets header is cut short"
@@ -208,13 +213,18 @@ trap cleanup EXIT
 
 bounded 300 tar -x -C "$root"
 [ -f "$root/$workflow" ] || die "the pull request has no $workflow"
+# Miu reads the workflow too, and stops at less than this.
+[ "$(wc -c < "$root/$workflow")" -le 524288 ] || die "refused: $workflow is over 512 KB"
+# The names Miu gives, and those the base branch's same job uses: nothing else.
+allowed=$allow_list
+for l in ${secret_lines[@]+"${secret_lines[@]}"}; do allowed+=",${l%%=*}"; done
 
 # Miu's account runs pull request code in its fast checks, so it can call this
 # script with any tar. Before act sees the workflow, check what it asks of Docker.
 links=$(find "$root/.github" -type l -print -quit) || die "refused: .github has a folder this account cannot read"
 [ -z "$links" ] || die "refused: a symbolic link under .github"
-bounded 60 python3 -I - "$root/$workflow" "$job" <<'POLICY'
-import os, shlex, sys
+bounded 60 python3 -I - "$root/$workflow" "$job" "$allowed" <<'POLICY'
+import json, os, re, shlex, sys
 import yaml
 
 path = sys.argv[1]
@@ -246,6 +256,21 @@ except (yaml.YAMLError, UnicodeDecodeError, RecursionError):
 jobs = doc.get("jobs") if isinstance(doc, dict) else None
 if not isinstance(jobs, dict):
     refuse("no jobs mapping")
+# Sandbox fills each secrets.X inside ${{ }} of a step from the server's
+# ci_secrets (sandbox/commands/ci.py _secret_refs, over json.dumps of the parsed
+# step). The same patterns, over each step and over the whole file as parsed
+# here, from the bytes act reads: more names than Sandbox fills, never fewer.
+EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+REF = re.compile(r"\bsecrets\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\])")
+def named(value):
+    return {a or b for block in EXPR.findall(json.dumps(value, default=str)) for a, b in REF.findall(block)}
+names = named(doc)
+for job in jobs.values():
+    for step in (job.get("steps") if isinstance(job, dict) and isinstance(job.get("steps"), list) else []):
+        names |= named(step)
+extra = sorted(names - set(filter(None, sys.argv[3].split(","))))
+if extra:
+    refuse(f"it names CI secrets its base branch's job does not: {', '.join(extra[:5])}")
 for job_id, job in jobs.items():
     if not isinstance(job, dict):
         refuse(f"job {job_id} must be a mapping")
@@ -253,6 +278,12 @@ for job_id, job in jobs.items():
     # have rewritten it in the shared workspace.
     if job.get("uses") is not None:
         refuse(f"job {job_id} calls another workflow")
+    # act reads a local action from the workspace on this server when the step
+    # comes, after earlier steps could rewrite it, and builds Docker ones here.
+    for step in (job.get("steps") if isinstance(job.get("steps"), list) else []):
+        uses = step.get("uses") if isinstance(step, dict) else None
+        if isinstance(uses, str) and (uses.startswith(".") or uses.startswith("/") or uses.lower().startswith("docker://")):
+            refuse(f"job {job_id} uses {uses[:60]}: a local or Docker action")
     # A key that is not a string reads differently in the plan and in the run,
     # so the count of runs below would not hold.
     strategy = job.get("strategy")
@@ -321,8 +352,8 @@ quiet_git init -q
 # .miu-ci/mirrors/<owner>/<name>.git. This script runs no git in those copies
 # and reads no key: it checks that they are plain files and folders, and gives
 # the job git config, through its .env, that reads each copy for the
-# repository's GitHub URLs. act gives the job the variables in .env (the base
-# branch's own, which Miu put in the run commit). Config through the
+# repository's GitHub URLs. act gives the job the variables in .env (the pull
+# request's own; it reaches only its own job). Config through the
 # environment adds to the job's own instead of replacing it.
 if [ -n "$mirror_list" ]; then
   # Not part of the pull request: never committed, out of git status in the job.
@@ -349,7 +380,7 @@ if [ -n "$mirror_list" ]; then
   done
   if [ -e "$root/.env" ] && [ ! -r "$root/.env" ]; then die "refused: .env is not readable"; fi
   if [ -f "$root/.env" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?GIT_CONFIG_(COUNT|KEY_|VALUE_|PARAMETERS)' "$root/.env"; then
-    die "refused: the base branch's .env sets GIT_CONFIG_COUNT, _KEY_ or _VALUE_ variables, which Miu needs for a deploy-key repository"
+    die "refused: the pull request's .env sets GIT_CONFIG_COUNT, _KEY_ or _VALUE_ variables, which Miu needs for a deploy-key repository"
   fi
   # First in .env: act reads a quoted value across lines, and an open quote
   # can only take in what comes after it.

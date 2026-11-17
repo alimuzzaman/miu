@@ -510,6 +510,59 @@ for (const [name, job, why] of [
   });
 }
 
+// What could hide a secret name from a check on the raw file: YAML escapes,
+// export-subst in the pull request's .gitattributes, a file too big to read.
+// Sandbox is never called with a name outside the base job's.
+{
+  const step = (run) => `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ${run}\n`;
+  const attempt = async (pr) => {
+    const p = await prBranch({ '.github/workflows/test.yml': OK }, pr);
+    const sandbox = sandboxHome();
+    const r = await runSandboxCi(check, p.dir, server({ home: sandbox.home }).env, { ref: p.run, trustedRef: p.base });
+    return { r, called: fs.existsSync(path.join(sandbox.home, 'argv')) };
+  };
+  test('a secret name hidden behind a YAML escape is still found', needsYaml, async () => {
+    for (const run of ['"echo ${{ secrets.\\x41WS_KEY }}"', '"echo ${{ secrets[\'\\u0041WS_KEY\'] }}"']) {
+      const { r, called } = await attempt({ '.github/workflows/test.yml': step(run) });
+      assert.match(r.notRun ?? '', /AWS_KEY/, `${run}: ${JSON.stringify(r)}`);
+      assert.equal(called, false);
+    }
+  });
+  test('a secret name that export-subst writes into the archive is refused by the worker', needsYaml, async () => {
+    const { r, called } = await attempt({ '.gitattributes': '.github/workflows/*.yml export-subst\n', '.github/workflows/test.yml': step('"echo ${{ $Format:secrets%x2eAWS_KEY$ }}"') });
+    assert.match(r.notRun ?? '', /refused: test\.yml: it names CI secrets its base branch's job does not: AWS_KEY/, JSON.stringify(r));
+    assert.equal(called, false);
+  });
+  test('a workflow too big to read is not run', needsYaml, async () => {
+    const pad = (n) => `# ${'x'.repeat(n)}\n`;
+    const big = await attempt({ '.github/workflows/test.yml': pad(5 * 1024 * 1024) + step('id') });
+    assert.match(big.r.notRun ?? '', /could not read \.github\/workflows\/test\.yml/, JSON.stringify(big.r));
+    const mid = await attempt({ '.github/workflows/test.yml': pad(600 * 1024) + step('id') });
+    assert.match(mid.r.notRun ?? '', /over 512 KB/, JSON.stringify(mid.r));
+    assert.equal(big.called || mid.called, false);
+  });
+  test('a local or Docker action in the pull request\'s workflow is refused', needsYaml, async () => {
+    for (const uses of ['./.github/actions/x', 'docker://alpine:3']) {
+      const { r, called } = await attempt({ '.github/workflows/test.yml': `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ${uses}\n` });
+      assert.match(r.notRun ?? '', /a local or Docker action/, `${uses}: ${JSON.stringify(r)}`);
+      assert.equal(called, false);
+    }
+  });
+}
+
+test('only a job the base branch runs the same way lends a job its reach', async () => {
+  const wf = (jobs) => ({ path: '.github/workflows/ci.yml', text: JSON.stringify({ on: 'pull_request', jobs }) });
+  const job = { 'runs-on': 'ubuntu-latest', steps: [{ run: 'id' }] };
+  const got = [];
+  const ci = createCi({
+    dir: fs.mkdtempSync(path.join(tmp, 'line-')), parse: (files) => files.map((f) => ({ path: f.path, doc: JSON.parse(f.text) })),
+    prepare: async () => ({ gitDir: '/bare', sha: 'a'.repeat(40), runSha: 'b'.repeat(40), trustedSha: 'c'.repeat(40), workflows: [wf({ test: job, release: job })], baseWorkflows: [wf({ test: job }), { path: '.github/workflows/release.yml', text: JSON.stringify({ on: { push: { tags: ['*'] } }, jobs: { release: job } }) }] }),
+    runJob: (c, d, s, o) => { got.push([c.sandbox_ci.job, o.trustedRef]); return new Promise(() => {}); },
+  });
+  ci.ensure('o/r', 1, 'a'.repeat(40)); await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(Object.fromEntries(got), { test: 'c'.repeat(40), release: null });
+});
+
 test('a pull request\'s workflow may name only the CI secrets its base branch\'s workflows name', needsYaml, async () => {
   const uses = (expr) => `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id, env: { X: "${expr}" } }]\n`;
   const base = { '.github/workflows/test.yml': uses('${{ secrets.SLACK_WEBHOOK }}') };
@@ -521,7 +574,7 @@ test('a pull request\'s workflow may name only the CI secrets its base branch\'s
     return { r, called: fs.existsSync(path.join(sandbox.home, 'argv')), minted: app.calls.mint.length };
   };
   const fresh = await runWith(uses("${{ secrets['DEPLOY_KEY'] }}"));
-  assert.match(fresh.r.notRun ?? '', /names a secret \(DEPLOY_KEY\) that no workflow on the base branch names/, JSON.stringify(fresh.r));
+  assert.match(fresh.r.notRun ?? '', /names a secret \(DEPLOY_KEY\) that job a on the base branch does not/, JSON.stringify(fresh.r));
   assert.equal(fresh.called, false);
   assert.equal(fresh.minted, 0, 'no token is made for a run that does not start');
   assert.equal((await runWith(uses('${{ secrets.SLACK_WEBHOOK }}'))).r.status, 0, 'a secret the base branch uses');
@@ -659,7 +712,7 @@ test('a fast check reads nothing from the pull request to grant: only its own re
   // A workflow on the branch the pull request targets is the pull request's too.
   const app = fakeApp();
   const r = await runSandboxCi(proCheck, proRepo().dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
-  assert.match(r.notRun, /^no access to Acme\/free, Acme\/pro, Acme\/tools, Acme\/hub, Acme\/licensing: a fast check gets only the repositories in the profile's sandbox_ci.repos$/);
+  assert.match(r.notRun, /^no access to Acme\/free, Acme\/pro, Acme\/tools, Acme\/hub, Acme\/licensing: a job its base branch does not run the same way gets only the repositories in the profile's repos$/);
   assert.deepEqual(app.calls.mint, []);
   const listed = { label: 'CI', sandbox_ci: { ...proCheck.sandbox_ci, repos: ['Acme/pro', 'Acme/free', 'Acme/tools', 'Acme/hub', 'Acme/licensing'] } };
   const ok = await runSandboxCi(listed, proRepo().dir, server({ home: sandboxHome({ plan: '{"jobs":[{"id":"php","cells":[{"matrix":{}}]}]}' }).home }).env, { repo: 'Acme/pro', mint: app.mint, revoke: app.revoke });
@@ -782,8 +835,6 @@ test('the sibling ships at the ref its checkout asks for; an expression picks th
     [at('${{ steps.freeref.outputs.ref }}'), 'feat/x', [], 'refs/heads/main'],
     [at('${{ steps.freeref.outputs.ref }}'), '--upload-pack=x', ['refs/heads/x'], 'refs/heads/main'],
     [at('release/2.1'), 'feat/x', ['refs/heads/release/2.1'], 'refs/heads/release/2.1'],
-    [at('v3.7.2'), 'feat/x', ['refs/tags/v3.7.2'], 'refs/tags/v3.7.2'],
-    [at('0123456789abcdef0123456789abcdef01234567'), 'feat/x', [], '0123456789abcdef0123456789abcdef01234567'],
     [at(undefined), 'feat/x', [], 'HEAD'],
   ];
   for (const [docs, head, has, want] of cases) {
@@ -794,7 +845,11 @@ test('the sibling ships at the ref its checkout asks for; an expression picks th
     assert.deepEqual(r.extra.map((x) => x.path), ['free']);
   }
   const none = async (args) => (args[0] === 'ls-remote' ? '' : '');
-  await assert.rejects(shipSibling({ git: none, siblingRepo: 'Acme/free', headRef: 'dev', docs: at('release/9'), auth: null }), /no branch or tag release\/9/);
+  await assert.rejects(shipSibling({ git: none, siblingRepo: 'Acme/free', headRef: 'dev', docs: at('release/9'), auth: null }), /no branch release\/9/);
+  // The pull request writes the checkout: a tag or a commit is not shipped, only a branch.
+  const tags = async (args) => (args[0] === 'ls-remote' ? (args.includes('refs/tags/v3.7.2') ? 'abc\trefs/tags/v3.7.2' : '') : '');
+  await assert.rejects(shipSibling({ git: tags, siblingRepo: 'Acme/free', headRef: 'dev', docs: at('v3.7.2'), auth: null }), /no branch v3\.7\.2; Miu ships a sibling's branch, not a tag or a commit/);
+  await assert.rejects(shipSibling({ git: none, siblingRepo: 'Acme/free', headRef: 'dev', docs: at('0123456789abcdef0123456789abcdef01234567'), auth: null }), /not a tag or a commit/);
   const two = [{ jobs: { a: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: 'free', ref: 'a' } }] }, b: { steps: [{ uses: 'actions/checkout@v4', with: { repository: 'Acme/free', path: 'free', ref: 'b' } }] } } }];
   await assert.rejects(shipSibling({ git: none, siblingRepo: 'Acme/free', headRef: 'dev', docs: two, auth: null }), /at different refs: workflow 1 job (a|b) asks for (a|b), workflow 1 job (a|b) for (a|b)/);
   assert.equal(await shipSibling({ git: none, siblingRepo: 'Acme/other', headRef: 'dev', docs: at('main'), auth: null }), null);

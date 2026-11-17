@@ -613,13 +613,14 @@ async function prepareNow(repo, pr, sha) {
   const tip = await gitAsync(['-C', bare, 'rev-parse', '--verify', `${ref(trusted)}^{commit}`]);
   const workflowsFrom = `${p.headRefName ?? `pull request #${pr}`}@${sha.slice(0, 7)}`;
   const workflows = await workflowsAt((args) => gitAsync(['-C', bare, ...args]), sha);
+  const baseWorkflows = await workflowsAt((args) => gitAsync(['-C', bare, ...args]), tip);
   // Without the sibling the run would use whatever the pull request has at that path: tried again later instead.
   const sibling = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw Object.assign(new Error(e.lasting ? e.message : `could not fetch the sibling repository's source: ${e.message}`), { lasting: e.lasting }); });
   const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, `Miu CI: ${sha.slice(0, 12)}${sibling ? ` with ${sibling.from} beside it` : ''}`, sibling?.extra ?? []);
   // Kept under a ref so a gc of the clone does not take it while it waits.
   const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
   await gitAsync(['-C', bare, 'update-ref', runRef, runSha]);
-  return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, workflowsFrom, siblingFrom: sibling?.from ?? null, base, changed };
+  return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, baseWorkflows, workflowsFrom, siblingFrom: sibling?.from ?? null, base, changed };
 }
 // The profile's sibling (Free beside Pro), shipped in the run commit (lib/ci.mjs shipSibling).
 // Only the jobs this run runs count (runningJobs): a release workflow's own
