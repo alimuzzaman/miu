@@ -88,6 +88,7 @@ test('no stack coming: a refused plan or a missing follow ends the wait at once'
 test('the staff console is signed in to only when the pull request touches it (the Hub caps staff links at 5 an hour)', async () => {
   assert.deepEqual(signInsFor({ hub: true, admin: false }), { admin: false, app: true });
   assert.deepEqual(signInsFor({ admin: true }), { admin: true, app: true });
+  assert.deepEqual(signInsFor({ hub: true }), { admin: true, app: true }, 'a profile with no admin area always signs in to the console');
   const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubstack-'));
   const run = async (args) => {
     if (args[0] === 'status') return status(args[1] === 'pr-hub-base' ? { hub: 'd' } : { hub: 'h1' });
@@ -100,7 +101,7 @@ test('the staff console is signed in to only when the pull request touches it (t
     if (i > -1) fs.writeFileSync(args[i + 1], '{}', { mode: 0o600 });
     return { code: 0, out: JSON.stringify({ ok: true, enrolled: false }) };
   };
-  const { hubs, infra } = await prepareHubStacks({ run, signin, selfRole: 'hub', pr: 7, sha: 'h1', runDir, runsDir: runDir, need: signInsFor({ hub: true }), ...clock() });
+  const { hubs, infra } = await prepareHubStacks({ run, signin, selfRole: 'hub', pr: 7, sha: 'h1', runDir, runsDir: runDir, need: signInsFor({ hub: true, admin: false }), ...clock() });
   assert.deepEqual(infra, []);
   assert.equal(signed.length, 2);
   assert.ok(signed.every((a) => !a.includes('--admin-out') && a.includes('--app-out')), 'no staff link is asked for');

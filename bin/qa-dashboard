@@ -36,7 +36,7 @@ import * as auth from '../lib/auth.mjs';
 import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed } from '../lib/queuectl.mjs';
 import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem, forkOf, workflowsAt } from '../lib/ci.mjs';
 import { runSandboxCi, adoptSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
@@ -826,17 +826,20 @@ async function pump() {
   else ciFor(next.repo, next.pr);
 }
 
-// Take a pull request out of the line. One Miu lined up by itself stays out
-// at this commit (its head joins the baseline), or the next scan would put it back.
+// Take a pull request out of the line. One Miu or a label lined up stays out
+// at this commit (lib/queuectl.mjs dismissal), or the next scan would put it back.
 function unqueue(repo, pr) {
   const i = queue.findIndex((q) => q.repo === repo && q.pr === pr);
   if (i < 0) return;
   const [q] = queue.splice(i, 1);
   saveQueue();
   const head = prCache.list.find((p) => p.repo === repo && p.number === pr)?.headRefOid;
-  if (q.by === 'auto' && head) {
+  const d = dismissal(q, head);
+  if (d) {
     const c = readJson(CONFIG_FILE) ?? {};
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...c, baseline: { ...(c.baseline ?? {}), [`${repo}#${pr}`]: head } }, null, 2));
+    const key = `${repo}#${pr}`;
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...c, baseline: { ...(c.baseline ?? {}), [key]: d.baseline },
+      ...(d.label ? { labelDismissed: { ...(c.labelDismissed ?? {}), [key]: d.label } } : {}) }, null, 2));
   }
 }
 
@@ -951,6 +954,8 @@ async function autoScan() {
         // this commit is enough: a new commit, or a person, asks again.
         const empty = (runs.get(`${p.repo}#${p.number}`) ?? []).filter((r) => r.sha === p.headRefOid && ['no_result', 'inconclusive'].includes(r.verdict)).length;
         if (empty >= 2) continue;
+        // A person took it out of the line at this commit (unqueue).
+        if (labelDismissed(cfg, `${p.repo}#${p.number}`, p.headRefOid)) continue;
         if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${p.labels.find((l) => asks.includes(l))}`, 'github');
         continue;
       }

@@ -174,7 +174,8 @@ if [ "$AGENT_USER_ON" = 1 ]; then
   # default entry gives new slots and files the same.
   install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$DATA/.cache/wt"
   setfacl -m "u:$AGENT_USER:--x" "$DATA/.cache"
-  setfacl -R -m "u:$AGENT_USER:rX,d:u:$AGENT_USER:rX" "$DATA/.cache/wt"
+  setfacl -R -m "u:$AGENT_USER:rX,d:u:$AGENT_USER:rX" "$DATA/.cache/wt" \
+    || say "Some checkout files changed during the ACL update; the default entry covers new ones"
 fi
 
 say "Installing Chromium"

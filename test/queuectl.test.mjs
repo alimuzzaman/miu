@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed } from '../lib/queuectl.mjs';
 
 const auto = { mode: 'auto', paused: false };
 const manual = { mode: 'manual', paused: false };
@@ -38,4 +38,15 @@ test('pick puts the chosen pull requests first, in order, as a person\'s, and re
   assert.ok(front.every((q) => q.by === 'person' && q.held === false && q.full === true));
   assert.equal(line[2].at, 5);
   assert.equal(nextIndex(line, manual), 0);
+});
+
+test('a person removing a waiting entry keeps it out at this commit: Miu\'s own and a label\'s', () => {
+  assert.deepEqual(dismissal({ by: 'auto' }, 'h1'), { baseline: 'h1' });
+  assert.deepEqual(dismissal({ by: 'github' }, 'h1'), { baseline: 'h1', label: 'h1' }, 'the label stays on the PR, so the label scan must skip it');
+  assert.equal(dismissal({ by: 'person' }, 'h1'), null);
+  assert.equal(dismissal({ by: 'github' }, undefined), null);
+  const cfg = { labelDismissed: { 'a/b#2': 'h1' } };
+  assert.equal(labelDismissed(cfg, 'a/b#2', 'h1'), true);
+  assert.equal(labelDismissed(cfg, 'a/b#2', 'h2'), false, 'a new commit asks again');
+  assert.equal(labelDismissed({}, 'a/b#2', 'h1'), false);
 });
