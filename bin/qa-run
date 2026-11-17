@@ -35,7 +35,7 @@ import { findPartners, roleOf, keyOf } from '../lib/pairs.mjs';
 import { startStub } from '../lib/stub-renderer.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
 import { fetchRef, checkoutSlot, checkoutCheckSlot, checkSiblings, freeDirFor, ensureDeps, checkEnv, CACHE } from '../lib/worktrees.mjs';
-import { runSandboxCi, changesCiDefinition } from '../lib/sandboxci.mjs';
+import { runSandboxCi } from '../lib/sandboxci.mjs';
 import { ensureSites, mount, reset, setConstants, writeGuardHosts, GUARD } from '../lib/warmsites.mjs';
 import { project, projectText, profileOf, roles, mainFile } from '../lib/project.mjs';
 
@@ -619,7 +619,9 @@ const runCmd = (cmd, dir) => new Promise((resolve) => {
   child.on('close', (status) => { clearTimeout(timer); tmp.done(); resolve({ status, out }); });
   child.on('error', (e) => { clearTimeout(timer); tmp.done(); resolve({ status: -1, out: String(e) }); });
 });
-const runCheck = (c, dir) => (c.sandbox_ci ? runSandboxCi(c, dir, envVars, { repo }) : runCmd(c.cmd, dir));
+// A sandbox_ci check runs the PR's own workflow; the server's CI secrets it may
+// name are those the base branch's (the dev checkout's) workflows name.
+const runCheck = (c, dir) => (c.sandbox_ci ? runSandboxCi(c, dir, envVars, { repo, secretsFrom: slotInfo[devLabel]?.sha ?? null }) : runCmd(c.cmd, dir));
 const secs = (t0) => `${Math.round((Date.now() - t0) / 1000)}s`;
 async function runFastChecks() {
   writeFast(false);
@@ -629,7 +631,6 @@ async function runFastChecks() {
     if (mode !== 'full' || !touches(c.when)) { fastLines.set(c.label, `- ${c.label}: not run (diff does not touch it)`); continue; }
     // Like GitHub: a fork's or Dependabot's pull request gets none of the server's CI secrets, so its workflow does not run here.
     if (c.sandbox_ci && (String(prData.headRepo ?? '').toLowerCase() !== repo.toLowerCase() || prData.author?.login === 'dependabot[bot]')) { fastLines.set(c.label, `- ${c.label}: not run (a pull request from a fork or from Dependabot does not get the server's CI secrets)`); continue; }
-    if (c.sandbox_ci && changesCiDefinition(files)) { fastLines.set(c.label, `- ${c.label}: not run (this PR changes the CI definition, and a PR must not choose what runs on the server)`); continue; }
     log(`check ${c.label}: running`);
     fastLines.set(c.label, `- ${c.label}: running`); writeFast(false);
     const t0 = Date.now();

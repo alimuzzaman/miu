@@ -5,8 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runSandboxCi, sandboxCiProblem, changesCiDefinition, reposNeeded, manifestRepos, deployKeyRepos, lockWithoutDists, sweepMirrorCopies } from '../lib/sandboxci.mjs';
-import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling, runningJobs } from '../lib/ci.mjs';
+import { runSandboxCi, sandboxCiProblem, reposNeeded, manifestRepos, deployKeyRepos, lockWithoutDists, sweepMirrorCopies } from '../lib/sandboxci.mjs';
+import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling, runningJobs, forkOf, workflowsAt, createCi, parseWorkflows } from '../lib/ci.mjs';
 
 const WORKER = fileURLToPath(new URL('../bin/miu-sandbox-ci', import.meta.url));
 const MIRROR = fileURLToPath(new URL('../bin/miu-ci-mirror', import.meta.url));
@@ -452,11 +452,82 @@ test('profile validation names what is wrong', () => {
   ]) assert.match(sandboxCiProblem(bad), new RegExp(field), JSON.stringify(bad));
 });
 
-test('a pull request cannot choose what the server runs', () => {
-  assert.equal(changesCiDefinition(['src/a.php', '.github/workflows/test.yml']), true);
-  assert.equal(changesCiDefinition(['.github/actions/setup/action.yml']), true);
-  assert.equal(changesCiDefinition(['.actrc']), true);
-  assert.equal(changesCiDefinition(['src/a.php', 'docs/.github-notes.md']), false);
+// ---- A pull request's own CI: it picks its jobs, not what holds them in.
+// A base commit, then the pull request's commit on top with `pr` written over
+// it, and the run commit Miu sends (ciRunCommit).
+async function prBranch(baseFiles, pr) {
+  const dir = repo(baseFiles);
+  const base = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+  for (const [name, text] of Object.entries(pr)) { fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true }); fs.writeFileSync(path.join(dir, name), text); }
+  git(dir, 'add', '-A'); git(dir, 'commit', '-qm', 'pr');
+  const sha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+  const g = (args, env, input) => Promise.resolve(spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8', input, env: { ...process.env, ...(env ?? {}) } }).stdout.trim());
+  return { dir, base, sha, g, run: await ciRunCommit(g, sha, 'm') };
+}
+const EDITED = 'on: pull_request\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id }]\n  edited:\n    runs-on: ubuntu-latest\n    steps: [{ run: echo edited by the pull request }]\n';
+
+test('a pull request from the repository that edits .github/workflows/x.yml runs its own edited job', needsYaml, async () => {
+  const p = await prBranch({ '.github/workflows/x.yml': `on: pull_request\n${OK}` }, { '.github/workflows/x.yml': EDITED });
+  assert.equal(forkOf({ headRepo: 'Acme/r', author: { login: 'dev' } }, 'acme/r'), null);
+  // The line reads the pull request's workflows and queues its new job.
+  const workflows = await workflowsAt(p.g, p.sha);
+  assert.deepEqual(workflows, [{ path: '.github/workflows/x.yml', text: EDITED.trim() }]);
+  const started = [];
+  const ci = createCi({ dir: fs.mkdtempSync(path.join(tmp, 'line-')), parse: parseWorkflows, prepare: async () => ({ gitDir: p.dir, sha: p.sha, runSha: p.run, trustedSha: p.base, workflows, workflowsFrom: `fix/x@${p.sha.slice(0, 7)}` }), runJob: (c) => { started.push(c.sandbox_ci.job); return new Promise(() => {}); } });
+  ci.ensure('Acme/r', 1, p.sha); await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(started.sort(), ['a', 'edited']);
+  // The commit the worker gets carries the edited workflow, and the worker runs that job.
+  assert.equal(git(p.dir, 'show', `${p.run}:.github/workflows/x.yml`).stdout, EDITED);
+  const sandbox = sandboxHome();
+  const r = await runSandboxCi({ label: 'CI', sandbox_ci: { workflow: '.github/workflows/x.yml', job: 'edited' } }, p.dir, server({ home: sandbox.home }).env, { ref: p.run, trustedRef: p.base });
+  assert.equal(r.status, 0, JSON.stringify(r));
+  const argv = sandbox.read('argv').split('\n');
+  assert.equal(argv[argv.indexOf('--job') + 1], 'edited');
+  assert.ok(argv.includes('--as-runner'));
+});
+
+test('a fork or Dependabot that edits the workflow the same way still gets no CI here', async () => {
+  assert.equal(forkOf({ headRepo: 'someone/r', author: { login: 'someone' } }, 'acme/r'), true);
+  assert.equal(forkOf({ headRepo: null }, 'acme/r'), true, 'an unknown head repository is a fork');
+  assert.equal(forkOf({ headRepo: 'acme/r', author: { login: 'dependabot[bot]' } }, 'acme/r'), 'dependabot');
+  const p = await prBranch({ '.github/workflows/x.yml': `on: pull_request\n${OK}` }, { '.github/workflows/x.yml': EDITED });
+  const ci = createCi({ dir: fs.mkdtempSync(path.join(tmp, 'line-')), parse: parseWorkflows, prepare: async () => ({ fork: forkOf({ headRepo: 'someone/r' }, 'acme/r') }), runJob: () => { throw new Error('ran'); } });
+  ci.ensure('acme/r', 1, p.sha); await new Promise((r) => setTimeout(r, 50));
+  assert.equal(ci.get('acme/r', 1, p.sha).state, 'not_run');
+  assert.match(ci.get('acme/r', 1, p.sha).reason, /fork/);
+});
+
+for (const [name, job, why] of [
+  ['a --privileged service', '    services:\n      db:\n        image: x\n        options: --privileged\n', /--privileged/],
+  ['the Docker socket as a volume', '    container:\n      image: x\n      volumes: ["/var/run/docker.sock:/var/run/docker.sock"]\n', /volumes/],
+]) {
+  test(`a pull request's own workflow with ${name} is still refused by the worker`, needsYaml, async () => {
+    const p = await prBranch({ '.github/workflows/test.yml': OK }, { '.github/workflows/test.yml': `jobs:\n  a:\n    runs-on: ubuntu-latest\n${job}    steps: [{ run: id }]\n` });
+    const sandbox = sandboxHome();
+    const r = await runSandboxCi(check, p.dir, server({ home: sandbox.home }).env, { ref: p.run, trustedRef: p.base });
+    assert.match(r.notRun ?? '', why, JSON.stringify(r));
+    assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false, 'Sandbox was not called');
+  });
+}
+
+test('a pull request\'s workflow may name only the CI secrets its base branch\'s workflows name', needsYaml, async () => {
+  const uses = (expr) => `jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id, env: { X: "${expr}" } }]\n`;
+  const base = { '.github/workflows/test.yml': uses('${{ secrets.SLACK_WEBHOOK }}') };
+  const runWith = async (wf, opts = {}) => {
+    const p = await prBranch(base, { '.github/workflows/test.yml': wf });
+    const app = fakeApp();
+    const sandbox = sandboxHome();
+    const r = await runSandboxCi(check, p.dir, server({ home: sandbox.home }).env, { ref: p.run, trustedRef: p.base, repo: 'acme/r', mint: app.mint, revoke: app.revoke, ...opts });
+    return { r, called: fs.existsSync(path.join(sandbox.home, 'argv')), minted: app.calls.mint.length };
+  };
+  const fresh = await runWith(uses("${{ secrets['DEPLOY_KEY'] }}"));
+  assert.match(fresh.r.notRun ?? '', /names a secret \(DEPLOY_KEY\) that no workflow on the base branch names/, JSON.stringify(fresh.r));
+  assert.equal(fresh.called, false);
+  assert.equal(fresh.minted, 0, 'no token is made for a run that does not start');
+  assert.equal((await runWith(uses('${{ secrets.SLACK_WEBHOOK }}'))).r.status, 0, 'a secret the base branch uses');
+  assert.equal((await runWith(uses('${{ secrets.MY_TOKEN || github.token }}'))).r.status, 0, 'a name Miu fills with its own token');
+  // Without a base branch to read (a QA run with no dev checkout): none.
+  assert.match((await runWith(uses('${{ secrets.SLACK_WEBHOOK }}'), { trustedRef: null, secretsFrom: null })).r.notRun ?? '', /SLACK_WEBHOOK/);
 });
 
 test('ref sends that commit from a bare clone, and every job\'s output comes back as the log', async () => {
@@ -661,7 +732,7 @@ test('the sibling is shipped where the trusted workflow checks it out, in place 
   fs.writeFileSync(path.join(dir, 'free.php'), '<?php\n'); git(dir, 'add', 'free.php'); git(dir, 'commit', '-qm', 'free');
   const tree = git(dir, 'rev-parse', 'HEAD^{tree}').stdout.trim();
   const run = (args, env, input) => Promise.resolve(spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8', input, env: { ...process.env, ...(env ?? {}) } }).stdout.trim());
-  const out = await ciRunCommit(run, sha, sha, 'm', [{ path: 'xspeed-free', tree }]);
+  const out = await ciRunCommit(run, sha, 'm', [{ path: 'xspeed-free', tree }]);
   const files = git(dir, 'ls-tree', '-r', '--name-only', out).stdout.trim().split('\n');
   assert.ok(files.includes('xspeed-free/free.php'));
   assert.ok(!files.includes('xspeed-free/planted.php'));

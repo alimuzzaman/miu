@@ -63,14 +63,14 @@ test('reads YAML, with `on` kept as a key', { skip: hasYaml ? false : 'needs pyt
 });
 
 // A CI line with stand-ins: workflows come as JSON, jobs finish when the test says.
-function line({ workflows = {}, changesCi = false, parallel = 2, paused = { v: false }, covered = [], prCi, runSha, changed, dir = fs.mkdtempSync(path.join(tmp, 'ci-')) } = {}) {
+function line({ workflows = {}, parallel = 2, paused = { v: false }, covered = [], prCi, runSha, changed, dir = fs.mkdtempSync(path.join(tmp, 'ci-')) } = {}) {
   const clock = { t: 1000 };
   const started = [];
   const ci = createCi({
     dir, parallel: () => parallel, isPaused: () => paused.v, now: () => clock.t, coveredBy: () => covered, prCiFor: () => prCi,
     scrub: (t) => String(t).replace(/s3cret/g, '[secret removed]'),
     parse: (files) => files.map((f) => ({ path: f.path, doc: JSON.parse(f.text) })),
-    prepare: async () => ({ gitDir: '/bare', runSha, workflowsFrom: 'dev@1234567', base: 'dev', changed, workflows: Object.entries(workflows).map(([p, d]) => ({ path: p, text: JSON.stringify(d) })), changesCi }),
+    prepare: async () => ({ gitDir: '/bare', runSha, workflowsFrom: 'dev@1234567', base: 'dev', changed, workflows: Object.entries(workflows).map(([p, d]) => ({ path: p, text: JSON.stringify(d) })) }),
     runJob: (check, gitDir, sha, { onStart }) => new Promise((resolve) => { onStart(999999999); started.push({ check, gitDir, sha, resolve }); }),
   });
   return { ci, clock, started, dir, paused };
@@ -135,15 +135,10 @@ test('paused: nothing new starts; resuming takes the line as it was', async () =
   assert.equal(l.started.length, 3);
 });
 
-test('no workflows: "none"; a pull request that edits .github: not run; a fast check already covers a job', async () => {
+test('no workflows: "none"; a fast check already covers a job', async () => {
   const a = line({});
   a.ci.ensure('o/r', 1, SHA); await settle();
   assert.equal(a.ci.get('o/r', 1, SHA).state, 'none');
-  const b = line({ workflows: three, changesCi: true });
-  b.ci.ensure('o/r', 1, SHA); await settle();
-  assert.equal(b.ci.get('o/r', 1, SHA).state, 'not_run');
-  assert.match(b.ci.get('o/r', 1, SHA).reason, /\.github/);
-  assert.equal(b.started.length, 0);
   const c = line({ workflows: three, covered: [{ label: 'Unit', sandbox_ci: { workflow: '.github/workflows/ci.yml', job: 'b' } }] });
   c.ci.ensure('o/r', 1, SHA); await settle();
   const jb = c.ci.view(c.ci.get('o/r', 1, SHA)).jobs[1];
@@ -358,7 +353,7 @@ test('a commit read under older rules is read again', async () => {
   assert.equal(now.ci.get('o/r', 1, SHA).rules, 4);
 });
 
-test('the run commit is the pull request\'s files with the trusted branch\'s .github and .actrc', async () => {
+test('the run commit is the pull request\'s own tree, its .github and act\'s files included', async () => {
   const repo = fs.mkdtempSync(path.join(tmp, 'git-'));
   const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
   const g = (...a) => { const r = spawnSync('git', ['-C', repo, ...a], { encoding: 'utf8', env }); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
@@ -366,7 +361,6 @@ test('the run commit is the pull request\'s files with the trusted branch\'s .gi
   g('init', '-q', '-b', 'dev');
   put('.github/workflows/ci.yml', 'trusted'); put('.actrc', '-P x'); put('src/a.php', 'old');
   g('add', '-A'); g('commit', '-qm', 'base');
-  const trusted = g('rev-parse', 'HEAD');
   g('checkout', '-qb', 'pr');
   put('.github/workflows/ci.yml', 'evil'); put('.github/workflows/extra.yml', 'evil'); fs.rmSync(path.join(repo, '.actrc')); put('src/a.php', 'new'); put('b space.txt', 'x');
   put('.input', 'jobs=js'); put('.vars', 'X=1'); put('.secrets', 'S=1'); put('.env', 'E=1'); put('.gitattributes', '.github/** export-ignore');
@@ -376,21 +370,15 @@ test('the run commit is the pull request\'s files with the trusted branch\'s .gi
     const r = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', input, env: { ...process.env, ...(e ?? {}) } });
     r.status ? reject(new Error(r.stderr)) : resolve(r.stdout.trim());
   });
-  const run = await ciRunCommit(git, sha, trusted, 'm');
-  assert.equal(await ciRunCommit(git, sha, trusted, 'm'), run, 'the same commit each time');
-  assert.equal(g('show', `${run}:.github/workflows/ci.yml`), 'trusted');
-  assert.equal(g('show', `${run}:.actrc`), '-P x');
+  const run = await ciRunCommit(git, sha, 'm');
+  assert.equal(await ciRunCommit(git, sha, 'm'), run, 'the same commit each time');
+  assert.equal(g('rev-parse', `${run}^{tree}`), g('rev-parse', `${sha}^{tree}`), 'nothing of the base branch is put over it');
+  assert.equal(g('show', `${run}:.github/workflows/ci.yml`), 'evil');
+  assert.equal(g('ls-tree', '--name-only', `${run}:.github/workflows`), 'ci.yml\nextra.yml');
   assert.equal(g('show', `${run}:src/a.php`), 'new');
-  assert.equal(g('show', `${run}:b space.txt`), 'x');
-  assert.equal(g('ls-tree', '--name-only', `${run}:.github/workflows`), 'ci.yml');
   assert.equal(g('rev-parse', `${run}^`), sha);
-  assert.equal(g('ls-tree', '--name-only', run).split('\n').filter((f) => f.startsWith('.')).join(' '), '.actrc .github', 'the pull request\'s .input, .vars, .secrets, .env and .gitattributes are not in it');
-});
-
-test('a pull request that changes what act reads is not run', async () => {
-  const { changesCiDefinition } = await import('../lib/sandboxci.mjs');
-  for (const f of ['.input', '.vars', '.secrets', '.env', '.actrc', '.github/workflows/ci.yml']) assert.equal(changesCiDefinition(['src/a.php', f]), true, f);
-  assert.equal(changesCiDefinition(['src/.env', 'tests/.input', '.gitattributes']), false, '.gitattributes is swapped, not refused');
+  // The worker drops .actrc and links among these; plain files are the pull request's own values.
+  assert.equal(g('ls-tree', '--name-only', run).split('\n').filter((f) => f.startsWith('.')).join(' '), '.env .gitattributes .github .input .secrets .vars');
 });
 
 test('a record lined up under older rules starts nothing after a restart, and is read again when asked', async () => {

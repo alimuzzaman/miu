@@ -37,8 +37,8 @@ import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, 
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { modeOf, holdReason, nextIndex, pick } from '../lib/queuectl.mjs';
-import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem } from '../lib/ci.mjs';
-import { runSandboxCi, changesCiDefinition, sweepMirrorCopies } from '../lib/sandboxci.mjs';
+import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem, forkOf, workflowsAt } from '../lib/ci.mjs';
+import { runSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -571,13 +571,15 @@ const gitAsync = (args, env, input) => new Promise((resolve, reject) => {
 });
 // The commit, its workflow files and what it changed, from the bare clone runs
 // use (lib/worktrees.mjs), under refs of CI's own so a run's fetch is not in
-// the way. The workflows are those of the branch the profile names (not the
-// pull request's, and not the base the pull request chose): a pull request
-// must not choose what runs on the server. A pull request whose own changes
-// touch .github/, .actrc, .env, .vars, .input, .secrets or .gitattributes is
-// not run at all. What the worker gets is a commit of Miu's own: the pull
-// request's files with that branch's copies of those. One repo's prepares go
-// one at a time (they share refs).
+// the way. The workflows are the pull request's own, as on GitHub: a pull
+// request from this repository may change its CI and have it run. What it
+// cannot change is what holds every job in (bin/miu-sandbox-ci: the workflow
+// policy, no Docker socket, runner uid, caps) or what the job may reach: the
+// token's repositories and the server's CI secrets come from the tip of the
+// branch the profile names (trustedSha), never from the pull request. Forks
+// and Dependabot are not run. What the worker gets is a commit of Miu's own:
+// the pull request's tree with the profile's sibling shipped in it. One
+// repo's prepares go one at a time (they share refs).
 const prepChains = new Map();
 const ciPrepare = (repo, pr, sha) => {
   const next = (prepChains.get(repo) ?? Promise.resolve()).catch(() => {}).then(() => prepareNow(repo, pr, sha));
@@ -588,9 +590,8 @@ async function prepareNow(repo, pr, sha) {
   const p = prCache.list.find((x) => x.repo === repo && x.number === pr);
   // Whose branch it is comes from the open pull request list; without it, try again later.
   if (!p) throw new Error('it is not in the open pull request list yet');
-  if (String(p.headRepo ?? '').toLowerCase() !== repo.toLowerCase()) return { fork: true };
-  // GitHub gives Dependabot's pull requests none of the usual secrets either: a new dependency's install scripts run in them.
-  if (p.author?.login === 'dependabot[bot]') return { fork: 'dependabot' };
+  const fork = forkOf(p, repo);
+  if (fork) return { fork };
   const auth = await gh.gitAuthEnv(repo).catch(() => null);
   const fallback = await gh.gitAuthEnv(repo, { fallback: true }).catch(() => null);
   const bare = ensureRepo(repo, auth, fallback);
@@ -609,19 +610,16 @@ async function prepareNow(repo, pr, sha) {
   // What the pull request itself changes, from where it left its base.
   const changed = (await gitAsync(['-C', bare, 'diff', '--no-renames', '--name-only', `${ref(base)}...${sha}`])
     .catch((e) => { throw new Error(`could not tell what the pull request changes: ${e.message}`); })).split('\n').filter(Boolean);
-  if (changesCiDefinition(changed)) return { gitDir: bare, sha, workflows: [], changesCi: true, trustedBase: trusted };
   const tip = await gitAsync(['-C', bare, 'rev-parse', '--verify', `${ref(trusted)}^{commit}`]);
-  const workflowsFrom = `${trusted}@${tip.slice(0, 7)}`;
-  const names = (await gitAsync(['-C', bare, 'ls-tree', '--name-only', tip, '.github/workflows/']).catch(() => '')).split('\n').filter((f) => /^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(f)).slice(0, 50);
-  const workflows = [];
-  for (const f of names) workflows.push({ path: f, text: (await gitAsync(['-C', bare, 'show', `${tip}:${f}`])).slice(0, 512 * 1024) });
+  const workflowsFrom = `${p.headRefName ?? `pull request #${pr}`}@${sha.slice(0, 7)}`;
+  const workflows = await workflowsAt((args) => gitAsync(['-C', bare, ...args]), sha);
   // Without the sibling the run would use whatever the pull request has at that path: tried again later instead.
   const sibling = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw Object.assign(new Error(e.lasting ? e.message : `could not fetch the sibling repository's source: ${e.message}`), { lasting: e.lasting }); });
-  const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, tip, `Miu CI: ${sha.slice(0, 12)} with the workflows of ${workflowsFrom}${sibling ? `, ${sibling.from} beside it` : ''}`, sibling?.extra ?? []);
+  const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, `Miu CI: ${sha.slice(0, 12)}${sibling ? ` with ${sibling.from} beside it` : ''}`, sibling?.extra ?? []);
   // Kept under a ref so a gc of the clone does not take it while it waits.
   const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
   await gitAsync(['-C', bare, 'update-ref', runRef, runSha]);
-  return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, workflowsFrom, siblingFrom: sibling?.from ?? null, changesCi: false, base, changed };
+  return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, workflowsFrom, siblingFrom: sibling?.from ?? null, base, changed };
 }
 // The profile's sibling (Free beside Pro), shipped in the run commit (lib/ci.mjs shipSibling).
 // Only the jobs this run runs count (runningJobs): a release workflow's own
