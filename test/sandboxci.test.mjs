@@ -478,7 +478,7 @@ test('a pull request from the repository that edits .github/workflows/x.yml runs
   assert.ok(started.includes('edited'), JSON.stringify(started));
   // The commit the worker gets carries the edited workflow, and the worker runs that job.
   assert.equal(git(p.dir, 'show', `${p.run}:.github/workflows/x.yml`).stdout, EDITED);
-  const sandbox = sandboxHome();
+  const sandbox = sandboxHome({ plan: '{"jobs":[{"id":"edited","cells":[{"matrix":{}}]}]}' });
   const r = await runSandboxCi({ label: 'CI', sandbox_ci: { workflow: '.github/workflows/x.yml', job: 'edited' } }, p.dir, server({ home: sandbox.home }).env, { ref: p.run, trustedRef: p.base });
   assert.equal(r.status, 0, JSON.stringify(r));
   const argv = sandbox.read('argv').split('\n');
