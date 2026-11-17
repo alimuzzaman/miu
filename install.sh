@@ -292,10 +292,6 @@ if [ -n "$SANDBOX_USER" ]; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-yaml >/dev/null
   install -d -m 0755 "$LIB"
   echo "$SANDBOX_USER" > "$LIB/sandbox-user"
-  # The current release's worker, ci-mirror and GitHub's SSH host key (for
-  # repositories CI reads with a deploy key, /etc/miu/ci-mirrors), in
-  # $LIB/versions/<commit>, behind $LIB/sandbox-ci and $LIB/ci-mirror.
-  "$LIB/miu-release" worker
   # CI job containers go here (bin/miu-sandbox-ci passes --cgroup-parent), capped
   # together; stop them all with: systemctl stop miu-ci.slice
   cat > /etc/systemd/system/miu-ci.slice <<SLICE
@@ -315,6 +311,11 @@ $MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/sandbox-ci, $LIB/versions/*/sandbox
 EOF
   visudo -cqf /etc/sudoers.d/miu-sandbox-ci.tmp || die "the Sandbox CI sudoers rule did not validate"
   chmod 0440 /etc/sudoers.d/miu-sandbox-ci.tmp && mv /etc/sudoers.d/miu-sandbox-ci.tmp /etc/sudoers.d/miu-sandbox-ci
+  # After the rule, which decides whether each release calls its own copy.
+  # The current release's worker, ci-mirror and GitHub's SSH host key (for
+  # repositories CI reads with a deploy key, /etc/miu/ci-mirrors), in
+  # $LIB/versions/<commit>, behind $LIB/sandbox-ci and $LIB/ci-mirror.
+  "$LIB/miu-release" worker
   setenv MIU_SANDBOX_USER "$SANDBOX_USER"
   setenv MIU_SANDBOX_WORKER "$LIB/sandbox-ci"
   # Repositories CI reads with a deploy key ($ETC/ci-mirrors: repository, key
