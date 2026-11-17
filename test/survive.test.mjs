@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { adoptSandboxCi } from '../lib/sandboxci.mjs';
+import { adoptSandboxCi, ownWorker } from '../lib/sandboxci.mjs';
 import { createCi } from '../lib/ci.mjs';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-survive-'));
@@ -83,6 +83,19 @@ test('a taken-up job still keeps its time limit: its group is stopped', { timeou
   assert.match(r.notRun, /time limit/);
   await new Promise((res) => (p.exitCode !== null || p.signalCode ? res() : p.on('exit', res)));
   assert.equal(p.signalCode, 'SIGTERM');
+  await new Promise((res) => setTimeout(res, 200));
+  assert.ok(!fs.existsSync(`${spool}.out`), 'the raw output goes after a time limit too');
+});
+
+test('a release runs its own copy of the worker when one is installed', () => {
+  const lib = fs.mkdtempSync(path.join(tmp, 'lib-'));
+  const sha = 'd'.repeat(40);
+  const worker = path.join(lib, 'sandbox-ci');
+  assert.equal(ownWorker(worker, sha), worker, 'none installed: the shared one');
+  fs.mkdirSync(path.join(lib, 'versions', sha), { recursive: true });
+  fs.writeFileSync(path.join(lib, 'versions', sha, 'sandbox-ci'), '');
+  assert.equal(ownWorker(worker, sha), path.join(lib, 'versions', sha, 'sandbox-ci'));
+  assert.equal(ownWorker(worker, ''), worker, 'a checkout with no REVISION');
 });
 
 const settle = () => new Promise((r) => setTimeout(r, 30));

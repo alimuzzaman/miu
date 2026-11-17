@@ -63,7 +63,7 @@ test('first deploy: the old folder becomes a release, its data moves out, and ev
   assert.ok(fs.existsSync(path.join(s.app, 'runs/run-1/verdict.json')), '/srv/miu/runs is the same folder');
   assert.ok(fs.statSync(path.join(s.root, 'data/runs')).isDirectory() && !fs.lstatSync(path.join(s.root, 'data/runs')).isSymbolicLink());
   assert.equal(fs.readFileSync(path.join(s.app, 'REVISION'), 'utf8').trim(), two);
-  assert.match(fs.readFileSync(path.join(s.root, 'units/miu.service.d/20-miu-release.conf'), 'utf8'), /MIU_RUNS=.*\/miu\/runs/);
+  assert.match(fs.readFileSync(path.join(s.root, 'units/miu.service.d/20-miu-release.conf'), 'utf8'), /MIU_RUNS=.*\/data\/runs\n/);
   assert.equal(fs.readlinkSync(path.join(s.lib, 'sandbox-ci')), `versions/${two}/sandbox-ci`);
   assert.match(spawnSync(path.join(s.lib, 'sandbox-ci'), { encoding: 'utf8' }).stdout, /worker two/);
   assert.match(fs.readFileSync(path.join(s.root, 'systemctl.log'), 'utf8'), /stop miu\.service[\s\S]*restart miu\.service/);

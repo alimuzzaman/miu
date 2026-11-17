@@ -85,7 +85,7 @@ ensure_repo() {
 resolve() {
   local want=$1
   [[ $want =~ ^[A-Za-z0-9._/-]+$ && $want != -* ]] || die "not a commit, branch or tag: $want"
-  if [[ $want =~ ^[0-9a-f]{40}$ ]] && git -C "$REPO" cat-file -e "$want^{commit}" 2>/dev/null; then echo "$want"; return; fi
+  if [[ $want =~ ^[0-9a-f]{7,40}$ ]] && git -C "$REPO" rev-parse -q --verify "$want^{commit}" 2>/dev/null; then return; fi
   git -C "$REPO" fetch -q --no-tags origin "+$want:refs/miu-release/want" || die "could not fetch $want"
   git -C "$REPO" rev-parse --verify -q "refs/miu-release/want^{commit}" || die "$want is not a commit"
 }
@@ -147,7 +147,10 @@ build() {
   printf '%s\n' "$LINKCHECK" > "$tmp/.miu-linkcheck.mjs"
   local entries=() e
   for e in bin/qa-dashboard bin/qa-run bin/qa-fix bin/miu-queue; do [ -f "$tmp/$e" ] && entries+=("$e"); done
-  (cd "$tmp" && timeout 120 node --experimental-vm-modules --no-warnings .miu-linkcheck.mjs "${entries[@]}" >&2) || die "${sha:0:7}: a module or import is missing"
+  # As Miu's account, not root: it loads each package to read its exports.
+  local as=()
+  [ -n "${MIU_RELEASE_TEST:-}" ] || ! id "$MIU_USER" >/dev/null 2>&1 || as=(runuser -u "$MIU_USER" -- env HOME=/nonexistent)
+  (cd "$tmp" && timeout 120 "${as[@]}" node --experimental-vm-modules --no-warnings .miu-linkcheck.mjs "${entries[@]}" >&2) || die "${sha:0:7}: a module or import is missing"
   rm -f "$tmp/.miu-linkcheck.mjs"
   for e in "${SHARED[@]}"; do rm -rf "${tmp:?}/$e"; ln -s "$DATA/$e" "$tmp/$e"; done
   [ -n "${MIU_RELEASE_TEST:-}" ] || chown -R root:root "$tmp"
@@ -168,47 +171,68 @@ users_of() {
   } | sed 's#^/proc/##' | sort -u
 }
 
+# This process and the ones that started it (an installer run from inside
+# /srv/miu): not runs.
+self_and_parents() {
+  local p=$$
+  while [ "${p:-0}" -gt 1 ]; do echo "$p"; p=$(awk '/^PPid:/ { print $2 }' "/proc/$p/status" 2>/dev/null || echo 0); done
+}
+runs_from() { users_of "$1" | grep -vxF -f <(self_and_parents; echo "${2:-0}") || true; }
+
 # The data folders out of a /srv/miu that is still a folder, the first time.
+# Every check comes before the service stops; once it has, any failure
+# starts it again on the old folder.
 convert() {
   [ -e "$APP" ] && [ ! -L "$APP" ] || return 0
   [ -d "$APP" ] || die "$APP is neither a folder nor a symlink"
   say "First deploy: moving runs/, .cache/ and .agent-codex/ to $DATA"
-  local busy main
-  main=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || echo 0)
-  busy=$(users_of "$APP" | grep -vx "${main:-0}" | grep -vx "$$" || true)
-  [ -z "$busy" ] || [ -n "${MIU_CONVERT_FORCE:-}" ] || die "processes still run from $APP (pids: $(echo $busy)); the first deploy needs it idle: try again when no run is going"
+  local busy main old name e
   install -d -m 0755 "$DATA"
-  [ "$(stat -c %d "$APP")" = "$(stat -c %d "$DATA")" ] || die "$DATA is on another file system than $APP; the move would copy"
-  local old name e
+  for e in "$DATA" "$RELEASES"; do
+    [ "$(stat -c %d "$APP")" = "$(stat -c %d "$e")" ] || die "$e is on another file system than $APP; the move would copy"
+  done
+  for e in "${SHARED[@]}"; do
+    if [ -e "$APP/$e" ] && [ ! -L "$APP/$e" ] && [ -e "$DATA/$e" ]; then die "$DATA/$e is there already and so is $APP/$e; move one by hand"; fi
+  done
+  main=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || echo 0)
+  busy=$(runs_from "$APP" "$main")
+  [ -z "$busy" ] || [ -n "${MIU_CONVERT_FORCE:-}" ] || die "processes still run from $APP (pids: $(echo $busy)); the first deploy needs it idle: try again when no run is going"
   old=$(git -C "$APP" rev-parse HEAD 2>/dev/null || true)
   name=${old:-legacy-$(date -u +%Y%m%dT%H%M%SZ)}
   [ ! -e "$RELEASES/$name" ] || name=$name-legacy-$(date -u +%Y%m%dT%H%M%SZ)
   systemctl stop "$SERVICE" 2>/dev/null || true
+  # A run the queue started just before the stop (the unit leaves it going).
+  busy=$(runs_from "$APP")
+  if [ -n "$busy" ] && [ -z "${MIU_CONVERT_FORCE:-}" ]; then
+    systemctl start "$SERVICE" 2>/dev/null || true
+    die "a run started from $APP (pids: $(echo $busy)); started $SERVICE again; try again when no run is going"
+  fi
+  trap 'echo "miu-release: the move stopped half way; $APP: $(readlink "$APP" 2>/dev/null || echo "a folder or missing"); history: $HISTORY" >&2; [ -e "$APP" ] || [ ! -d "$RELEASES/'"$name"'" ] || ln -sfn "$RELEASES/'"$name"'" "$APP"; systemctl start "$SERVICE" 2>/dev/null || true' ERR
+  record "$name"
   for e in "${SHARED[@]}"; do
-    if [ -e "$APP/$e" ] && [ ! -L "$APP/$e" ]; then
-      [ ! -e "$DATA/$e" ] || die "$DATA/$e is there already and so is $APP/$e; move one by hand"
-      mv -T "$APP/$e" "$DATA/$e"
-    fi
+    if [ -e "$APP/$e" ] && [ ! -L "$APP/$e" ]; then mv -T "$APP/$e" "$DATA/$e"; fi
     rm -f "$APP/$e"; ln -s "$DATA/$e" "$APP/$e"
   done
   touch "$APP/.miu-release-ok"
   mv -T "$APP" "$RELEASES/$name"
   flip "$APP" "$RELEASES/$name"
-  record "$name"
+  trap - ERR
   CONVERTED=1
   say "Kept the old folder as release $name, for rollback"
 }
 
-# The unit keeps naming /srv/miu; the dashboard keeps runs and the cache by
-# that name, which every release resolves to the same folders.
+# The dashboard keeps runs and the cache by their real folders, the same in
+# every release: a path through the /srv/miu symlink would differ from the
+# working folder a process sees (the fix agent's edit rule compares them).
+# /srv/miu/runs still names them, for paths saved before.
 unit_dropin() {
   local d=$UNIT_DIR/${SERVICE}.d
   install -d -m 0755 "$d"
   cat > "$d/20-miu-release.conf.tmp" <<EOF
 # Written by bin/miu-release: data by paths that outlive a release.
 [Service]
-Environment=MIU_RUNS=$APP/runs
-Environment=QA_CACHE_DIR=$APP/.cache
+Environment=MIU_RUNS=$DATA/runs
+Environment=QA_CACHE_DIR=$DATA/.cache
 EOF
   if ! cmp -s "$d/20-miu-release.conf.tmp" "$d/20-miu-release.conf"; then mv "$d/20-miu-release.conf.tmp" "$d/20-miu-release.conf"; systemctl daemon-reload; else rm -f "$d/20-miu-release.conf.tmp"; fi
 }
@@ -267,16 +291,19 @@ go_to() {
   local name=$1 before restart_it=$2
   before=$(current)
   flip "$APP" "$RELEASES/$name"
-  record "$name"
   worker "$name"
-  # The first deploy stopped the service to move the data: it starts again either way.
-  [ "$restart_it" = 1 ] || [ "$CONVERTED" = 1 ] || { say "Switched $APP to $name; not restarted"; return 0; }
+  if [ "$restart_it" != 1 ]; then
+    record "$name"
+    if [ "$CONVERTED" = 1 ]; then say "Switched $APP to $name; $SERVICE stays stopped until it is started"; else say "Switched $APP to $name; not restarted"; fi
+    return 0
+  fi
   say "Restarting $SERVICE on $name"
-  if restart; then say "$SERVICE answers on $name"; return 0; fi
+  # Only a release that came up goes in the history, so rollback and the
+  # releases kept never count one that did not.
+  if restart; then record "$name"; say "$SERVICE answers on $name"; return 0; fi
   [ -n "$before" ] && [ "$before" != "$name" ] || die "$SERVICE did not come up on $name; see: journalctl -u $SERVICE -n 50"
   say "$SERVICE did not come up on $name; switching back to $before"
   flip "$APP" "$RELEASES/$before"
-  record "$before"
   worker "$before"
   restart || die "$SERVICE did not come up on $before either; see: journalctl -u $SERVICE -n 50"
   die "$name did not start; back on $before"

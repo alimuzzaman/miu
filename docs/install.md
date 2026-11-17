@@ -31,7 +31,7 @@ Read [install.sh](../install.sh) before you run it. It changes the server as roo
 | rexenv, headless | The `rexenv` apt package, plus `rexenv-headless.service` running as `miu`. Its edge listens on `127.0.0.1:8180` and `127.0.0.1:8543`, so ports 80 and 443 stay free. |
 | Node, `claude`, `codex`, Chromium | `/opt/miu`, owned by root. Neither account can change them. |
 | Miu | `/srv/miu-releases/<commit>`, one folder per deployed commit, owned by root. `/srv/miu` is a symlink to the current one. It runs as the `miu.service` unit on `127.0.0.1:4747`. |
-| Miu's data | `/srv/miu-data`: `runs/`, `.cache/` and `.agent-codex/`, owned by `miu`. Each release links them, so `/srv/miu/runs` is the same folder in every release. |
+| Miu's data | `/srv/miu-data`: `runs/`, `.cache/` and `.agent-codex/`, owned by `miu`. Miu names them by these paths (`MIU_RUNS`, `QA_CACHE_DIR`). Each release links them too, so `/srv/miu/runs` still finds them. |
 | Profiles | `/etc/miu/profiles` |
 | Settings and sign-ins | `/home/miu/.config/miu`. Tokens are stored in `keys.enc.json`, encrypted with AES-256-GCM. |
 | Secrets key | `/etc/credstore.encrypted/miu-secrets-key`, sealed with the machine's own key. systemd decrypts it for `miu.service` only. |
@@ -98,12 +98,12 @@ Run the installer again. It fetches Miu, reinstalls the dependencies and the CLI
 To deploy only Miu itself, use `bin/miu-release`, which the installer puts in `/usr/local/lib/miu`:
 
 ```sh
-sudo /usr/local/lib/miu/miu-release deploy main      # or a commit, or a branch
+sudo /usr/local/lib/miu/miu-release deploy main      # or a branch, a tag or a full commit sha
 sudo /usr/local/lib/miu/miu-release rollback         # back to the release before
 sudo /usr/local/lib/miu/miu-release status
 ```
 
-A deploy builds the commit in a folder of its own first: its files, `npm ci`, and a check that every module and import the dashboard, a run, a fix and `miu-queue` load is there. A commit that fails the build or the check never goes live. Then it switches `/srv/miu` to the new folder with one rename, switches the CI worker the same way (`/usr/local/lib/miu/sandbox-ci` is a symlink into `/usr/local/lib/miu/versions/<commit>`), and restarts `miu.service`. If the dashboard does not answer within 30 seconds, it switches back and restarts the old release.
+A deploy builds the commit in a folder of its own first: its files, `npm ci`, and a check that every module and import the dashboard, a run, a fix and `miu-queue` load is there. A commit that fails the build or the check never goes live. Then it switches `/srv/miu` to the new folder with one rename, installs the release's CI worker in `/usr/local/lib/miu/versions/<commit>`, and restarts `miu.service`. Each release calls its own copy of the worker, so a run keeps the worker it started with; `/usr/local/lib/miu/sandbox-ci` is a symlink to the newest one. The sudo rule names both paths. If the dashboard does not answer within 30 seconds, it switches back and restarts the old release.
 
 You do not need to wait for tests to finish before you deploy:
 
@@ -114,7 +114,7 @@ You do not need to wait for tests to finish before you deploy:
 
 The last 3 releases are kept, and so is any release a process still runs from. Changes to the unit, the sudo rules or the system packages still need the installer.
 
-The first deploy on a server installed before releases existed stops the service and moves `runs/`, `.cache/` and `.agent-codex/` from the old `/srv/miu` folder to `/srv/miu-data`. It keeps that folder as a release, so `rollback` goes back to it. This one deploy refuses to run while a test is going.
+The first deploy on a server installed before releases existed stops the service and moves `runs/`, `.cache/` and `.agent-codex/` from the old `/srv/miu` folder to `/srv/miu-data`. It keeps that folder as a release, so `rollback` goes back to it. This one deploy refuses to run while a test is going, and with `--no-restart` (as the installer runs it) it leaves the service stopped until the installer starts it.
 
 ## Checking it works
 

@@ -158,7 +158,7 @@ git -C "$RELEASES/repo.git" remote remove origin 2>/dev/null || true
 git -C "$RELEASES/repo.git" remote add origin "$MIU_REPO"
 git -C "$RELEASES/repo.git" fetch -q --no-tags origin "+$MIU_REF:refs/miu-release/install"
 MIU_SHA=$(git -C "$RELEASES/repo.git" rev-parse --verify "refs/miu-release/install^{commit}")
-git -C "$RELEASES/repo.git" show "$MIU_SHA:bin/miu-release" > "$LIB/.miu-release.new"
+git -C "$RELEASES/repo.git" show "$MIU_SHA:bin/miu-release" > "$LIB/.miu-release.new" 2>/dev/null || die "$MIU_REF has no bin/miu-release: this installer needs a Miu with side-by-side releases"
 install -o root -g root -m 0755 "$LIB/.miu-release.new" "$LIB/miu-release" && rm -f "$LIB/.miu-release.new"
 # It also writes miu.service.d/20-miu-release.conf: MIU_RUNS and QA_CACHE_DIR
 # name the data through /srv/miu, the same folders in every release.
@@ -211,7 +211,7 @@ EOF
 #!/bin/bash
 # qasite for the agent account, run as $MIU_USER: reset or log in to a QA site.
 case "\${1:-}:\${2:-}" in reset:pr|reset:dev|reset:fix|login:pr|login:dev|login:fix|info:) ;; *) echo "usage: qasite reset|login pr|dev|fix, or qasite info" >&2; exit 2 ;; esac
-export HOME=$MIU_HOME USER=$MIU_USER XDG_RUNTIME_DIR=/run/user/$MIU_UID PATH=$OPT/node/bin:/usr/bin:/bin QA_CACHE_DIR=$APP/.cache MIU_PROFILES=$ETC/profiles
+export HOME=$MIU_HOME USER=$MIU_USER XDG_RUNTIME_DIR=/run/user/$MIU_UID PATH=$OPT/node/bin:/usr/bin:/bin QA_CACHE_DIR=$DATA/.cache MIU_PROFILES=$ETC/profiles
 cd $APP && exec node lib/warmsites.mjs "\$@"
 EOF
   printf '#!/bin/bash\nexec sudo -n -u %s %s/rex-mcp\n' "$MIU_USER" "$LIB" > "$LIB/rex-as-qa"
@@ -274,7 +274,7 @@ if [ "$AGENT_USER_ON" = 1 ]; then
   setenv MIU_AGENT_CLAUDE "$OPT/node/bin/claude"
   setenv MIU_AGENT_CODEX "$OPT/node/bin/codex"
   setenv MIU_AGENT_BASE_PATH "$OPT/agent-bin:$OPT/node/bin:/usr/local/bin:/usr/bin:/bin"
-  setenv MIU_AGENT_CODEX_DIR "$APP/.agent-codex"
+  setenv MIU_AGENT_CODEX_DIR "$DATA/.agent-codex"
 fi
 if [ -n "$DOMAIN" ]; then
   setenv MIU_PUBLIC_URL "https://$DOMAIN"
@@ -310,7 +310,8 @@ SLICE
   systemctl daemon-reload
   cat > /etc/sudoers.d/miu-sandbox-ci.tmp <<EOF
 # $MIU_USER may hand a pull request's files to Sandbox CI as $SANDBOX_USER, nothing else.
-$MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/sandbox-ci
+# Each release runs its own copy (bin/miu-release: $LIB/versions/<commit>, root's).
+$MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/sandbox-ci, $LIB/versions/*/sandbox-ci
 EOF
   visudo -cqf /etc/sudoers.d/miu-sandbox-ci.tmp || die "the Sandbox CI sudoers rule did not validate"
   chmod 0440 /etc/sudoers.d/miu-sandbox-ci.tmp && mv /etc/sudoers.d/miu-sandbox-ci.tmp /etc/sudoers.d/miu-sandbox-ci
@@ -388,7 +389,7 @@ systemctl restart miu.service
 # wait while rexenv downloads MySQL and PHP; a second try finishes what a slow
 # first one left.
 say "Preparing the QA sites (the first time takes a few minutes)"
-prep() { (cd "$APP" && as_miu env HOME="$MIU_HOME" QA_CACHE_DIR="$APP/.cache" MIU_PROFILES="$ETC/profiles" timeout 1500 \
+prep() { (cd "$APP" && as_miu env HOME="$MIU_HOME" QA_CACHE_DIR="$DATA/.cache" MIU_PROFILES="$ETC/profiles" timeout 1500 \
   node --input-type=module -e 'await (await import("./lib/warmsites.mjs")).ensureSites(() => {}, ["pr", "dev"]);') >/tmp/miu-sites.log 2>&1; }
 prep || prep || say "The QA sites are not ready yet (see /tmp/miu-sites.log); the first test makes them."
 
