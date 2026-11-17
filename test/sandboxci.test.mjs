@@ -96,6 +96,9 @@ test('the worker runs the commit on this server and never asks for deploy steps'
   assert.ok(!argv.includes('--remote'));
   assert.ok(!argv.includes('--allow-deploy'));
   assert.ok(argv.includes('--as-runner'), 'jobs run as runner, as on GitHub, not as root');
+  // Only the artifact differences are accepted: a local run collects none.
+  const accepted = argv.flatMap((a, i) => (a === '--accept-difference' ? [argv[i + 1]] : []));
+  assert.deepEqual(accepted, ['sandbox.artifact-pattern-unsupported', 'sandbox.artifact-runner-temp-unsupported', 'sandbox.artifact-missing-semantics', 'sandbox.artifact-options-unsupported']);
   assert.equal(argv[argv.indexOf('--job') + 1], 'a');
   assert.equal(argv[argv.indexOf('--runtime') + 1], 'none');
   assert.equal(sandbox.read('files'), '.github/workflows/test.yml\ncode.php');
@@ -388,6 +391,7 @@ for (const [name, sb, expected] of [
   ['a CLI that dies before running anything', { exit: 1, stderr: 'act not found\n' }, /act not found/],
   ['output that is not a report', { exit: 1, stdout: 'Traceback\n' }, /no result/i],
   ['a workflow the runner refuses', { exit: 1, stdout: JSON.stringify({ ok: false, code: 'ci_preflight_blocked', preflight: { blocking: [{ id: 'artifact-paths' }] } }) + '\n' }, /artifact-paths/],
+  ['a workflow the runner refuses, by id as Sandbox lists them', { exit: 1, stdout: JSON.stringify({ ok: false, code: 'ci_preflight_blocked', preflight: { blocking: ['act.oidc-unavailable', 'sandbox.artifact-x'] } }) + '\n' }, /Sandbox refused this workflow: act\.oidc-unavailable, sandbox\.artifact-x$/],
 ]) {
   test(`not run, not failed: ${name}`, async () => {
     const r = await runSandboxCi(check, repo(), fakeWorker(sb).env);

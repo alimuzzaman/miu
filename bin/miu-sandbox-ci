@@ -442,10 +442,18 @@ if len(cells) != 1:
 # GitHub does, not as root; a Sandbox without it refuses the run.
 # The secrets go to Sandbox on a pipe (printf is a shell builtin, so they are
 # in no process's arguments). A Sandbox too old for --secrets-stdin refuses.
+# A local run replaces upload-artifact with a no-op and collects nothing, and
+# Miu keeps no artifacts, so the differences Sandbox names for artifacts it
+# could not collect the way GitHub does are accepted; every other difference
+# still refuses the run.
+artifact_differences=()
+for d in pattern-unsupported runner-temp-unsupported missing-semantics options-unsupported; do
+  artifact_differences+=(--accept-difference "sandbox.artifact-$d")
+done
 run_ci() {
   bounded "$((seconds + 60))" "$sb" ci run "$root/$workflow" --local --project-dir "$root" --json \
     --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"} \
-    --as-runner --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice "$@"
+    "${artifact_differences[@]}" --as-runner --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice "$@"
 }
 if [ ${#secret_lines[@]} -gt 0 ]; then
   printf '%s\n' "${secret_lines[@]}" | run_ci --secrets-stdin

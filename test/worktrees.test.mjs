@@ -149,6 +149,8 @@ test('each fast check gets its own private, empty temp folder outside the run fo
   try {
     assert.notEqual(a.env.TMPDIR, b.env.TMPDIR);
     assert.equal(a.env.TMP, a.env.TMPDIR); assert.equal(a.env.TEMP, a.env.TMPDIR); assert.equal(a.env.PATH, '/bin');
+    // Composer's own 300 s script limit would cut a full test suite short; the check's limit holds.
+    assert.equal(a.env.COMPOSER_PROCESS_TIMEOUT, '0');
     assert.deepEqual(fs.readdirSync(a.env.TMPDIR), []);
     // Nobody else's: the agent account may write the run folder, never this one.
     assert.equal(fs.statSync(a.env.TMPDIR).mode & 0o777, 0o700);
