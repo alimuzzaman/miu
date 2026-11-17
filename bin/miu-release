@@ -252,12 +252,15 @@ worker() {
   install -d -m 0755 "$LIB/versions" "$LIB/versions/$name"
   install "${OWN[@]}" -m 0755 "$src/bin/miu-sandbox-ci" "$LIB/versions/$name/sandbox-ci"
   [ ! -f "$src/bin/miu-ci-mirror" ] || install "${OWN[@]}" -m 0755 "$src/bin/miu-ci-mirror" "$LIB/versions/$name/ci-mirror"
+  [ ! -f "$src/bin/miu-pr-stack" ] || install "${OWN[@]}" -m 0755 "$src/bin/miu-pr-stack" "$LIB/versions/$name/pr-stack"
   if [ -f "$src/lib/github-known-hosts" ]; then
     install "${OWN[@]}" -m 0644 "$src/lib/github-known-hosts" "$LIB/.github-known-hosts.new"
     mv -f "$LIB/.github-known-hosts.new" "$LIB/github-known-hosts"
   fi
   flip "$LIB/sandbox-ci" "versions/$name/sandbox-ci"
   [ ! -f "$LIB/versions/$name/ci-mirror" ] || flip "$LIB/ci-mirror" "versions/$name/ci-mirror"
+  # A release without the PR-stack helper leaves the installed one as it is.
+  [ ! -f "$LIB/versions/$name/pr-stack" ] || flip "$LIB/pr-stack" "versions/$name/pr-stack"
   if grep -qF "$LIB/versions/*/sandbox-ci" "$SUDOERS_CI" 2>/dev/null; then
     touch "$LIB/versions/.per-release"
   else
