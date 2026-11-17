@@ -342,7 +342,10 @@ EOF
   setenv MIU_CI_MIRROR_USER "$MIRROR_USER"
   setenv MIU_CI_MIRROR_HELPER "$LIB/ci-mirror"
   # Sandbox runs act with --pull=false, so the runner image has to be here already.
-  sudo -u "$SANDBOX_USER" -H docker pull -q catthehacker/ubuntu:act-22.04 >/dev/null || say "Could not pull the CI runner image as $SANDBOX_USER; CI workflows will fail until it is there."
+  # Miu runs jobs with --as-runner: ubuntu-latest and ubuntu-22.04 run in this image.
+  sudo -u "$SANDBOX_USER" -H docker pull -q catthehacker/ubuntu:runner-22.04 >/dev/null || say "Could not pull the CI runner image as $SANDBOX_USER; CI workflows will fail until it is there."
+  # The job's runner user is uid 1001 and writes to the workspace this account owns.
+  [ "$(id -u "$SANDBOX_USER")" = 1001 ] || say "$SANDBOX_USER is not uid 1001, the runner user in CI jobs; jobs that write to their workspace will fail."
   sudo -u "$SANDBOX_USER" -H sh -c 'command -v act' >/dev/null || say "act is not installed for $SANDBOX_USER; CI workflows will report \"not run\" until it is."
 fi
 

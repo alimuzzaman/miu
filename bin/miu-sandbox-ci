@@ -191,8 +191,9 @@ cleanup() {
       bounded 30 docker rm -f "$id" >/dev/null 2>&1 || true
     fi
   done
-  # Jobs run as root in their containers, so what they wrote needs root to remove.
-  bounded 120 docker run --rm --pull=never -v "$root:/work" --entrypoint find catthehacker/ubuntu:act-22.04 /work -mindepth 1 -delete >/dev/null 2>&1 || true
+  # Jobs run as runner (uid 1001), but a container: job or a service keeps its
+  # image's user, often root, so what they wrote needs root to remove.
+  bounded 120 docker run --rm --pull=never --user 0 -v "$root:/work" --entrypoint find catthehacker/ubuntu:runner-22.04 /work -mindepth 1 -delete >/dev/null 2>&1 || true
   bounded 120 rm -rf "$root" "$config" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -332,7 +333,7 @@ if [ -n "$mirror_list" ]; then
     [[ $repo =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ && $repo != */. && $repo != */.. ]] || die "not run: not a repository name: $repo"
     copy=$root/.miu-ci/mirrors/${repo,,}.git
     [ -d "$copy/objects" ] && [ -f "$copy/HEAD" ] || die "not run: Miu sent no copy of $repo"
-    # The job runs as root in its container, and the copy is this account's, hence safe.directory.
+    # A container: job may run as another user than this account, which owns the copy, hence safe.directory.
     for u in "git@github.com:$repo.git" "ssh://git@github.com/$repo.git" "https://github.com/$repo.git"; do
       mirror_config+=("url.$copy.insteadOf" "$u")
     done
@@ -380,12 +381,14 @@ if len(cells) != 1:
 # Every job container is capped and placed in miu-ci.slice (install.sh makes it),
 # so CI cannot crowd out what else runs on this server. A Sandbox too old for
 # --container-limit refuses the run, so CI never runs uncapped.
+# --as-runner runs each job as runner (uid 1001) in Sandbox's runner- image, as
+# GitHub does, not as root; a Sandbox without it refuses the run.
 # The secrets go to Sandbox on a pipe (printf is a shell builtin, so they are
 # in no process's arguments). A Sandbox too old for --secrets-stdin refuses.
 run_ci() {
   bounded "$((seconds + 60))" "$sb" ci run "$root/$workflow" --local --project-dir "$root" --json \
     --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"} \
-    --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice "$@"
+    --as-runner --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice "$@"
 }
 if [ ${#secret_lines[@]} -gt 0 ]; then
   printf '%s\n' "${secret_lines[@]}" | run_ci --secrets-stdin

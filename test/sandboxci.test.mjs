@@ -95,6 +95,7 @@ test('the worker runs the commit on this server and never asks for deploy steps'
   assert.ok(argv.includes('--local'));
   assert.ok(!argv.includes('--remote'));
   assert.ok(!argv.includes('--allow-deploy'));
+  assert.ok(argv.includes('--as-runner'), 'jobs run as runner, as on GitHub, not as root');
   assert.equal(argv[argv.indexOf('--job') + 1], 'a');
   assert.equal(argv[argv.indexOf('--runtime') + 1], 'none');
   assert.equal(sandbox.read('files'), '.github/workflows/test.yml\ncode.php');
@@ -247,6 +248,16 @@ rm) echo "$3" >> "${log}" ;;
 esac`;
   await runSandboxCi(check, repo(), server({ home: sandbox.home, docker }).env);
   assert.equal(fs.readFileSync(log, 'utf8').trim(), 'mine');
+});
+
+test('the cleanup removes what root-run containers wrote, as root in the runner image', async () => {
+  const sandbox = sandboxHome();
+  const log = path.join(sandbox.home, 'docker-log');
+  await runSandboxCi(check, repo(), server({ home: sandbox.home, docker: `[ "$1" = run ] && printf '%s\\n' "$@" > "${log}"; exit 0` }).env);
+  const argv = fs.readFileSync(log, 'utf8').trim().split('\n');
+  assert.equal(argv[argv.indexOf('--user') + 1], '0');
+  assert.ok(argv.includes('catthehacker/ubuntu:runner-22.04'));
+  assert.ok(argv.includes('--pull=never'));
 });
 
 test('the worker never asks Sandbox for a site', async () => {
