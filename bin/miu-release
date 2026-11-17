@@ -157,13 +157,15 @@ build() {
   BUILD_TMP=""
 }
 
-# Processes that run from a folder: their working folder or command line is in it.
+# Processes that run from a folder: their working folder or command line is
+# in it. One pass over /proc; the pattern goes to grep in a file, so grep's
+# own command line does not match.
 users_of() {
-  local dir=$1 p cwd
-  for p in /proc/[0-9]*; do
-    cwd=$(readlink "$p/cwd" 2>/dev/null || true)
-    if [[ $cwd == "$dir" || $cwd == "$dir"/* ]] || tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -qF "$dir/"; then echo "${p#/proc/}"; fi
-  done
+  local dir=$1
+  {
+    find /proc/[0-9]*/cwd -maxdepth 0 -printf '%h %l\n' 2>/dev/null | awk -v d="$dir" '$2 == d || index($2, d "/") == 1 { print $1 }'
+    grep -alsF -f <(printf '%s/\n' "$dir") /proc/[0-9]*/cmdline 2>/dev/null | sed 's#/cmdline$##'
+  } | sed 's#^/proc/##' | sort -u
 }
 
 # The data folders out of a /srv/miu that is still a folder, the first time.
