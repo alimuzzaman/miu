@@ -1070,6 +1070,7 @@ function keyedRun() {
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
   script(sb, `if [ "$2" = plan ]; then echo '{"jobs":[{"id":"php","cells":[{"matrix":{}}]}]}'; exit 0; fi
+if [ "$3" = --help ]; then exit 0; fi
 project="$6"; cat > /dev/null
 cp "$project/.env" "${home}/env" 2>/dev/null || true
 cp "$project/composer.lock" "${home}/lock" 2>/dev/null || true
