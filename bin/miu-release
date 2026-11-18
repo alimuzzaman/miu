@@ -56,12 +56,14 @@ trap '[ -z "$BUILD_TMP" ] || rm -rf "$BUILD_TMP"' EXIT
 CONVERTED=0
 
 # One deploy at a time. A deploy handed on to the release's own copy of this
-# script (below) keeps the lock it took: fd 8 goes with the exec.
+# script (below) keeps the lock it took: fd 8 goes with the exec, and flock on
+# it again returns at once. Anything else opens the lock and waits for it.
+# MIU_RELEASE_HANDOFF only stops a second hand-on; it never skips the lock.
+HANDED_ON=${MIU_RELEASE_HANDOFF:-}
+unset MIU_RELEASE_HANDOFF
 install -d -m 0755 "$RELEASES"
-if [ -z "${MIU_RELEASE_HANDOFF:-}" ]; then
-  exec 8>"$RELEASES/.lock"
-  flock -w 600 8 || die "another deploy holds $RELEASES/.lock"
-fi
+[ "$(readlink /proc/self/fd/8 2>/dev/null)" = "$(readlink -f "$RELEASES/.lock")" ] || exec 8>"$RELEASES/.lock"
+flock -w 600 8 || die "another deploy holds $RELEASES/.lock"
 
 # The release /srv/miu points at, by folder name; empty before the first deploy.
 current() { [ -L "$APP" ] && basename "$(readlink "$APP")" || true; }
@@ -383,7 +385,7 @@ case "$cmd" in
     # $LIB/miu-release, and that copy does the rest, so a deploy never runs
     # an older script's steps for a newer release.
     new=$RELEASES/$sha/bin/miu-release
-    if [ -z "${MIU_RELEASE_HANDOFF:-}" ] && [ -f "$new" ] && ! cmp -s "$new" "$LIB/miu-release"; then
+    if [ -z "$HANDED_ON" ] && [ -f "$new" ] && ! cmp -s "$new" "$LIB/miu-release"; then
       install "${OWN[@]}" -m 0755 "$new" "$LIB/.miu-release.new"
       mv -f "$LIB/.miu-release.new" "$LIB/miu-release"
       say "This release changes miu-release: $LIB/miu-release is its copy now, and goes on with the deploy"

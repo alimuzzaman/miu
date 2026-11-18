@@ -146,6 +146,38 @@ test('a release that changes miu-release installs its copy, which does the rest 
   assert.ok(!fs.existsSync(s.app), 'the copy it handed on to does the switch, not this script');
 });
 
+test('a deploy handed on to a changed real copy finishes the deploy', linux, () => {
+  const s = server();
+  fs.copyFileSync(RELEASE, path.join(s.lib, 'miu-release'));
+  fs.writeFileSync(path.join(s.src, 'bin/miu-release'), `${fs.readFileSync(RELEASE, 'utf8')}# changed\n`, { mode: 0o755 });
+  const one = s.commit('one');
+  const r = s.run('deploy', one);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /goes on with the deploy/);
+  assert.match(fs.readFileSync(path.join(s.lib, 'miu-release'), 'utf8'), /# changed\n$/);
+  assert.equal(path.basename(fs.readlinkSync(s.app)), one);
+  assert.equal(fs.readlinkSync(path.join(s.lib, 'sandbox-ci')), `versions/${one}/sandbox-ci`);
+});
+
+test('MIU_RELEASE_HANDOFF without the lock it came with still waits for the lock', linux, async () => {
+  const s = server();
+  const one = s.commit('one');
+  fs.mkdirSync(path.join(s.root, 'releases'), { recursive: true });
+  const lockFile = path.join(s.root, 'releases/.lock');
+  fs.writeFileSync(lockFile, '');
+  const holder = spawn('flock', [lockFile, 'sleep', '3'], { stdio: 'ignore' });
+  await new Promise((res) => setTimeout(res, 300));
+  const t0 = Date.now();
+  const r = await new Promise((res) => {
+    const c = spawn('bash', [RELEASE, 'deploy', one], { env: { ...s.env, MIU_RELEASE_HANDOFF: '1' }, stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = ''; c.stderr.on('data', (d) => { err += d; });
+    c.on('close', (status) => res({ status, err }));
+  });
+  holder.kill();
+  assert.equal(r.status, 0, r.err);
+  assert.ok(Date.now() - t0 >= 2000, 'it waited for the deploy that held the lock');
+});
+
 test('a release with the same miu-release deploys without handing on', linux, () => {
   const s = server();
   fs.copyFileSync(RELEASE, path.join(s.src, 'bin/miu-release'));
