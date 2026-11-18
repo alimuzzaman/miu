@@ -597,11 +597,11 @@ test('only a job the base branch runs the same way lends a job its reach', async
   const got = [];
   const ci = createCi({
     dir: fs.mkdtempSync(path.join(tmp, 'line-')), parse: (files) => files.map((f) => ({ path: f.path, doc: JSON.parse(f.text) })),
-    prepare: async () => ({ gitDir: '/bare', sha: 'a'.repeat(40), runSha: 'b'.repeat(40), trustedSha: 'c'.repeat(40), workflows: [wf({ test: job, release: job })], baseWorkflows: [wf({ test: job }), { path: '.github/workflows/release.yml', text: JSON.stringify({ on: { push: { tags: ['*'] } }, jobs: { release: job } }) }] }),
+    prepare: async () => ({ gitDir: '/bare', sha: 'a'.repeat(40), runSha: 'b'.repeat(40), trustedSha: 'c'.repeat(40), workflows: [wf({ test: job, build: job })], baseWorkflows: [wf({ test: job }), { path: '.github/workflows/release.yml', text: JSON.stringify({ on: { push: { tags: ['*'] } }, jobs: { build: job } }) }] }),
     runJob: (c, d, s, o) => { got.push([c.sandbox_ci.job, o.trustedRef]); return new Promise(() => {}); },
   });
   ci.ensure('o/r', 1, 'a'.repeat(40)); await new Promise((r) => setTimeout(r, 50));
-  assert.deepEqual(Object.fromEntries(got), { test: 'c'.repeat(40), release: null });
+  assert.deepEqual(Object.fromEntries(got), { test: 'c'.repeat(40), build: null });
 });
 
 test('a pull request\'s workflow may name only the CI secrets its base branch\'s workflows name', needsYaml, async () => {

@@ -224,13 +224,12 @@ test('the comment\'s CI section: each linked pull request, each job, failing tes
   assert.match(text, /CI is still running\. This comment is updated when it finishes\./);
   assert.match(text, /\*\*Free #696\*\* at `9668408`: 1 passed, 1 failed, 1 not run/);
   assert.match(text, /❌ CI: JS — Vitest \+ tsc \+ Vite: failed, 4 of 1830 tests failed/);
-  assert.match(text, /- `railItems > renders ' x ' @someone` in `tests-js\/components\/railItems\.test\.tsx`: `Error: boom`/.source ? /`railItems > renders  x  @someone`/ : /x/);
+  assert.match(text, /  - `railItems > renders  x  @someone` in `tests-js\/components\/railItems\.test\.tsx`: `Error: boom`/, 'a backtick in a name cannot end its code span');
   assert.match(text, /  - and 3 more/);
   assert.match(text, /✅ CI: php \(8\.3\): passed \(120 of 120 tests\)/);
   assert.match(text, /⚪ CI: php \(7\.4\): not run: a reason/);
   assert.match(text, /\*\*Pro #246\*\* at `1aa96af`: 1 running/);
   assert.match(text, /\*\*Hub #276\*\* at `0b39e81`: CI has not started yet\./);
-  assert.doesNotMatch(text, /[^`]@someone/, 'a name from the pull request is in a code span: no mention');
   // Put in before the footer, then replaced in place.
   const body = '## Verdict\n\nstuff\n\n<sub>Tested by Miu at `abc`</sub>';
   const once = putCiBlock(body, text);
@@ -352,7 +351,7 @@ test('a container job whose image has no node gets this server\'s node, read onl
   assert.equal(c.image, 'php:${{ matrix.php }}-cli', 'the image stays as the workflow wrote it');
   assert.equal(c.options, `--memory=2g --memory-swap=2g --cpus=2 --cgroup-parent=miu-ci.slice --volume=${none.node}:/usr/local/bin/node:ro`);
   assert.match(r.log, /^Note: php:8\.3-cli has no node, so Miu gave job php this server's node/);
-  assert.equal(yaml(none.workflow()).on.workflow_dispatch, null, '`on` is kept as a key');
+  assert.match(none.workflow(), /^'on': workflow_dispatch$/m, '`on` stays the trigger key, not YAML 1.1\'s true');
 
   const has = server({ plan: plan83 });
   await sandboxci.runSandboxCi(check('.github/workflows/test.yml', 'php', { php: '8.3' }), prRepo({ '.github/workflows/test.yml': PHP }), has.env);

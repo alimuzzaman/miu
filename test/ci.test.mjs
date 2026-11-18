@@ -334,7 +334,8 @@ test('with pr_ci, only the listed workflows run, on Miu\'s run commit; only rele
   assert.match(d.ci.get('o/r', 1, SHA).reason, /No workflow here runs for pull requests/);
   const dl = line({ workflows: deployOnly, prCi: [{ workflow: '.github/workflows/deploy.yml' }] });
   dl.ci.ensure('o/r', 1, SHA); await settle();
-  assert.equal(dl.ci.get('o/r', 1, SHA).state, 'none', 'a listed deploy is still not run');
+  assert.equal(dl.ci.get('o/r', 1, SHA).state, 'not_run', 'a listed deploy is refused, and says why');
+  assert.match(dl.ci.get('o/r', 1, SHA).reason, /Miu never runs/);
   assert.equal(dl.started.length, 0);
 });
 
