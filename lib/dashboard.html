@@ -1928,7 +1928,23 @@ function ciJob(c, j) {
   const note = j.status === 'queued' ? (c.paused ? 'the queue is paused' : j.place ? ord(j.place) + ' in the CI line' : 'in the CI line') + (j.waitReason ? '; ' + j.waitReason : '') : j.reason || '';
   return '<div class="cirow"><span class="cist ' + esc(j.status) + '">' + (j.status === 'running' ? '<span class="spin" style="width:10px;height:10px"></span>' : '') + esc(CI_STATUS[j.status] || j.status) + '</span>' +
     '<span class="cil"><b>' + esc(j.label) + '</b><small>' + esc(j.workflow + (j.job ? ', job ' + j.job : '')) + (note ? ' · ' + esc(note) : '') + '</small></span>' +
-    '<span class="cid">' + esc(t) + '</span><span class="cilog">' + (j.hasLog ? '<a href="/api/ci/log?key=' + encodeURIComponent(c.key) + '&n=' + j.n + '" target="_blank" rel="noopener" data-ext>Log</a>' : '') + '</span></div>';
+    '<span class="cid">' + esc(t) + '</span><span class="cilog">' + (j.hasLog ? '<a href="/api/ci/log?key=' + encodeURIComponent(c.key) + '&n=' + j.n + '" target="_blank" rel="noopener" data-ext>Log</a>' : '') + '</span></div>' + ciTests(j);
+}
+// The failing tests the worker read from the job's own test report (the log keeps only its tail).
+function ciTests(j) {
+  const t = j.tests;
+  if (!t || (!t.failed?.length && !t.total)) return '';
+  const count = t.failedCount ?? t.failed.length;
+  const head = (t.total ? (t.passed ?? 0) + ' of ' + t.total + ' tests passed' : '') + (count ? (t.total ? ', ' : '') + count + ' failed' : '');
+  return '<div class="h" style="margin:0 0 8px 12px">' + esc(head) + (t.failed?.length ? '<ul style="margin:4px 0 0 16px;padding:0">' + t.failed.map((f) => '<li><span class="mono">' + esc(f.name) + '</span>' + (f.file ? ' <small>' + esc(f.file) + '</small>' : '') + (f.message ? '<br><small>' + esc(f.message) + '</small>' : '') + '</li>').join('') + (count > t.failed.length ? '<li>and ' + (count - t.failed.length) + ' more</li>' : '') + '</ul>' : '') + '</div>';
+}
+// A paired pull request's CI (Free, Pro, Hub), each at its own head.
+function ciLinked(c, x) {
+  const s = x.summary;
+  const line = { not_started: 'CI has not started for this commit yet.', detecting: 'Reading the workflows…', none: 'No PR CI in this repo. ' + (x.reason || ''), not_run: 'CI did not run: ' + (x.reason || 'unknown reason') }[x.state]
+    || (s && s.state === 'no_jobs' ? 'No CI job runs here for this pull request.' : s ? s.passed + ' of ' + s.total + ' passed' + (s.failed ? ', ' + s.failed + ' failed' : '') + (s.running ? ', ' + s.running + ' running' : '') + (s.queued ? ', ' + s.queued + ' queued' : '') + (s.not_run ? ', ' + s.not_run + ' not run' : '') + '.' : '');
+  return '<div class="cihead" style="margin-top:16px"><span><b>' + esc(x.label) + ' at ' + esc((x.sha || '').slice(0, 7)) + '</b>, ' + esc(line) + '</span></div>' +
+    (x.jobs && x.jobs.length ? '<div class="cijobs">' + x.jobs.map((j) => ciJob({ ...x, paused: c.paused }, j)).join('') + '</div>' : '');
 }
 function ciTab(d) {
   const c = d.ci;
@@ -1945,6 +1961,7 @@ function ciTab(d) {
   return '<div class="cihead"><span><b>CI at ' + esc(at) + '</b>, ' + esc(line + from) + '</span><span class="sp"></span>' + again +
     (c.checksUrl ? '<a class="btn" href="' + esc(c.checksUrl) + '" target="_blank" rel="noopener" data-ext title="GitHub\'s own checks, read only">GitHub checks</a>' : '') + '</div>' +
     (c.jobs && c.jobs.length ? '<div class="cijobs">' + c.jobs.map((j) => ciJob(c, j)).join('') + '</div>' : '') +
+    (c.linked || []).map((x) => ciLinked(c, x)).join('') +
     '<p class="h" style="margin-top:10px">Jobs run in Miu\'s Sandbox CI containers on this server, up to ' + esc(c.parallel) + ' at once across all pull requests, never on GitHub Actions. A pull request from this repository runs the workflows on its own branch; one from a fork or from Dependabot is not run here. A job may name only the CI secrets its job on the base branch uses, and Miu never runs a job that deploys, publishes, comments or notifies.</p>' + fast;
 }
 

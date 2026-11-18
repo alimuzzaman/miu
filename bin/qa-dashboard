@@ -38,7 +38,8 @@ import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, 
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed } from '../lib/queuectl.mjs';
-import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem, forkOf, workflowsAt } from '../lib/ci.mjs';
+import { createCi, ciRunCommit, shipSiblings, parseWorkflows, runningGroups, prCiProblem, forkOf, workflowsAt, linkedPrs } from '../lib/ci.mjs';
+import { sweepCiComments } from '../lib/cicomment.mjs';
 import { runSandboxCi, adoptSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
 import { createStacks, sudoRunner, WORKER as STACK_WORKER } from '../lib/prstackctl.mjs';
@@ -368,7 +369,12 @@ function detail(name) {
     // The CI of the commit this run tested (lib/ci.mjs), and where GitHub shows its own checks.
     // Its test stack (lib/prstackctl.mjs), when PR stacks are on.
     stack: (() => { const m = readJson(path.join(dir, 'context/pr.json'))?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); return m && stacksOn() ? stacks.view(`${m[1]}#${m[2]}`) : null; })(),
-    ci: (() => { const pr = readJson(path.join(dir, 'context/pr.json')); const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); return m ? { ...(ci.view(ci.get(m[1], Number(m[2]), pr.headRefOid)) ?? { state: 'not_started', repo: m[1], pr: Number(m[2]), sha: pr.headRefOid, jobs: [] }), checksUrl: `${pr.url}/checks`, paused: queueState().paused, parallel: ciParallel() } : null; })(),
+    ci: (() => { const pr = readJson(path.join(dir, 'context/pr.json')); const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); return m ? { ...(ci.view(ci.get(m[1], Number(m[2]), pr.headRefOid)) ?? { state: 'not_started', repo: m[1], pr: Number(m[2]), sha: pr.headRefOid, jobs: [] }), checksUrl: `${pr.url}/checks`, paused: queueState().paused, parallel: ciParallel(),
+      // The paired pull requests' own CI, each at its current head (else its newest).
+      linked: linkedPrs(readJson(path.join(dir, 'context/pair.json')), repos()).map((x) => {
+        const head = prCache.list.find((p) => p.repo === x.repo && p.number === x.pr)?.headRefOid ?? x.sha;
+        return { label: `${x.label} #${x.pr}`, ...(ci.view(ci.get(x.repo, x.pr, head) ?? ci.latest(x.repo, x.pr)) ?? { state: 'not_started', repo: x.repo, pr: x.pr, sha: head, jobs: [] }) };
+      }) } : null; })(),
     notes: read(path.join(dir, 'notes.md')),
     prompt: read(path.join(dir, 'prompt.md')),
     comment: rewire(read(path.join(dir, 'comment.md'))),
@@ -620,24 +626,34 @@ async function prepareNow(repo, pr, sha) {
   const workflows = await workflowsAt((args) => gitAsync(['-C', bare, ...args]), sha);
   const baseWorkflows = await workflowsAt((args) => gitAsync(['-C', bare, ...args]), tip);
   // Without the sibling the run would use whatever the pull request has at that path: tried again later instead.
-  const sibling = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw Object.assign(new Error(e.lasting ? e.message : `could not fetch the sibling repository's source: ${e.message}`), { lasting: e.lasting }); });
-  const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, `Miu CI: ${sha.slice(0, 12)}${sibling ? ` with ${sibling.from} beside it` : ''}`, sibling?.extra ?? []);
-  // Kept under a ref so a gc of the clone does not take it while it waits.
-  const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
-  await gitAsync(['-C', bare, 'update-ref', runRef, runSha]);
-  return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, baseWorkflows, workflowsFrom, siblingFrom: sibling?.from ?? null, base, changed };
+  const variants = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw Object.assign(new Error(e.lasting ? e.message : `could not fetch the sibling repository's source: ${e.message}`), { lasting: e.lasting }); });
+  // One run commit for each sibling ref the jobs ask for (lib/ci.mjs shipSiblings); most runs have one.
+  const runShaFor = {}, runRefs = [];
+  let runSha = null;
+  for (const [k, v] of (variants ?? [{ tops: [], from: null, extra: [] }]).entries()) {
+    const made = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, `Miu CI: ${sha.slice(0, 12)}${v.from ? ` with ${v.from} beside it` : ''}`, v.extra);
+    // Kept under a ref so a gc of the clone does not take it while it waits.
+    const ref = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}${k ? `-${k}` : ''}`;
+    await gitAsync(['-C', bare, 'update-ref', ref, made]);
+    runRefs.push(ref);
+    runSha ??= made;
+    for (const t of v.tops) runShaFor[t] = made;
+  }
+  const siblingFrom = variants ? [...new Set(variants.map((v) => v.from).filter(Boolean))].join('; ') || null : null;
+  return { gitDir: bare, sha, runSha, runShaFor, runRef: runRefs[0], runRefs, trustedSha: tip, workflows, baseWorkflows, workflowsFrom, siblingFrom, base, changed };
 }
-// The profile's sibling (Free beside Pro), shipped in the run commit (lib/ci.mjs shipSibling).
-// Only the jobs this run runs count (runningJobs): a release workflow's own
-// checkout of the sibling, at another ref, is not this run's.
+// The profile's sibling (Free beside Pro), shipped in the run commit (lib/ci.mjs shipSiblings).
+// Only the jobs this run runs count (runningGroups): a release workflow's own
+// checkout of the sibling, at another ref, is not this run's. Jobs that check
+// it out at different refs get a run commit each.
 async function siblingSource(repo, bare, headRef, workflows, { base, changed }) {
   const profile = profiles().find((x) => x.repo === repo);
   const sib = profile?.sibling;
   // A bad pr_ci is reported by the CI line itself (createCi).
   if (!sib?.repo || !gh.validRepo(sib.repo) || prCiProblem(profile.pr_ci)) return null;
   const parsed = (await parseWorkflows(workflows)).map((w) => ({ path: w.path, doc: w.doc }));
-  const running = runningJobs(parsed, { list: profile.pr_ci, base, changed });
-  return shipSibling({ git: (args, env) => gitAsync(['-C', bare, ...args], env), siblingRepo: sib.repo, headRef, docs: parsed.map((w) => w.doc), names: parsed.map((w) => w.path), keep: (i, id) => running.has(`${i}:${id}`), auth: await gh.gitAuthEnv(sib.repo).catch(() => null) });
+  const groups = runningGroups(parsed, { list: profile.pr_ci, base, changed });
+  return shipSiblings({ git: (args, env) => gitAsync(['-C', bare, ...args], env), siblingRepo: sib.repo, headRef, docs: parsed.map((w) => w.doc), names: parsed.map((w) => w.path), groups, auth: await gh.gitAuthEnv(sib.repo).catch(() => null) });
 }
 fs.mkdirSync(RUNS, { recursive: true });
 // Deploy-key copies of runs that a stop cut short (lib/sandboxci.mjs).
@@ -666,8 +682,26 @@ function ciScan() {
   const pr = live && readJson(path.join(RUNS, live, 'context/pr.json'));
   const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
   if (m && pr.headRefOid) ci.ensure(m[1], Number(m[2]), pr.headRefOid);
+  // A paired run's other pull requests (Free, Pro, Hub: context/pair.json) get
+  // their own CI too, each on its own repo at its own current head.
+  for (const x of linkedPrs(live && readJson(path.join(RUNS, live, 'context/pair.json')), repos())) ciFor(x.repo, x.pr);
   ci.tick();
+  ciCommentsTick();
 }
+
+// The CI section of result comments posted while CI was still going
+// (lib/cicomment.mjs): edited in place as CI finishes, never posted again.
+let ciCommentsAt = 0, ciCommentsBusy = false;
+function ciCommentsTick() {
+  if (ciCommentsBusy || Date.now() - ciCommentsAt < 30 * 1000) return;
+  ciCommentsAt = Date.now();
+  ciCommentsBusy = true;
+  sweepCiComments({ dir: path.join(RUNS, '.ci-comments'), lookup: ciLookup, rest: gh.rest, log: (msg) => console.log(`ci comment: ${msg}`) })
+    .catch((e) => console.error('ci comment:', e.message))
+    .finally(() => { ciCommentsBusy = false; });
+}
+// A pull request's CI record: at the commit, else its newest.
+const ciLookup = (repo, pr, sha) => ci.get(repo, pr, sha) ?? ci.latest(repo, pr);
 setInterval(() => { try { ciScan(); } catch (e) { console.error('ci:', e.message); } }, 10 * 1000);
 // Why automatic testing leaves a PR alone, or null: a draft, qa:skip, or the
 // rules in Settings (lib/prrules.mjs). The Test button and /miu ignore this.

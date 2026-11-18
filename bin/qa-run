@@ -38,6 +38,8 @@ import { sudoRunner } from '../lib/prstackctl.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
 import { fetchRef, checkoutSlot, checkoutCheckSlot, checkSiblings, freeDirFor, ensureDeps, checkEnv, CACHE } from '../lib/worktrees.mjs';
 import { runSandboxCi } from '../lib/sandboxci.mjs';
+import { readCiRecord } from '../lib/ci.mjs';
+import { ciBlock, ciEntries, savePending, commentId } from '../lib/cicomment.mjs';
 import { ensureSites, mount, reset, setConstants, writeGuardHosts, GUARD, SITES } from '../lib/warmsites.mjs';
 import { LANE, qasiteShim } from '../lib/lane.mjs';
 import { project, projectText, profileOf, roles, mainFile } from '../lib/project.mjs';
@@ -987,6 +989,12 @@ fs.writeFileSync(path.join(runDir, 'verdict.json'), JSON.stringify({
 log(`verdict ${own.verdict}${pairList.length ? ` (pair ${verdict}: ${memberResults.map((m) => `${m.label} #${m.pr} ${m.verdict}`).join(', ')})` : ''}, ${problems.length} downgrade(s), report ${reportUrl}`);
 
 // ---------------------------------------------------------------- 7. publish
+// The CI of every pull request of the run (lib/ci.mjs, run by the dashboard
+// beside this run), as each comment's CI section. Still going: the dashboard
+// edits the same comments when it is done (lib/cicomment.mjs).
+const CI_DIR = path.join(path.dirname(runDir), '.ci');
+const ciMembers = memberResults.map((m) => ({ label: m.label ?? m.repo.split('/')[1], repo: m.repo, pr: m.pr, sha: m.sha }));
+const ciNow = ciBlock(ciEntries(ciMembers, (r, n, h) => readCiRecord(CI_DIR, r, n, h)));
 if (!dryRun) await withAppToken(async (asApp) => {
   // Every PR of the run, each step on its own (lib/publish.mjs postMember): a
   // failure in one must not stop the others, and the labels always move off
@@ -996,7 +1004,7 @@ if (!dryRun) await withAppToken(async (asApp) => {
   for (const m of memberResults) {
     // An image that did not reach Cloudinary is a note on GitHub, not a broken link.
     const gone = (f) => (!fs.existsSync(path.join(runDir, 'evidence', f)) ? 'it was not saved during the run' : cloudinaryUrl() ? 'the upload failed' : 'Cloudinary is not set up');
-    const r = await postMember({ repo: m.repo, pr: m.pr, sha: m.sha, round: m.round, comment: noteLocalImages(m.body, gone), fullMd: noteLocalImages(fullMd, gone), note, verdict: m.verdict, results: m.results, before: labelsBefore[m.key] ?? [], log });
+    const r = await postMember({ repo: m.repo, pr: m.pr, sha: m.sha, round: m.round, comment: noteLocalImages(m.body, gone), fullMd: noteLocalImages(fullMd, gone), note, verdict: m.verdict, results: m.results, before: labelsBefore[m.key] ?? [], ci: ciNow.text, log });
     if (r.failed) process.exitCode = 1;
     if (r.stale) log(`${m.key}: head moved to ${r.now.slice(0, 7)} during the run`);
     if (r.url) log(`posted ${r.url}`);
@@ -1004,6 +1012,10 @@ if (!dryRun) await withAppToken(async (asApp) => {
     posted.push({ key: m.key, repo: m.repo, pr: m.pr, url: r.url, verdict: m.verdict, stale: r.stale, tested: m.sha, now: r.now, labels: r.labels });
   }
   const mine = posted[0];
+  if (ciNow.pending) {
+    try { savePending(path.join(path.dirname(runDir), '.ci-comments'), path.basename(runDir), { members: ciMembers, text: ciNow.text, comments: posted.filter((x) => commentId(x.url)).map((x) => ({ repo: x.repo, id: commentId(x.url), fallback: !asApp })) }); log('ci: still running; the dashboard updates the comments\' CI section when it finishes'); }
+    catch (e) { log(`ci: the comments' CI section will not be updated: ${e.message}`); }
+  }
   if (mine.url) {
     fs.writeFileSync(path.join(runDir, 'posted.json'), JSON.stringify({ url: mine.url, at: new Date().toISOString(), as: asApp ? 'Miu App' : 'local gh login', verdict: own.verdict, stale: mine.stale, tested: sha, now: mine.now, report: note?.url ?? null, ...(pairList.length ? { members: posted } : {}) }, null, 2));
     if (flag('--slack')) { try { const r = await notify({ verdict: own.verdict, repo, pr, title: prData.title, round, url: mine.url, stale: mine.stale }); log(r.ok ? 'slack: notice sent' : `slack: ${r.skipped}`); } catch (e) { log(`slack failed: ${e.message}`); } }

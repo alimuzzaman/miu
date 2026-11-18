@@ -279,6 +279,12 @@ except (yaml.YAMLError, UnicodeDecodeError, RecursionError, MemoryError):
 jobs = doc.get("jobs") if isinstance(doc, dict) else None
 if not isinstance(jobs, dict):
     refuse("no jobs mapping")
+# Never a deploy, a release or a notice, whatever Miu's account asks for (the
+# owner's list, the same as lib/ci.mjs NEVER_RUN): by the file's name, the
+# workflow's name, and below each job's id and name.
+NEVER = re.compile(r"(^|[^a-z0-9])(deploy|release|publish|website-sync|announce|slack|tag|close-issues)([^a-z0-9]|$)", re.I)
+if NEVER.search(re.sub(r"\.ya?ml$", "", os.path.basename(path), flags=re.I)) or (isinstance(doc.get("name"), str) and NEVER.search(doc["name"])):
+    refuse("it is a deploy, release or notification workflow, which Miu never runs")
 # Sandbox fills each secrets.X inside ${{ }} of a step from the server's
 # ci_secrets (sandbox/commands/ci.py _secret_refs, over json.dumps of the parsed
 # step). The same patterns, over each step and over the whole file as parsed
@@ -354,6 +360,14 @@ while todo:
         refuse(f"job {job_id} must run on ubuntu-latest or ubuntu-22.04")
     needs = jobs[job_id].get("needs") or []
     todo += [needs] if isinstance(needs, str) else [n for n in needs if isinstance(n, str)]
+# The job and every job it needs: never one named for a deploy, a release or a
+# notice, and never one that deploys to an environment.
+for job_id in sorted(seen):
+    title = jobs[job_id].get("name")
+    if NEVER.search(job_id) or (isinstance(title, str) and NEVER.search(title)):
+        refuse(f"job {job_id} is named for a deploy, release or notification, which Miu never runs")
+    if jobs[job_id].get("environment") is not None:
+        refuse(f"job {job_id} deploys to an environment, which Miu never runs")
 # A job skipped by its condition leaves the success of the job it needs as the
 # only result in the log, and that would read as its own.
 if len(seen) > 1 and any("if" in jobs[j] for j in seen):
@@ -437,6 +451,9 @@ else
   bounded 60 rm -rf "$root/.miu-ci"
 fi
 
+# Where the job's own test reports are copied to (below): never the pull request's.
+bounded 60 rm -rf "$root/.miu-ci-reports"
+echo /.miu-ci-reports/ >> "$root/.git/info/exclude"
 quiet_git add -A
 # Never in the pull request's commit, whatever its .gitignore says.
 quiet_git rm -r -q --cached --ignore-unmatch -- .miu-ci
@@ -454,6 +471,108 @@ cells = [c for j in plan["jobs"] if j["id"] == job for c in j["cells"] if all(st
 if len(cells) != 1:
     sys.exit(f"refused: {len(cells)} matching runs of job {job}; a check runs exactly one, so name the matrix values")
 ' "$job" "$@" <<<"$plan"
+
+# What this worker adds to the workflow, after the policy above has passed it
+# and after the commit, so the job's own commit stays the pull request's:
+# - A container: job runs in the image the workflow names, with options that
+#   are only --health-* (above), and act gives it none of Sandbox's
+#   --container-options: it gets the same caps here. act runs a JavaScript
+#   action (actions/checkout, actions/cache) with the node of that image, where
+#   GitHub mounts its own; an image with no node (php:8.3-cli) gets this
+#   server's node, read only, at /usr/local/bin/node. An image that has node
+#   keeps its own.
+# - The job's last step copies its own test reports (the paths its steps give
+#   to --outputFile, --log-junit or --junitxml) into the workspace, so the
+#   failing tests are known after the run: Sandbox keeps only the tail of a
+#   job's output.
+# Sandbox reads and writes the file with PyYAML the same way before act sees it.
+# sudo resets the environment, so only a test points these elsewhere.
+node_bin=${MIU_CI_NODE_BIN:-/opt/miu/node/bin/node}
+bounded 1200 python3 -I - "$root/$workflow" "$job" "$node_bin" "$run_mem_gb" "$run_cpus" "$@" <<'PREPARE'
+import os, re, subprocess, sys
+import yaml
+# No memory cap here, unlike the policy: docker is started from here. The
+# policy read this same file under one, so its aliases are bounded.
+path, job_id, node_bin, mem, cpus = sys.argv[1:6]
+pairs = dict(a.split("=", 1) for a in sys.argv[6:])
+with open(path, encoding="utf-8") as f:
+    doc = yaml.safe_load(f)
+if True in doc and "on" not in doc:
+    doc["on"] = doc.pop(True)
+jobs = doc["jobs"]
+seen, todo = [], [job_id]
+while todo:
+    j = todo.pop()
+    if j in seen or not isinstance(jobs.get(j), dict):
+        continue
+    seen.append(j)
+    needs = jobs[j].get("needs") or []
+    todo += [needs] if isinstance(needs, str) else [n for n in needs if isinstance(n, str)]
+IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}")
+MATRIX = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
+def has_node(image):
+    # The image act will run anyway, with no network and nothing mounted.
+    try:
+        r = subprocess.run(["docker", "run", "--rm", "--pull=missing", "--network=none", "--memory=256m", "--cgroup-parent=miu-ci.slice",
+                            "--entrypoint", "sh", image, "-c", "command -v node >/dev/null 2>&1"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {0: True, 1: False}.get(r.returncode)
+notes, changed = [], False
+caps = f"--memory={mem}g --memory-swap={mem}g --cpus={cpus} --cgroup-parent=miu-ci.slice"
+for j in seen:
+    c = jobs[j].get("container")
+    if c is None:
+        continue
+    c = {"image": c} if isinstance(c, str) else c
+    image = c.get("image")
+    # The matrix values of this run, for the job it runs; a needed job's own matrix is not known here.
+    image = MATRIX.sub(lambda m: pairs.get(m.group(1), m.group(0)), image) if isinstance(image, str) and j == job_id else image
+    add = [caps]
+    if isinstance(image, str) and IMAGE.fullmatch(image) and os.path.isfile(node_bin) and has_node(image) is False:
+        add.append(f"--volume={node_bin}:/usr/local/bin/node:ro")
+        notes.append(f"{image} has no node, so Miu gave job {j} this server's node for its JavaScript actions (GitHub mounts its own)")
+    c["options"] = " ".join([c["options"]] + add) if isinstance(c.get("options"), str) and c["options"].strip() else " ".join(add)
+    jobs[j]["container"] = c
+    changed = True
+# The paths the job's run steps write test reports to.
+REPORT = re.compile(r"(?:--outputFile|--log-junit|--junitxml|--junit-xml)(?:=|[ \t]+)(['\"]?)([A-Za-z0-9_./-]{1,200})\1")
+job = jobs[job_id]
+def wd(*where):
+    for w in where:
+        w = ((w or {}).get("run") or {}).get("working-directory") if isinstance(w, dict) else None
+        if isinstance(w, str):
+            return w
+    return ""
+reports = []
+for st in job.get("steps") if isinstance(job.get("steps"), list) else []:
+    if not isinstance(st, dict) or not isinstance(st.get("run"), str):
+        continue
+    here = st.get("working-directory") if isinstance(st.get("working-directory"), str) else wd(job.get("defaults"), doc.get("defaults"))
+    for m in REPORT.finditer(st["run"]):
+        p = m.group(2)
+        if ".." in p.split("/"):
+            continue
+        if p.startswith("/"):
+            reports.append(p)
+        elif re.fullmatch(r"[A-Za-z0-9_./-]*", here):
+            reports.append("$GITHUB_WORKSPACE/" + "/".join(x for x in (here.strip("/"), p) if x and x != "."))
+if reports and isinstance(job.get("steps"), list):
+    lines = ['d="$GITHUB_WORKSPACE/.miu-ci-reports"', 'mkdir -p "$d" || exit 0']
+    for k, src in enumerate(dict.fromkeys(reports).keys()):
+        if k > 7:
+            break
+        lines.append(f'if [ -f "{src}" ]; then cp "{src}" "$d/{k}{".xml" if src.endswith(".xml") else ".json"}" || true; fi')
+    job["steps"].append({"name": "Miu: keep the test reports", "if": "always()", "run": "\n".join(lines) + "\nexit 0\n"})
+    changed = True
+if changed:
+    with open(path + ".miu", "w", encoding="utf-8") as f:
+        yaml.safe_dump(doc, f, sort_keys=False, allow_unicode=True)
+    os.replace(path + ".miu", path)
+for n in notes:
+    print(f"miu-ci-note {n}")
+PREPARE
 
 # Never --runtime sandbox: that starts what the repository declares, Compose
 # files included, with this account's Docker access.
@@ -477,8 +596,86 @@ run_ci() {
     --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"} \
     "${artifact_differences[@]}" --as-runner --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice "$@"
 }
+rc=0
 if [ ${#secret_lines[@]} -gt 0 ]; then
-  printf '%s\n' "${secret_lines[@]}" | run_ci --secrets-stdin
+  printf '%s\n' "${secret_lines[@]}" | run_ci --secrets-stdin || rc=$?
 else
-  run_ci </dev/null
+  run_ci </dev/null || rc=$?
 fi
+
+# The job's own test reports, as one line Miu reads (lib/sandboxci.mjs testsIn):
+# test counts and up to 50 failing tests. The job wrote these files, so
+# nothing in them is trusted: no link is followed, a file is read only when it
+# is a plain one of at most 32 MB, and XML with entities is not read.
+bounded 120 python3 -I - "$root" <<'TESTS' || true
+import json, os, re, resource, stat, sys
+import xml.etree.ElementTree as ET
+resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+root = sys.argv[1]
+try:
+    dfd = os.open(os.path.join(root, ".miu-ci-reports"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError:
+    sys.exit(0)
+total = passed = failed_count = 0
+counted, failed = False, []
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+def text(v, n):
+    v = ANSI.sub("", v if isinstance(v, str) else "").strip()
+    return (v.splitlines() or [""])[0][:n]
+def short(f):
+    f = f if isinstance(f, str) else ""
+    return f[len(root) + 1:] if f.startswith(root + "/") else f
+def add(file, name, message):
+    global failed_count
+    failed_count += 1
+    if len(failed) < 50:
+        failed.append({"file": text(short(file), 200) or None, "name": text(name, 300) or "(unnamed test)", "message": text(message, 300) or None})
+for name in sorted(os.listdir(dfd)):
+    if not re.fullmatch(r"[0-7]\.(json|xml)", name):
+        continue
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError:
+        continue
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            continue
+        data = f.read((32 << 20) + 1)
+    if len(data) > 32 << 20:
+        continue
+    try:
+        if name.endswith(".json"):
+            r = json.loads(data)
+            if not isinstance(r, dict) or not isinstance(r.get("testResults"), list):
+                continue
+            if isinstance(r.get("numTotalTests"), int):
+                total += r["numTotalTests"]
+                passed += r.get("numPassedTests") if isinstance(r.get("numPassedTests"), int) else 0
+                counted = True
+            for tr in r["testResults"]:
+                if not isinstance(tr, dict):
+                    continue
+                cases = [a for a in tr.get("assertionResults") or [] if isinstance(a, dict) and a.get("status") == "failed"]
+                if not cases and tr.get("status") == "failed":
+                    add(tr.get("name"), "(the test file failed to run)", tr.get("message"))
+                for a in cases:
+                    titles = [t for t in (a.get("ancestorTitles") or []) if isinstance(t, str)] + [a.get("title") if isinstance(a.get("title"), str) else ""]
+                    add(tr.get("name"), a.get("fullName") if isinstance(a.get("fullName"), str) else " > ".join(t for t in titles if t), (a.get("failureMessages") or [""])[0])
+        else:
+            if b"<!ENTITY" in data or b"<!DOCTYPE" in data:
+                continue
+            for tc in ET.fromstring(data).iter("testcase"):
+                total += 1
+                counted = True
+                bad = tc.find("failure")
+                bad = tc.find("error") if bad is None else bad
+                if bad is not None:
+                    add(tc.get("file"), "::".join(x for x in (tc.get("classname"), tc.get("name")) if x), bad.get("message") or bad.text)
+                elif tc.find("skipped") is None:
+                    passed += 1
+    except (ValueError, ET.ParseError, RecursionError, MemoryError, TypeError, AttributeError):
+        continue
+if counted or failed:
+    print("miu-ci-tests " + json.dumps({"total": total if counted else None, "passed": passed if counted else None, "failedCount": failed_count, "failed": failed}))
+TESTS
+exit "$rc"
