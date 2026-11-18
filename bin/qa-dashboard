@@ -37,7 +37,7 @@ import { needsReply, waitsReply } from '../lib/cmdreply.mjs';
 import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelGone, takeNext } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelGone, takeNext, stackKeys } from '../lib/queuectl.mjs';
 import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem, forkOf, workflowsAt } from '../lib/ci.mjs';
 import { runSandboxCi, adoptSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
@@ -1018,7 +1018,7 @@ setTimeout(scan, 5000);
 setInterval(pump, 15 * 1000);
 
 // ---- PR test stacks ----------------------------------------------------------
-// Each PR in the queue (or being tested) gets a Sandbox stack that follows
+// The live run, its pair, and PRs a person queued get a Sandbox stack that follows
 // its branch (lib/prstacks.mjs decides, lib/prstackctl.mjs does it). Off
 // unless Settings has stacks.on and install.sh set up the worker.
 const stacksOn = () => getConfig().stacks?.on === true && !!process.env.MIU_SANDBOX_USER && fs.existsSync(STACK_WORKER);
@@ -1047,7 +1047,7 @@ async function stackScan() {
     const ctx = live ? readJson(path.join(RUNS, live, 'context/pr.json')) : null;
     const own = ctx?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
     const liveKeys = new Set([own && `${own[1]}#${own[2]}`, ...(live ? (readJson(path.join(RUNS, live, 'context/pair.json')) ?? []).map((x) => `${x.repo}#${x.number}`) : [])].filter(Boolean));
-    const wanted = new Set([...queue.map((q) => `${q.repo}#${q.pr}`), ...liveKeys]);
+    const wanted = stackKeys(queue, liveKeys);
     for (const key of wanted) {
       const p = list.find((x) => `${x.repo}#${x.number}` === key);
       const role = p && roleOf(p.repo);

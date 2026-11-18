@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelOf, labelGone, takeNext } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelOf, labelGone, takeNext, stackKeys } from '../lib/queuectl.mjs';
 
 const auto = { mode: 'auto', paused: false };
 const manual = { mode: 'manual', paused: false };
@@ -115,4 +115,23 @@ test('a run that started meanwhile stops the pick before anything leaves the lin
   const took = await takeNext(line, st, { readPr: async () => { running = true; return { state: 'OPEN', labels: ['Needs Testing'] }; }, asks, busy: () => running });
   assert.equal(took.next, null);
   assert.equal(line.length, 1, 'it keeps its place for the next pump');
+});
+
+test('a stack goes to the live run, its pair and what a person queued', () => {
+  const queue = [
+    { repo: 'a/free', pr: 1, by: 'person', why: 'asked from the dashboard' },
+    { repo: 'a/free', pr: 2, by: 'auto', why: 'new commits' },
+    { repo: 'a/pro', pr: 3, by: 'github', why: 'labelled Needs Testing', label: 'Needs Testing' },
+    { repo: 'a/hub', pr: 4, by: 'github', why: '/miu from x' },
+  ];
+  // The terminal and the dashboard's Start pick the entry, which makes it a person's.
+  pick(queue, [{ repo: 'a/free', pr: 5 }]);
+  const keys = stackKeys(queue, ['a/free#9', 'a/pro#10']);
+  assert.deepEqual([...keys].sort(), ['a/free#1', 'a/free#5', 'a/free#9', 'a/pro#10']);
+});
+
+test('auto-queued entries waiting for a person get no stack', () => {
+  const queue = Array.from({ length: 24 }, (_, i) => ({ repo: 'a/free', pr: 100 + i, by: 'auto', why: 'new commits' }));
+  assert.equal(stackKeys(queue, []).size, 0, 'no live run, nothing a person asked for: no stacks');
+  assert.deepEqual([...stackKeys(queue, ['a/free#100'])], ['a/free#100'], 'only the live run, even when it is also in the line');
 });
