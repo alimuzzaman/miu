@@ -224,7 +224,7 @@ test('the comment\'s CI section: each linked pull request, each job, failing tes
   assert.match(text, /CI is still running\. This comment is updated when it finishes\./);
   assert.match(text, /\*\*Free #696\*\* at `9668408`: 1 passed, 1 failed, 1 not run/);
   assert.match(text, /❌ CI: JS — Vitest \+ tsc \+ Vite: failed, 4 of 1830 tests failed/);
-  assert.match(text, /  - `railItems > renders  x  @\u200bsomeone` in `tests-js\/components\/railItems\.test\.tsx`: `Error: boom`/, 'a backtick in a name cannot end its code span');
+  assert.match(text, /  - `railItems › renders  x  @\u200bsomeone` in `tests-js\/components\/railItems\.test\.tsx`: `Error: boom`/, 'a backtick in a name cannot end its code span');
   assert.match(text, /  - and 3 more/);
   assert.match(text, /✅ CI: php \(8\.3\): passed \(120 of 120 tests\)/);
   assert.match(text, /⚪ CI: php \(7\.4\): not run: a reason/);

@@ -642,6 +642,7 @@ fi
 bounded 120 python3 -I - "$root" <<'TESTS' || true
 import json, os, re, resource, stat, sys
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
 root = sys.argv[1]
 try:
@@ -696,12 +697,14 @@ for name in sorted(os.listdir(dfd)):
         else:
             if b"<!ENTITY" in data or b"<!DOCTYPE" in data:
                 continue
-            parser = ET.XMLParser()
+            # A plain expat pass first: no DOCTYPE and no entity, in any encoding.
             def no_entities(*_):
                 raise ValueError("entities")
-            parser.parser.EntityDeclHandler = no_entities
-            parser.feed(data)
-            for tc in parser.close().iter("testcase"):
+            probe = xml.parsers.expat.ParserCreate()
+            probe.StartDoctypeDeclHandler = no_entities
+            probe.EntityDeclHandler = no_entities
+            probe.Parse(data, True)
+            for tc in ET.fromstring(data).iter("testcase"):
                 total += 1
                 counted = True
                 bad = tc.find("failure")
@@ -710,7 +713,7 @@ for name in sorted(os.listdir(dfd)):
                     add(tc.get("file"), "::".join(x for x in (tc.get("classname"), tc.get("name")) if x), bad.get("message") or bad.text)
                 elif tc.find("skipped") is None:
                     passed += 1
-    except (ValueError, ET.ParseError, RecursionError, MemoryError, TypeError, AttributeError):
+    except (ValueError, ET.ParseError, xml.parsers.expat.ExpatError, RecursionError, MemoryError, TypeError, AttributeError):
         continue
 if counted or failed:
     print("miu-ci-tests " + json.dumps({"total": total if counted else None, "passed": passed if counted else None, "failedCount": failed_count, "failed": failed}))

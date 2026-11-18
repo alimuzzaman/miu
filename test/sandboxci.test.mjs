@@ -247,7 +247,8 @@ inspect) if [ "$4" = mine ]; then cat "${sandbox.home}/project"; else echo /some
 rm) echo "$3" >> "${log}" ;;
 esac`;
   await runSandboxCi(check, repo(), server({ home: sandbox.home, docker }).env);
-  assert.equal(fs.readFileSync(log, 'utf8').trim(), 'mine');
+  // The run's own node probe (named for it) goes too, whether or not it ran.
+  assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n').filter((n) => !/^miu-probe-miu-ci\.\w+$/.test(n)), ['mine']);
 });
 
 test('the cleanup removes what root-run containers wrote, as root in the runner image', async () => {
