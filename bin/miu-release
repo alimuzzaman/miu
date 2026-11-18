@@ -295,7 +295,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=$LIB/ci-net up
 ExecReload=$LIB/ci-net up
-ExecStop=$LIB/ci-net down
+ExecStop=$LIB/ci-net unstamp
 [Install]
 WantedBy=multi-user.target docker.service
 UNIT

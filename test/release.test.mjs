@@ -146,6 +146,7 @@ test('the CI network helper goes in with the worker, behind a unit that holds it
   assert.match(unit, new RegExp(`^ExecStart=${s.lib}/ci-net up$`, 'm'));
   assert.match(unit, new RegExp(`^ExecReload=${s.lib}/ci-net up$`, 'm'), 'a deploy reloads it, so the rules are never taken down');
   assert.match(unit, /^PartOf=docker\.service$/m);
+  assert.match(unit, new RegExp(`^ExecStop=${s.lib}/ci-net unstamp$`, 'm'), 'Docker stopping takes the stamp, never the rules a running job is held by');
   assert.match(unit, /^WantedBy=multi-user\.target docker\.service$/m);
   const log = fs.readFileSync(path.join(s.root, 'systemctl.log'), 'utf8');
   assert.match(log, /enable -q miu-ci-net\.service/);
