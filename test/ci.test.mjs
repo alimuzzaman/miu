@@ -350,7 +350,7 @@ test('a commit read under older rules is read again', async () => {
   const now = line({ workflows: { '.github/workflows/ci.yml': manualCi }, prCi: [{ workflow: '.github/workflows/ci.yml', jobs: ['js'] }], dir });
   now.ci.ensure('o/r', 1, SHA); await settle();
   assert.equal(now.started.length, 1);
-  assert.equal(now.ci.get('o/r', 1, SHA).rules, 6);
+  assert.equal(now.ci.get('o/r', 1, SHA).rules, 7);
 });
 
 test('the run commit is the pull request\'s own tree, its .github and act\'s files included', async () => {
@@ -437,10 +437,12 @@ test('more ways a job posts, publishes or deploys are refused', () => {
   assert.match(refused({}, { permissions: { contents: 'write' } }), /write access/);
   assert.match(jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { deploy: ubuntu() } })[0].skip, /name says/);
   assert.match(refused({ steps: [{ uses: 'stefanzweifel/git-auto-commit-action@v5' }] }), /auto-commit/);
-  // Test jobs that only sound like it run.
+  // The owner's list (2026-11-18): a job named for a release is not run, even a test of one.
   const runs = (id, job) => jobsOf('.github/workflows/ci.yml', { on: 'pull_request', jobs: { [id]: ubuntu(job) } })[0].check;
-  assert.ok(runs('site', { name: 'Website + release notes', steps: [{ run: 'npm ci && npm test' }] }));
-  assert.ok(runs('release_check', { steps: [{ name: 'Test release service in Chromium', run: 'npm test' }, { name: 'Comment out xdebug', run: 'sed -i s/^z/;z/ x.ini' }, { name: 'Verify Core Comment Disabling Functionality', run: 'wp eval-file t.php' }] }));
+  assert.equal(runs('site', { name: 'Website + release notes', steps: [{ run: 'npm ci && npm test' }] }), undefined);
+  assert.equal(runs('release_check', { steps: [{ run: 'npm test' }] }), undefined);
+  // Steps that only sound like it still run.
+  assert.ok(runs('unit', { steps: [{ name: 'Test release service in Chromium', run: 'npm test' }, { name: 'Comment out xdebug', run: 'sed -i s/^z/;z/ x.ini' }, { name: 'Verify Core Comment Disabling Functionality', run: 'wp eval-file t.php' }] }));
   for (const run of ['wrangler deploy --dry-run', 'curl -f -sSL https://getcomposer.org/installer | php', 'curl -D - https://x/y', 'wget -T 30 -t 3 https://x/y', 'docker compose up -d', 'cargo build --release']) assert.ok(runs('t', { steps: [{ run }] }), run);
   assert.equal(refused({ steps: [{ run: 'curl -fsSL https://x/y -o y && npm ci && npm test -- --json' }] }), undefined, 'a download and a test run are fine');
 });
