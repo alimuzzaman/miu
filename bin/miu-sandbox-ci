@@ -389,6 +389,15 @@ if [ -L "$root/.miu-ci" ]; then rm -f "$root/.miu-ci"; fi
 # could start a container that owns this server.
 mkdir "$config/act"
 echo '--container-daemon-socket=-' > "$config/act/actrc"
+# Without the socket, act (0.2.9x) also restricts a workflow's container
+# options and host-path volumes, and so refuses the caps and the node this
+# worker gives a container: job (below). The workflow policy above already
+# lets a pull request set only --health-* options and no volumes, so what
+# this permits is what this worker adds. An act without the option has no
+# such restriction.
+if bounded 30 act --help 2>/dev/null | grep -q -- '--container-options-policy'; then
+  echo '--container-options-policy=allow' >> "$config/act/actrc"
+fi
 export XDG_CONFIG_HOME="$config"
 # Sandbox writes act's secret file to TMPDIR; here it is gone with the folder
 # even if Sandbox is stopped before it can delete it.
@@ -514,11 +523,12 @@ def has_node(image):
     # The image act will run anyway, with no network and nothing mounted.
     try:
         r = subprocess.run(["docker", "run", "--rm", "--pull=missing", "--network=none", "--memory=256m", "--cgroup-parent=miu-ci.slice",
-                            "--entrypoint", "sh", image, "-c", "command -v node >/dev/null 2>&1"],
+                            "--entrypoint", "sh", image, "-c", "command -v node >/dev/null 2>&1 && exit 0; exit 3"],
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
     except (OSError, subprocess.SubprocessError):
         return None
-    return {0: True, 1: False}.get(r.returncode)
+    # 3 is the image saying it has no node; anything else (no sh, no image) is not known.
+    return {0: True, 3: False}.get(r.returncode)
 notes, changed = [], False
 caps = f"--memory={mem}g --memory-swap={mem}g --cpus={cpus} --cgroup-parent=miu-ci.slice"
 for j in seen:

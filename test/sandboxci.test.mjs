@@ -111,7 +111,8 @@ test('the worker runs the commit on this server and never asks for deploy steps'
 test('jobs do not get the Docker socket, and a committed .actrc is ignored', async () => {
   const sandbox = sandboxHome();
   await runSandboxCi(check, repo({ '.actrc': '--privileged\n' }), server({ home: sandbox.home }).env);
-  assert.equal(sandbox.read('actrc'), '--container-daemon-socket=-');
+  // An act that restricts container options without the socket is told the worker's own policy decides (bin/miu-sandbox-ci).
+  assert.match(sandbox.read('actrc'), /^--container-daemon-socket=-(\n--container-options-policy=allow)?$/);
   assert.doesNotMatch(sandbox.read('files'), /actrc/);
 });
 

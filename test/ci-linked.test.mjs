@@ -343,10 +343,10 @@ const plan83 = '{"jobs":[{"id":"php","cells":[{"matrix":{"php":"7.4"}},{"matrix"
 test('a container job whose image has no node gets this server\'s node, read only, and the CI caps; one with node keeps its own', needsYaml, async () => {
   const yaml = (t) => JSON.parse(spawnSync('python3', ['-c', 'import json,sys,yaml; print(json.dumps(yaml.safe_load(sys.stdin)))'], { input: t, encoding: 'utf8' }).stdout);
   // `docker run ... command -v node` exits 1: no node in the image.
-  const none = server({ plan: plan83, docker: 'case "$1" in run) exit 1;; esac; exit 0' });
+  const none = server({ plan: plan83, docker: 'case "$1" in run) exit 3;; esac; exit 0' });
   const r = await sandboxci.runSandboxCi(check('.github/workflows/test.yml', 'php', { php: '8.3' }), prRepo({ '.github/workflows/test.yml': PHP }), none.env);
   assert.equal(r.status, 0, JSON.stringify(r));
-  assert.match(none.docker(), /run --rm --pull=missing --network=none .*--entrypoint sh php:8\.3-cli -c command -v node/);
+  assert.match(none.docker(), /run --rm --pull=missing --network=none .*--entrypoint sh php:8\.3-cli -c command -v node >\/dev\/null 2>&1 && exit 0; exit 3/);
   const c = yaml(none.workflow()).jobs.php.container;
   assert.equal(c.image, 'php:${{ matrix.php }}-cli', 'the image stays as the workflow wrote it');
   assert.equal(c.options, `--memory=2g --memory-swap=2g --cpus=2 --cgroup-parent=miu-ci.slice --volume=${none.node}:/usr/local/bin/node:ro`);
