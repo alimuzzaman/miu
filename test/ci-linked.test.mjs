@@ -294,6 +294,8 @@ function prRepo(files) {
 }
 // The real worker with a stand-in `sb` (it keeps the workflow it was given and
 // can play the job writing its reports) and a stand-in `docker`.
+// Root's stamp for the CI network (bin/miu-ci-net) names the network the stand-in docker reports.
+const NET_ID = 'f00dfeed'.repeat(8);
 function server({ help = '', docker = 'exit 0', plan = '{"jobs":[{"id":"a","cells":[{"matrix":{}}]}]}', cells = '[{"label":"a","status":"passed","exit_code":0,"output":"[t/a]   🏁  Job succeeded"}]', job = '' } = {}) {
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const bin = fs.mkdtempSync(path.join(tmp, 'bin-'));
@@ -302,14 +304,16 @@ function server({ help = '', docker = 'exit 0', plan = '{"jobs":[{"id":"a","cell
   script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nif [ "$3" = --help ]; then echo '${help}'; exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\ncp "$3" "${home}/workflow"\nproject="$6"\n${job}\necho '{"ok":true,"cells":${cells}}'`);
   script(path.join(bin, 'sudo'), 'shift 4\nexec "$@"');
   script(path.join(bin, 'timeout'), 'shift 3\nexec "$@"');
-  script(path.join(bin, 'docker'), `printf '%s\\n' "$*" >> "${bin}/docker-calls"\n${docker}`);
+  script(path.join(bin, 'docker'), `printf '%s\\n' "$*" >> "${bin}/docker-calls"\nif [ "$1 $2" = "network inspect" ]; then echo ${NET_ID}; exit 0; fi\n${docker}`);
+  const stamp = path.join(fs.mkdtempSync(path.join(tmp, 'net-')), 'ok');
+  fs.writeFileSync(stamp, `${NET_ID}\n`);
   script(path.join(bin, 'curl'), 'cat > /dev/null');
   const names = path.join(fs.mkdtempSync(path.join(tmp, 'names-')), 'ci-secret-names');
   fs.writeFileSync(names, '');
   const node = path.join(home, 'node');
   fs.writeFileSync(node, '#!/bin/true\n');
   return {
-    env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no.lock'), MIU_CI_RUNNER_UID: String(process.getuid()), MIU_CI_SECRET_NAMES: names, MIU_CI_SECRET_NAMES_OWNER: SELF, MIU_CI_NODE_BIN: node },
+    env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no.lock'), MIU_CI_RUNNER_UID: String(process.getuid()), MIU_CI_SECRET_NAMES: names, MIU_CI_SECRET_NAMES_OWNER: SELF, MIU_CI_NODE_BIN: node, MIU_CI_NET_STAMP: stamp, MIU_CI_NET_STAMP_OWNER: String(process.getuid()) },
     node,
     ran: () => fs.existsSync(path.join(home, 'workflow')),
     argv: () => fs.readFileSync(path.join(home, 'argv'), 'utf8').trim().split('\n'),

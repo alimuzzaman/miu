@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# The Docker network Miu's CI jobs run on, and the firewall that holds it in.
+# Root runs it (miu-ci-net.service, which bin/miu-release installs):
+#
+#   miu-ci-net up      make the network and the rules (again: it changes nothing twice)
+#   miu-ci-net down    take the rules away and the stamp with them
+#
+# The network is a user-defined bridge, miu-ci, on its own interface (miu-ci0)
+# and subnet, with containers on it unable to talk to each other. Its rules:
+#   - nothing from it reaches this server itself (INPUT): no SSH, no nginx,
+#     no tailnet name, no service on the bridge's gateway address. 127.0.0.1
+#     in a job is the job's own, so services on this server's loopback are out
+#     of reach as well;
+#   - nothing from it reaches a private, shared, link-local or loopback address
+#     (FORWARD, in DOCKER-USER, which Docker never flushes): no other stack's
+#     network, no port another stack publishes (Docker has rewritten that to the
+#     container's address by then), no tailnet, no cloud metadata;
+#   - the internet stays open: package installs, GitHub, Docker's own DNS.
+# Only then is the stamp written: the network's id, in a root-owned file under
+# /run (gone at a reboot until this runs again). bin/miu-sandbox-ci runs a job
+# on the network only when the stamp names the network it finds, and refuses
+# the job otherwise. Rejected, not dropped, so a job that tries fails at once.
+set -euo pipefail
+
+NET=${MIU_CI_NET:-miu-ci}
+BRIDGE=${MIU_CI_NET_BRIDGE:-miu-ci0}
+SUBNET=${MIU_CI_NET_SUBNET:-10.213.0.0/24}
+STAMP=${MIU_CI_NET_STAMP:-/run/miu-ci-net/ok}
+IPT=${MIU_CI_IPTABLES:-iptables}
+IN=MIU-CI-IN
+FWD=MIU-CI-FWD
+# Every address that is not the internet.
+PRIVATE=(0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4)
+
+die() { printf 'miu-ci-net: %s\n' "$*" >&2; exit 1; }
+[[ $NET =~ ^[a-z0-9][a-z0-9_.-]{0,62}$ ]] || die "not a network name: $NET"
+[[ $BRIDGE =~ ^[a-z0-9][a-z0-9_-]{0,14}$ ]] || die "not an interface name: $BRIDGE"
+[[ $SUBNET =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "not a subnet: $SUBNET"
+
+# A chain of ours, filled by fill_<name> and swapped in whole, so the rules
+# are never missing while a job runs: the new chain is built beside the old,
+# its jump goes in at the top of the parent, and only then the old one goes.
+swap() {
+  local parent=$1 name=$2 next=$2-N
+  "$IPT" -w -N "$next" 2>/dev/null || "$IPT" -w -F "$next"
+  "fill_$name" "$next"
+  # A jump left by a run that stopped half way.
+  while "$IPT" -w -D "$parent" -i "$BRIDGE" -j "$next" 2>/dev/null; do :; done
+  "$IPT" -w -I "$parent" 1 -i "$BRIDGE" -j "$next"
+  while "$IPT" -w -D "$parent" -i "$BRIDGE" -j "$name" 2>/dev/null; do :; done
+  "$IPT" -w -F "$name" 2>/dev/null || true
+  "$IPT" -w -X "$name" 2>/dev/null || true
+  "$IPT" -w -E "$next" "$name"
+}
+fill_MIU-CI-IN() {
+  "$IPT" -w -A "$1" -p tcp -j REJECT --reject-with tcp-reset
+  "$IPT" -w -A "$1" -j REJECT --reject-with icmp-port-unreachable
+}
+fill_MIU-CI-FWD() {
+  # Replies to what a job opened on the internet.
+  "$IPT" -w -A "$1" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  local d
+  for d in "${PRIVATE[@]}"; do
+    "$IPT" -w -A "$1" -d "$d" -p tcp -j REJECT --reject-with tcp-reset
+    "$IPT" -w -A "$1" -d "$d" -j REJECT --reject-with icmp-net-prohibited
+  done
+  "$IPT" -w -A "$1" -j RETURN
+}
+unchain() {
+  local parent=$1 name=$2
+  while "$IPT" -w -D "$parent" -i "$BRIDGE" -j "$name" 2>/dev/null; do :; done
+  "$IPT" -w -F "$name" 2>/dev/null || true
+  "$IPT" -w -X "$name" 2>/dev/null || true
+}
+
+up() {
+  rm -f "$STAMP"
+  # The network, made once. One that is there already must be the one this
+  # makes; it is never removed here (a job may be on it).
+  if ! docker network inspect "$NET" >/dev/null 2>&1; then
+    docker network create --driver bridge --subnet "$SUBNET" --label miu.ci-net=1 \
+      --opt "com.docker.network.bridge.name=$BRIDGE" --opt com.docker.network.bridge.enable_icc=false "$NET" >/dev/null
+  fi
+  local got
+  got=$(docker network inspect -f '{{.Driver}} {{index .Options "com.docker.network.bridge.name"}} {{index .Options "com.docker.network.bridge.enable_icc"}} {{range .IPAM.Config}}{{.Subnet}} {{end}}{{.EnableIPv6}}' "$NET")
+  [ "$got" = "bridge $BRIDGE false $SUBNET false" ] || die "network $NET is not the one Miu makes (it is: $got); remove it when no job uses it, then run this again"
+  # Docker makes DOCKER-USER; an older Docker that has none cannot hold the rules.
+  "$IPT" -w -S DOCKER-USER >/dev/null 2>&1 || die "no DOCKER-USER chain: is Docker running?"
+  swap INPUT "$IN"
+  swap DOCKER-USER "$FWD"
+  install -d -m 0755 "$(dirname "$STAMP")"
+  docker network inspect -f '{{.Id}}' "$NET" > "$STAMP.tmp"
+  chmod 0644 "$STAMP.tmp"
+  mv -f "$STAMP.tmp" "$STAMP"
+  echo "miu-ci-net: $NET ($BRIDGE, $SUBNET) is up and held in"
+}
+
+down() {
+  rm -f "$STAMP"
+  unchain INPUT "$IN"
+  unchain DOCKER-USER "$FWD"
+}
+
+case "${1:-}" in
+  up) up ;;
+  down) down ;;
+  *) die "usage: miu-ci-net up|down" ;;
+esac

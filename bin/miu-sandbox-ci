@@ -611,6 +611,50 @@ if changed:
 for n in notes:
     print(f"miu-ci-note {n}")
 PREPARE
+
+# The job's network. act puts a job on the host's own network unless told
+# otherwise, where it reaches every service on this server's loopback and every
+# port another stack publishes. A job runs on miu-ci instead (bin/miu-ci-net:
+# its own bridge, with no way to this server, other stacks or any private
+# address, and the internet open), and only once root's stamp names the
+# network Docker has; without it the job is not run. act's cache server
+# listens on this server, which the job cannot reach from there: none.
+# A job with services: (or one it needs) is the exception. act 0.2.x makes a
+# network of its own for those and ignores --network, and the job reaches its
+# services on localhost, as on GitHub, only from the host's network. So it
+# stays there, said in a note, until Sandbox can give such a job a network.
+services=$(bounded 60 python3 -I - "$root/$workflow" "$job" <<'SERVICES'
+import sys
+import yaml
+path, job_id = sys.argv[1:3]
+with open(path, encoding="utf-8") as f:
+    jobs = yaml.safe_load(f)["jobs"]
+seen, todo = [], [job_id]
+while todo:
+    j = todo.pop()
+    if j in seen or not isinstance(jobs.get(j), dict):
+        continue
+    seen.append(j)
+    needs = jobs[j].get("needs") or []
+    todo += [needs] if isinstance(needs, str) else [n for n in needs if isinstance(n, str)]
+print(next((j for j in seen if jobs[j].get("services")), ""))
+SERVICES
+)
+net=${MIU_CI_NET:-miu-ci}
+net_stamp=${MIU_CI_NET_STAMP:-/run/miu-ci-net/ok}
+if [ -n "$services" ]; then
+  echo "miu-ci-note job $services has services, so it ran on this server's own network, not on $net (act gives such a job a network of its own)"
+else
+  net_why="the CI network $net is not set up (root runs: systemctl restart miu-ci-net), so no job runs"
+  [ -f "$net_stamp" ] && [ ! -L "$net_stamp" ] || die "refused: $net_why"
+  meta=$(stat -c '%u %a' "$net_stamp") || die "refused: $net_why"
+  [[ ${meta% *} == "${MIU_CI_NET_STAMP_OWNER:-0}" ]] && ! (( 8#${meta#* } & 8#022 )) || die "refused: $net_why (its stamp is not root's own)"
+  net_id=$(bounded 30 docker network inspect -f '{{.Id}}' "$net" 2>/dev/null || true)
+  [ -n "$net_id" ] && [ "$net_id" = "$(head -c 200 "$net_stamp")" ] || die "refused: $net_why (its stamp names another network)"
+  printf '%s\n' "--network=$net" --no-cache-server >> "$config/act/actrc"
+fi
+unset services net_why net_id meta
+
 # The job's checkout stays clean: git status and git diff in the job do not
 # see what this worker changed in the workflow.
 quiet_git update-index --skip-worktree -- "$workflow"

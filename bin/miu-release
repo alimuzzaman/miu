@@ -262,6 +262,7 @@ worker() {
   [ ! -f "$LIB/versions/$name/ci-mirror" ] || flip "$LIB/ci-mirror" "versions/$name/ci-mirror"
   # A release without the PR-stack helper leaves the installed one as it is.
   [ ! -f "$LIB/versions/$name/pr-stack" ] || flip "$LIB/pr-stack" "versions/$name/pr-stack"
+  [ ! -f "$src/bin/miu-ci-net" ] || ci_net "$name" "$src"
   if grep -qF "$LIB/versions/*/sandbox-ci" "$SUDOERS_CI" 2>/dev/null; then
     touch "$LIB/versions/.per-release"
   else
@@ -271,6 +272,37 @@ worker() {
   # Root's list of the CI secrets each repository may name (install.sh makes it).
   { [ -f "$SECRET_NAMES" ] && [ ! -L "$SECRET_NAMES" ] && [ "$(stat -c %u:%g "$SECRET_NAMES" 2>/dev/null)" = 0:0 ]; } || say "No root-owned regular file $SECRET_NAMES: the worker lets no workflow name a CI secret. Run install.sh again to make it, then list each repository's names (docs/install.md)."
   say "CI worker: $LIB/sandbox-ci -> versions/$name"
+}
+
+# The network CI jobs run on and its firewall (bin/miu-ci-net), from a unit
+# that runs it again whenever Docker starts, so it holds after a reboot. The
+# worker runs no job until the network is up, so a failure here says so and
+# leaves CI refusing rather than running jobs on the host's network.
+CI_NET_UNIT=miu-ci-net.service
+ci_net() {
+  local name=$1 src=$2 unit=$UNIT_DIR/$CI_NET_UNIT
+  install "${OWN[@]}" -m 0755 "$src/bin/miu-ci-net" "$LIB/versions/$name/ci-net"
+  flip "$LIB/ci-net" "versions/$name/ci-net"
+  install -d -m 0755 "$UNIT_DIR"
+  cat > "$unit.tmp" <<UNIT
+[Unit]
+Description=Miu CI job network (miu-ci) and its firewall
+Requires=docker.service
+After=docker.service ufw.service tailscaled.service
+PartOf=docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$LIB/ci-net up
+ExecReload=$LIB/ci-net up
+ExecStop=$LIB/ci-net down
+[Install]
+WantedBy=multi-user.target docker.service
+UNIT
+  if cmp -s "$unit.tmp" "$unit"; then rm -f "$unit.tmp"; else mv -f "$unit.tmp" "$unit"; systemctl daemon-reload; fi
+  systemctl enable -q "$CI_NET_UNIT" 2>/dev/null || true
+  if systemctl reload-or-restart "$CI_NET_UNIT"; then say "CI network: up ($CI_NET_UNIT)"
+  else say "CI network: $CI_NET_UNIT failed (journalctl -u $CI_NET_UNIT); CI refuses jobs until it is up"; fi
 }
 
 answers() { [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$URL" || true)" != 000 ]; }

@@ -133,3 +133,23 @@ test('the first move failing half way: /srv/miu points at the old folder again a
   assert.ok(fs.existsSync(path.join(s.app, 'runs')));
   assert.match(fs.readFileSync(path.join(s.root, 'systemctl.log'), 'utf8'), /stop miu\.service[\s\S]*start miu\.service/);
 });
+
+test('the CI network helper goes in with the worker, behind a unit that holds it after a reboot', linux, () => {
+  const s = server();
+  fs.writeFileSync(path.join(s.src, 'bin/miu-ci-net'), '#!/usr/bin/env bash\necho net "$@"\n', { mode: 0o755 });
+  const one = s.commit('one');
+  const r = s.run('deploy', one);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readlinkSync(path.join(s.lib, 'ci-net')), `versions/${one}/ci-net`);
+  assert.match(spawnSync(path.join(s.lib, 'ci-net'), ['up'], { encoding: 'utf8' }).stdout, /^net up/);
+  const unit = fs.readFileSync(path.join(s.root, 'units/miu-ci-net.service'), 'utf8');
+  assert.match(unit, new RegExp(`^ExecStart=${s.lib}/ci-net up$`, 'm'));
+  assert.match(unit, new RegExp(`^ExecReload=${s.lib}/ci-net up$`, 'm'), 'a deploy reloads it, so the rules are never taken down');
+  assert.match(unit, /^PartOf=docker\.service$/m);
+  assert.match(unit, /^WantedBy=multi-user\.target docker\.service$/m);
+  const log = fs.readFileSync(path.join(s.root, 'systemctl.log'), 'utf8');
+  assert.match(log, /enable -q miu-ci-net\.service/);
+  assert.match(log, /reload-or-restart miu-ci-net\.service/);
+  assert.doesNotMatch(log, /(?:^|\n)(?:stop|restart) miu-ci-net\.service/);
+  assert.match(r.stderr, /CI network: up/);
+});
