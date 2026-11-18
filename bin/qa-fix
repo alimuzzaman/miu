@@ -32,6 +32,7 @@ import { recordRefusal, refusalIn } from '../lib/authrefused.mjs';
 import { fixToolRule } from '../lib/rules.mjs';
 import { findings, findingsMd, checkChange, commitMessage, outcome, branchProblem, checkProbe } from '../lib/fix.mjs';
 import { fetchRef, checkoutSlot, ensureDeps, CACHE, redact } from '../lib/worktrees.mjs';
+import { qasiteShim } from '../lib/lane.mjs';
 import { ensureSites, mount, reset } from '../lib/warmsites.mjs';
 import { profiles, profileOf } from '../lib/project.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
@@ -160,7 +161,7 @@ const binDir = path.join(fixDir, 'bin');
 fs.mkdirSync(binDir, { recursive: true });
 for (const [name, target] of [['qa-evidence', 'bin/qa-evidence'], ['qasite', 'bin/qasite']]) {
   const exe = AGENT_USER && name === 'qasite' ? AGENT_QASITE : path.join(ROOT, target);
-  fs.writeFileSync(path.join(binDir, name), `#!/usr/bin/env bash\nexec "${exe}" "$@"\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(binDir, name), name === 'qasite' ? qasiteShim(exe) : `#!/usr/bin/env bash\nexec "${exe}" "$@"\n`, { mode: 0o755 });
 }
 if (AGENT_USER) shareRunDir(fixDir);
 

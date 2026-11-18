@@ -38,7 +38,8 @@ import { sudoRunner } from '../lib/prstackctl.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
 import { fetchRef, checkoutSlot, checkoutCheckSlot, checkSiblings, freeDirFor, ensureDeps, checkEnv, CACHE } from '../lib/worktrees.mjs';
 import { runSandboxCi } from '../lib/sandboxci.mjs';
-import { ensureSites, mount, reset, setConstants, writeGuardHosts, GUARD } from '../lib/warmsites.mjs';
+import { ensureSites, mount, reset, setConstants, writeGuardHosts, GUARD, SITES } from '../lib/warmsites.mjs';
+import { LANE, qasiteShim } from '../lib/lane.mjs';
 import { project, projectText, profileOf, roles, mainFile } from '../lib/project.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -404,7 +405,8 @@ const depsEnv = { ...(await gh.composerAuthEnv(repo).catch(() => ({}))), ...proc
 const gitFallback = await gh.gitAuthEnv(repo, { fallback: true }).catch(() => null);
 const depsFallback = await gh.composerAuthEnv(repo, { fallback: true }).catch(() => null);
 
-// Worktrees are shared by every run, so only one run may use them at a time.
+// Worktrees are shared by every run in a lane, so only one run per lane may
+// use them at a time (lib/lane.mjs: another lane has its own).
 const lockFile = path.join(CACHE, 'run.lock');
 fs.mkdirSync(CACHE, { recursive: true });
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
@@ -418,6 +420,7 @@ if (!takeLock()) {
   if (!takeLock()) { console.error('Another QA run took the worktrees just now.'); process.exit(3); }
 }
 process.on('exit', () => { try { if (Number(fs.readFileSync(lockFile, 'utf8')) === process.pid) fs.rmSync(lockFile); } catch { /* gone */ } });
+if (LANE) log(`lane ${LANE}: worktrees in ${CACHE}, QA sites ${SITES.pr} and ${SITES.dev}`);
 
 const builds = [];
 const slotInfo = {};
@@ -582,7 +585,7 @@ if (mode === 'full') {
         if (needHub) qaSites[w].hub = hubUrl(w);
       }
       write('sites.json', qaSites);
-      log(`rexenv: sites ready in ${((Date.now() - t0) / 1000).toFixed(1)}s, qa-pr.rex runs ${Object.values(qaSites.pr.runs).join(' + ')}, qa-dev.rex runs ${Object.values(qaSites.dev.runs).join(' + ')}`);
+      log(`rexenv: sites ready in ${((Date.now() - t0) / 1000).toFixed(1)}s, ${SITES.pr} runs ${Object.values(qaSites.pr.runs).join(' + ')}, ${SITES.dev} runs ${Object.values(qaSites.dev.runs).join(' + ')}`);
     }
   } catch (e) {
     infra.push({ what: `rexenv is not ready: ${e.message}`, impact: 'no test site', blocking: true });
@@ -720,7 +723,7 @@ for (const [name, target] of [['qa-evidence', 'bin/qa-evidence'], ['hubenv', pat
   // qasite changes the QA sites, which belong to Miu's account: the agent
   // account reaches it only through its one sudo rule (lib/agentuser.mjs).
   const exe = AGENT_USER && name === 'qasite' ? AGENT_QASITE : path.join(ROOT, target);
-  fs.writeFileSync(path.join(binDir, name), `#!/usr/bin/env bash\nexec "${exe}" "$@"\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(binDir, name), name === 'qasite' ? qasiteShim(exe) : `#!/usr/bin/env bash\nexec "${exe}" "$@"\n`, { mode: 0o755 });
 }
 
 // Something the test needs is not there (a build, rexenv, a Hub, the AI
