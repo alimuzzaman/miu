@@ -486,7 +486,7 @@ test('an open pull request whose CI an older worker made runs again at its curre
 });
 
 test('the worker asks Sandbox for each job\'s whole output when Sandbox can keep it', needsYaml, async () => {
-  const yes = server({ help: '  --output-limit BYTES   keep this much of each job\'s output (0: all)' });
+  const yes = server({ help: '  --output-limit BYTES   keep this much of each output (0: all)' });
   await sandboxci.runSandboxCi(check(), prRepo({ '.github/workflows/test.yml': 'on: workflow_dispatch\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id }]\n' }), yes.env);
   const argv = yes.argv();
   assert.equal(argv[argv.indexOf('--output-limit') + 1], '2097152');
