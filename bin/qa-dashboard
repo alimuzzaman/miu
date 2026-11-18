@@ -138,6 +138,8 @@ function status(dir, name) {
     state, reached, verdict: state === 'running' ? null : verdict?.verdict ?? null, history,
     crashed: state === 'stopped' && !/stopped from the dashboard/.test(log),
     waiting: state === 'waiting' ? readJson(path.join(dir, 'waiting.json')) : null,
+    // Why the run did not test: which base, which commit, which files (qa-run, conflict.json).
+    conflict: state === 'conflict' ? readJson(path.join(dir, 'conflict.json')) : null,
     last: (log.trim().split('\n').pop() ?? '').replace(/^\[qa [\d:]+\] /, ''),
     // What the run is doing, in plain words, for the PR list (the raw log line
     // is on the run page).
@@ -240,7 +242,8 @@ function listRuns() {
       failed: sm ? sm.claims.filter((c) => c.state === 'fail').length : null,
       issues: sm ? sm.issues.length : null,
       last: st.state === 'running' ? st.last : null,
-      conflictKind: st.state === 'conflict' ? readJson(path.join(dir, 'conflict.json'))?.kind ?? 'conflict' : null,
+      conflictKind: st.state === 'conflict' ? st.conflict?.kind ?? 'conflict' : null,
+      conflictFiles: st.state === 'conflict' ? (st.conflict?.files ?? []).slice(0, 10) : null,
     };
   }).sort((a, b) => b.mtime - a.mtime);
 }
