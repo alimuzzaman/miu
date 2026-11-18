@@ -687,6 +687,8 @@ function ciScan() {
   // A paired run's other pull requests (Free, Pro, Hub: context/pair.json) get
   // their own CI too, each on its own repo at its own current head.
   for (const x of linkedPrs(live && readJson(path.join(RUNS, live, 'context/pair.json')), repos())) ciFor(x.repo, x.pr);
+  // Open pull requests whose CI an older worker made, one at a time while the line has room.
+  ci.refreshStale(prCache.list.filter((p) => repos().includes(p.repo)), { max: 1, room: ciParallel() });
   ci.tick();
 }
 

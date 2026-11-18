@@ -564,6 +564,15 @@ for j in seen:
     # Miu's options first: a dangling --health-cmd at the end of the workflow's cannot take one as its value.
     c["options"] = " ".join(add + [c["options"]]) if isinstance(c.get("options"), str) and c["options"].strip() else " ".join(add)
     jobs[j]["container"] = c
+    # The workspace belongs to this account and the container runs as its
+    # image's user (root), so git refuses it as "dubious ownership" and
+    # Composer cannot read the version. On GitHub actions/checkout trusts the
+    # workspace; under act it copies the files instead. The same, first, in
+    # plain shell: git may not be installed yet, and an old git reads no
+    # GIT_CONFIG_* variables.
+    if isinstance(jobs[j].get("steps"), list):
+        jobs[j]["steps"].insert(0, {"name": "Miu: trust the workspace for git", "shell": "sh", "continue-on-error": True,
+                                    "run": 'printf \'[safe]\\n\\tdirectory = %s\\n\' "$GITHUB_WORKSPACE" >> "${HOME:-/root}/.gitconfig" || true\n'})
     changed = True
 # The paths the job's run steps write test reports to.
 REPORT = re.compile(r"(?:--outputFile|--log-junit|--junitxml|--junit-xml)(?:=|[ \t]+)(['\"]?)([A-Za-z0-9_./-]{1,200})\1")
@@ -623,10 +632,16 @@ artifact_differences=()
 for d in pattern-unsupported runner-temp-unsupported missing-semantics options-unsupported; do
   artifact_differences+=(--accept-difference "sandbox.artifact-$d")
 done
+# The whole of each job's output, where Sandbox can keep it: without this it
+# keeps the last 6000 characters. An older Sandbox refuses the option.
+output_args=()
+sb_help=$(bounded 30 "$sb" ci run --help </dev/null 2>/dev/null || true)
+if [[ $sb_help == *--output-limit* ]]; then output_args=(--output-limit 2097152); fi
+unset sb_help
 run_ci() {
   bounded "$((seconds + 60))" "$sb" ci run "$root/$workflow" --local --project-dir "$root" --json \
     --event "$event" --timeout "$seconds" --runtime none --job "$job" ${matrix_args[@]+"${matrix_args[@]}"} \
-    "${artifact_differences[@]}" --as-runner --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice "$@"
+    "${artifact_differences[@]}" --as-runner --container-limit "memory=${run_mem_gb}g" --container-limit "cpus=${run_cpus}" --container-limit cgroup-parent=miu-ci.slice ${output_args[@]+"${output_args[@]}"} "$@"
 }
 rc=0
 if [ ${#secret_lines[@]} -gt 0 ]; then

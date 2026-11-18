@@ -294,12 +294,12 @@ function prRepo(files) {
 }
 // The real worker with a stand-in `sb` (it keeps the workflow it was given and
 // can play the job writing its reports) and a stand-in `docker`.
-function server({ docker = 'exit 0', plan = '{"jobs":[{"id":"a","cells":[{"matrix":{}}]}]}', cells = '[{"label":"a","status":"passed","exit_code":0,"output":"[t/a]   🏁  Job succeeded"}]', job = '' } = {}) {
+function server({ help = '', docker = 'exit 0', plan = '{"jobs":[{"id":"a","cells":[{"matrix":{}}]}]}', cells = '[{"label":"a","status":"passed","exit_code":0,"output":"[t/a]   🏁  Job succeeded"}]', job = '' } = {}) {
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const bin = fs.mkdtempSync(path.join(tmp, 'bin-'));
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
-  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\ncp "$3" "${home}/workflow"\nproject="$6"\n${job}\necho '{"ok":true,"cells":${cells}}'`);
+  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nif [ "$3" = --help ]; then echo '${help}'; exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\ncp "$3" "${home}/workflow"\nproject="$6"\n${job}\necho '{"ok":true,"cells":${cells}}'`);
   script(path.join(bin, 'sudo'), 'shift 4\nexec "$@"');
   script(path.join(bin, 'timeout'), 'shift 3\nexec "$@"');
   script(path.join(bin, 'docker'), `printf '%s\\n' "$*" >> "${bin}/docker-calls"\n${docker}`);
@@ -312,6 +312,7 @@ function server({ docker = 'exit 0', plan = '{"jobs":[{"id":"a","cells":[{"matri
     env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no.lock'), MIU_CI_RUNNER_UID: String(process.getuid()), MIU_CI_SECRET_NAMES: names, MIU_CI_SECRET_NAMES_OWNER: SELF, MIU_CI_NODE_BIN: node },
     node,
     ran: () => fs.existsSync(path.join(home, 'workflow')),
+    argv: () => fs.readFileSync(path.join(home, 'argv'), 'utf8').trim().split('\n'),
     workflow: () => fs.readFileSync(path.join(home, 'workflow'), 'utf8'),
     docker: () => { try { return fs.readFileSync(path.join(bin, 'docker-calls'), 'utf8'); } catch { return ''; } },
   };
@@ -456,4 +457,53 @@ test('a deleted comment is not waited for; a rerun\'s file takes over the commen
   const rest = async (method) => { if (method === 'GET') throw new Error('GitHub GET repos/o/free/issues/comments/12: HTTP 404 Not Found'); return {}; };
   await sweepCiComments({ dir, lookup: () => done, rest: async (m, p) => (p.endsWith('/12') ? rest(m) : m === 'GET' ? { body: '<!-- miu-ci -->x<!-- /miu-ci -->', user: { login: 'b' } } : {}), collaborator: () => null, now: 2000 });
   assert.deepEqual(fs.readdirSync(dir), [], 'both done: one edited, one gone');
+});
+
+// ---- the orchestrator's scope addition (2026-11-18): stale records, whole logs, git in a container job
+
+test('an open pull request whose CI an older worker made runs again at its current head, one at a time, and then not again', async () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'ci-'));
+  const OLD = 'b'.repeat(40), NEW = 'e'.repeat(40);
+  // The two 11-15 failures: Sandbox's old blocking-id format, and Pro's sibling checkout with no token.
+  fs.writeFileSync(path.join(dir, `xspeed-208-${OLD.slice(0, 12)}.json`), JSON.stringify({ key: `xspeed-208-${OLD.slice(0, 12)}`, repo: 'o/xspeed', pr: 208, sha: OLD, at: 100, rules: 6, state: 'ready', jobs: [{ n: 0, label: 'CI: js', status: 'not_run', reason: 'Sandbox refused this workflow: , ' }] }));
+  fs.writeFileSync(path.join(dir, `xspeed-pro-30-${OLD.slice(0, 12)}.json`), JSON.stringify({ key: `xspeed-pro-30-${OLD.slice(0, 12)}`, repo: 'o/xspeed-pro', pr: 30, sha: OLD, at: 200, rules: 6, state: 'ready', jobs: [{ n: 0, label: 'CI: php', status: 'failed', reason: null, hasLog: true }] }));
+  const started = [];
+  let busy = false;
+  const c = ci.createCi({ dir, now: () => 1000, parallel: () => 1, prCiFor: () => [{ workflow: '.github/workflows/ci.yml' }], parse: (files) => files.map((f) => ({ path: f.path, doc: JSON.parse(f.text) })),
+    prepare: async () => ({ gitDir: '/bare', workflows: [{ path: '.github/workflows/ci.yml', text: JSON.stringify({ on: { workflow_dispatch: {} }, jobs: { a: ubuntu() } }) }] }),
+    runJob: (check, d, sha) => new Promise((resolve) => { started.push(sha); busy = true; setTimeout(() => { busy = false; resolve({ status: 0, out: '' }); }, 5); }) });
+  assert.equal(typeof c.refreshStale, 'function');
+  const open = [{ repo: 'o/xspeed', number: 208, headRefOid: NEW }, { repo: 'o/xspeed-pro', number: 30, headRefOid: NEW }, { repo: 'o/xspeed', number: 999, headRefOid: NEW }];
+  assert.deepEqual(c.refreshStale(open, { max: 1, room: 1 }), ['o/xspeed#208'], 'the oldest first, one at a time');
+  assert.deepEqual(c.refreshStale(open, { max: 1, room: 1 }), [], 'not while one is being read');
+  await settle(); await settle();
+  assert.equal(busy, false);
+  assert.deepEqual(c.refreshStale(open, { max: 1, room: 1 }), ['o/xspeed-pro#30']);
+  await settle(); await settle();
+  assert.deepEqual(started, [NEW, NEW], 'each at its current head');
+  assert.equal(c.get('o/xspeed', 208, NEW).worker, ci.CI_WORKER);
+  assert.deepEqual(c.refreshStale(open, { max: 5, room: 5 }), [], 'current now: not again, and a PR that never had CI is left to the queue');
+});
+
+test('the worker asks Sandbox for each job\'s whole output when Sandbox can keep it', needsYaml, async () => {
+  const yes = server({ help: '  --output-limit BYTES   keep this much of each job\'s output (0: all)' });
+  await sandboxci.runSandboxCi(check(), prRepo({ '.github/workflows/test.yml': 'on: workflow_dispatch\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id }]\n' }), yes.env);
+  const argv = yes.argv();
+  assert.equal(argv[argv.indexOf('--output-limit') + 1], '2097152');
+  const old = server({ help: '  --timeout SECONDS' });
+  await sandboxci.runSandboxCi(check(), prRepo({ '.github/workflows/test.yml': 'on: workflow_dispatch\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id }]\n' }), old.env);
+  assert.equal(old.argv().includes('--output-limit'), false, 'an older Sandbox would refuse it');
+});
+
+test('a container job trusts its workspace for git first, as actions/checkout does on GitHub', needsYaml, async () => {
+  const s = server({ plan: plan83 });
+  await sandboxci.runSandboxCi(check('.github/workflows/test.yml', 'php', { php: '8.3' }), prRepo({ '.github/workflows/test.yml': PHP }), s.env);
+  const steps = JSON.parse(spawnSync('python3', ['-c', 'import json,sys,yaml; print(json.dumps(yaml.safe_load(sys.stdin)))'], { input: s.workflow(), encoding: 'utf8' }).stdout).jobs.php.steps;
+  assert.equal(steps[0].name, 'Miu: trust the workspace for git');
+  assert.equal(steps[0].shell, 'sh');
+  // What the step does, in a shell like the container's.
+  const home = fs.mkdtempSync(path.join(tmp, 'gh-'));
+  spawnSync('sh', ['-c', steps[0].run], { env: { ...process.env, HOME: home, GITHUB_WORKSPACE: '/tmp/miu-ci.abc' } });
+  assert.equal(fs.readFileSync(path.join(home, '.gitconfig'), 'utf8'), '[safe]\n\tdirectory = /tmp/miu-ci.abc\n');
+  assert.equal(steps[1].uses, 'actions/checkout@v4', 'then the job as it was');
 });

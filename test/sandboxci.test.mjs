@@ -67,7 +67,7 @@ function sandboxHome({ stdout = '{"ok":true,"cells":[{"label":"a","status":"pass
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
-  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\ncat > "${home}/stdin"\necho "$TMPDIR" > "${home}/tmpdir"\nproject="$6"\necho "$project" > "${home}/project"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | LC_ALL=C sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
+  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nif [ "$3" = --help ]; then exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\ncat > "${home}/stdin"\necho "$TMPDIR" > "${home}/tmpdir"\nproject="$6"\necho "$project" > "${home}/project"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | LC_ALL=C sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
   return { home, read: (f) => fs.readFileSync(path.join(home, f), 'utf8').trim() };
 }
 
