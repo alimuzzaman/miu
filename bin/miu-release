@@ -12,7 +12,9 @@
 # module and import it names is there), and only then switches /srv/miu to it
 # with one rename. The CI worker (bin/miu-sandbox-ci, bin/miu-ci-mirror) goes
 # to /usr/local/lib/miu/versions/<sha>, behind the same kind of switch. Then
-# miu.service restarts.
+# miu.service restarts. A release whose bin/miu-release differs from this one
+# replaces /usr/local/lib/miu/miu-release with it after the build, and that
+# copy does the rest of the deploy.
 #
 # A restart does not stop a test or a CI job: the unit stops its main process
 # only (KillMode=process), each run keeps the release folder it started from,
@@ -53,10 +55,13 @@ BUILD_TMP=""
 trap '[ -z "$BUILD_TMP" ] || rm -rf "$BUILD_TMP"' EXIT
 CONVERTED=0
 
-# One deploy at a time.
+# One deploy at a time. A deploy handed on to the release's own copy of this
+# script (below) keeps the lock it took: fd 8 goes with the exec.
 install -d -m 0755 "$RELEASES"
-exec 8>"$RELEASES/.lock"
-flock -w 600 8 || die "another deploy holds $RELEASES/.lock"
+if [ -z "${MIU_RELEASE_HANDOFF:-}" ]; then
+  exec 8>"$RELEASES/.lock"
+  flock -w 600 8 || die "another deploy holds $RELEASES/.lock"
+fi
 
 # The release /srv/miu points at, by folder name; empty before the first deploy.
 current() { [ -L "$APP" ] && basename "$(readlink "$APP")" || true; }
@@ -373,6 +378,18 @@ case "$cmd" in
     ensure_repo
     sha=$(resolve "$want")
     build "$sha"
+    # The rest of the deploy (the worker, the CI network, the units) is this
+    # script's: a release that changes it installs its own copy as
+    # $LIB/miu-release, and that copy does the rest, so a deploy never runs
+    # an older script's steps for a newer release.
+    new=$RELEASES/$sha/bin/miu-release
+    if [ -z "${MIU_RELEASE_HANDOFF:-}" ] && [ -f "$new" ] && ! cmp -s "$new" "$LIB/miu-release"; then
+      install "${OWN[@]}" -m 0755 "$new" "$LIB/.miu-release.new"
+      mv -f "$LIB/.miu-release.new" "$LIB/miu-release"
+      say "This release changes miu-release: $LIB/miu-release is its copy now, and goes on with the deploy"
+      opts=(); [ "$restart_it" = 1 ] || opts=(--no-restart)
+      MIU_RELEASE_HANDOFF=1 exec "$LIB/miu-release" deploy "$sha" "${opts[@]}"
+    fi
     convert
     install -d -m 0755 "$DATA"
     for e in "${SHARED[@]}"; do [ -d "$DATA/$e" ] || ! id "$MIU_USER" >/dev/null 2>&1 || install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$DATA/$e"; done

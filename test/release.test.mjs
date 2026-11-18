@@ -134,6 +134,29 @@ test('the first move failing half way: /srv/miu points at the old folder again a
   assert.match(fs.readFileSync(path.join(s.root, 'systemctl.log'), 'utf8'), /stop miu\.service[\s\S]*start miu\.service/);
 });
 
+test('a release that changes miu-release installs its copy, which does the rest of the deploy under the same lock', linux, () => {
+  const s = server();
+  // Not the script that started the deploy: it says it ran, and whether the lock is still held.
+  fs.writeFileSync(path.join(s.src, 'bin/miu-release'), `#!/usr/bin/env bash\necho "handed: $* $MIU_RELEASE_HANDOFF $(flock -n "$MIU_RELEASES/.lock" true && echo free || echo held)" > "${s.root}/handed"\n`, { mode: 0o755 });
+  const one = s.commit('one');
+  const r = s.run('deploy', one, '--no-restart');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readFileSync(path.join(s.lib, 'miu-release'), 'utf8'), fs.readFileSync(path.join(s.src, 'bin/miu-release'), 'utf8'));
+  assert.equal(fs.readFileSync(path.join(s.root, 'handed'), 'utf8'), `handed: deploy ${one} --no-restart 1 held\n`);
+  assert.ok(!fs.existsSync(s.app), 'the copy it handed on to does the switch, not this script');
+});
+
+test('a release with the same miu-release deploys without handing on', linux, () => {
+  const s = server();
+  fs.copyFileSync(RELEASE, path.join(s.src, 'bin/miu-release'));
+  fs.copyFileSync(RELEASE, path.join(s.lib, 'miu-release'));
+  const one = s.commit('one');
+  const r = s.run('deploy', one);
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /goes on with the deploy/);
+  assert.equal(path.basename(fs.readlinkSync(s.app)), one);
+});
+
 test('the CI network helper goes in with the worker, behind a unit that holds it after a reboot', linux, () => {
   const s = server();
   fs.writeFileSync(path.join(s.src, 'bin/miu-ci-net'), '#!/usr/bin/env bash\necho net "$@"\n', { mode: 0o755 });
