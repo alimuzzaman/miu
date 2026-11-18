@@ -37,7 +37,7 @@ import { needsReply, waitsReply } from '../lib/cmdreply.mjs';
 import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelGone, takeNext } from '../lib/queuectl.mjs';
 import { createCi, ciRunCommit, shipSiblings, parseWorkflows, runningGroups, prCiProblem, forkOf, workflowsAt, linkedPrs } from '../lib/ci.mjs';
 import { sweepCiComments } from '../lib/cicomment.mjs';
 import { runSandboxCi, adoptSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
@@ -796,14 +796,19 @@ function prView() {
 // full: test every claim again instead of only what changed since the last
 // round. note: what a reviewer asked for in a /miu comment. by: who asked
 // (lib/queuectl.mjs); in manual mode only a person's entry starts.
-function enqueue(repo, pr, why, { full = false, note = '', force = false, by = 'auto' } = {}) {
+// label: the request label that queued it; the entry then starts only while
+// the pull request still has one (pump, labelGone). asked: a /miu comment, an
+// explicit ask that no label decides.
+function enqueue(repo, pr, why, { full = false, note = '', force = false, by = 'auto', label = null, asked = false } = {}) {
   const have = queue.find((q) => q.repo === repo && q.pr === pr);
   if (have) {
     if (full) have.full = true; if (force) have.force = true; if (note) have.note = note;
     if (by === 'person') { have.by = 'person'; have.held = false; } else if (by === 'github' && have.by !== 'person') have.by = 'github';
+    // A person or a /miu comment asked for it: no label decides any more.
+    if (by === 'person' || asked) have.label = null; else if (label && !have.label && have.by !== 'person' && have.by !== 'auto') have.label = label;
     saveQueue(); pump(); return { ok: true, queued: true, waits: holdReason(have, queueState()) };
   }
-  const q = { repo, pr, why, by, held: false, full, force, note, at: Date.now() };
+  const q = { repo, pr, why, by, held: false, full, force, note, at: Date.now(), ...(label && by !== 'person' && !asked ? { label } : {}) };
   queue.push(q);
   saveQueue();
   pump();
@@ -812,7 +817,7 @@ function enqueue(repo, pr, why, { full = false, note = '', force = false, by = '
 
 // Queue a PR unless another PR of its pair is already queued or running: one
 // paired run tests them all.
-async function enqueuePair(repo, pr, why, by = 'auto') {
+async function enqueuePair(repo, pr, why, by = 'auto', label = null) {
   let keys = [];
   try { keys = Object.values(await partnersOf(repo, pr)).map((x) => `${x.repo}#${x.number}`); } catch (e) { console.error('pair lookup:', e.message); }
   const live = liveRun();
@@ -820,7 +825,7 @@ async function enqueuePair(repo, pr, why, by = 'auto') {
   const own = dir && readJson(path.join(dir, 'context/pr.json'))?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
   const liveKeys = dir ? [own && `${own[1]}#${own[2]}`, ...(readJson(path.join(dir, 'context/pair.json')) ?? []).map((x) => `${x.repo}#${x.number}`)].filter(Boolean) : [];
   if (keys.some((k) => queue.some((q) => `${q.repo}#${q.pr}` === k) || liveKeys.includes(k))) return { ok: true, queued: false, pairedWith: keys };
-  return enqueue(repo, pr, why, { by });
+  return enqueue(repo, pr, why, { by, label });
 }
 
 // Start the next queued run that may start (lib/queuectl.mjs) when nothing is running.
@@ -853,10 +858,16 @@ async function pump() {
     }
     queueHeld = null;
   } catch (e) { console.error('queue check:', e.message); } finally { pumping = false; }
-  const at = nextIndex(queue, queueState());
-  if (at < 0 || liveRun()) return;
-  const [next] = queue.splice(at, 1);
-  saveQueue();
+  // An entry a request label queued starts only while the PR still asks: the
+  // label may have come off, or the PR closed, while it waited (takeNext).
+  let next = null;
+  pumping = true;
+  try {
+    const took = await takeNext(queue, queueState, { readPr: (repo, pr) => gh.prBasic(repo, pr), asks: [...L().request, L().retest], busy: () => !!liveRun(), log: (m) => console.error(m) });
+    if (took.dropped.length || took.next) saveQueue();
+    next = took.next;
+  } finally { pumping = false; }
+  if (!next) return;
   const cfg = getConfig();
   const r = startRun({ repo: next.repo, pr: next.pr, model: cfg.model, dryRun: !cfg.post, full: next.full, force: next.force, note: next.note, slack: cfg.post && cfg.slack });
   if (r.error) console.error(`Could not start ${next.repo}#${next.pr}: ${r.error}`);
@@ -974,6 +985,10 @@ async function autoScan() {
       const open = new Set(list.map((p) => `${p.repo}#${p.number}`));
       const gone = queue.filter((q) => q.by !== 'person' && !open.has(`${q.repo}#${q.pr}`));
       if (gone.length) { for (const q of gone) queue.splice(queue.indexOf(q), 1); saveQueue(); }
+      // An entry a request label queued goes once the label is off the PR.
+      const byKey = new Map(list.map((p) => [`${p.repo}#${p.number}`, p]));
+      const unasked = queue.filter((q) => labelGone(q, byKey.get(`${q.repo}#${q.pr}`) && { state: 'OPEN', labels: byKey.get(`${q.repo}#${q.pr}`).labels }, [...L().request, L().retest]));
+      if (unasked.length) { for (const q of unasked) { queue.splice(queue.indexOf(q), 1); console.error(`queue: dropped ${q.repo}#${q.pr}: label removed while queued`); } saveQueue(); }
     }
     const runs = runsByPr();
     const heads = new Map(list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid]));
@@ -994,7 +1009,8 @@ async function autoScan() {
         if (empty >= 2) continue;
         // A person took it out of the line at this commit (unqueue).
         if (labelDismissed(cfg, `${p.repo}#${p.number}`, p.headRefOid)) continue;
-        if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${p.labels.find((l) => asks.includes(l))}`, 'github');
+        const asked = p.labels.find((l) => asks.includes(l));
+        if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${asked}`, 'github', asked);
         continue;
       }
       if (skipReason(p)) continue;
@@ -1448,7 +1464,7 @@ async function scanCommands() {
       const rest = m[2].trim();
       const full = /^full\b/i.test(rest);
       const note = (full ? rest.replace(/^full\b/i, '') : rest).trim();
-      enqueue(repo, pr, `/miu from ${c.user.login}`, { full, note: note ? `${c.user.login}: ${note}` : '', by: 'github' });
+      enqueue(repo, pr, `/miu from ${c.user.login}`, { full, note: note ? `${c.user.login}: ${note}` : '', by: 'github', asked: true });
       await gh.rest('POST', `repos/${repo}/issues/comments/${c.id}/reactions`, { body: { content: 'eyes' } }).catch(() => {});
       console.log(`queued ${repo}#${pr} from /miu by ${c.user.login}${full ? ' (full)' : ''}`);
       // Manual mode: say it waits for a person, once per trigger (lib/cmdreply.mjs).
