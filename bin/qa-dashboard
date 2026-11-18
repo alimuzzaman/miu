@@ -675,6 +675,8 @@ function ciFor(repo, pr, { again = false, by = 'auto' } = {}) {
 // What gets CI: the run going now, and what in the queue may start (all of it
 // in auto mode, what a person picked in manual mode). Paused: nothing new.
 function ciScan() {
+  // Comments posted earlier still get their CI section while the queue is paused.
+  ciCommentsTick();
   if (queueState().paused) return;
   const st = queueState();
   for (const q of queue) if (!holdReason(q, st)) ciFor(q.repo, q.pr);
@@ -686,7 +688,6 @@ function ciScan() {
   // their own CI too, each on its own repo at its own current head.
   for (const x of linkedPrs(live && readJson(path.join(RUNS, live, 'context/pair.json')), repos())) ciFor(x.repo, x.pr);
   ci.tick();
-  ciCommentsTick();
 }
 
 // The CI section of result comments posted while CI was still going

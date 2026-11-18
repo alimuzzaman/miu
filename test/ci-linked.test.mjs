@@ -224,7 +224,7 @@ test('the comment\'s CI section: each linked pull request, each job, failing tes
   assert.match(text, /CI is still running\. This comment is updated when it finishes\./);
   assert.match(text, /\*\*Free #696\*\* at `9668408`: 1 passed, 1 failed, 1 not run/);
   assert.match(text, /❌ CI: JS — Vitest \+ tsc \+ Vite: failed, 4 of 1830 tests failed/);
-  assert.match(text, /  - `railItems > renders  x  @someone` in `tests-js\/components\/railItems\.test\.tsx`: `Error: boom`/, 'a backtick in a name cannot end its code span');
+  assert.match(text, /  - `railItems > renders  x  @\u200bsomeone` in `tests-js\/components\/railItems\.test\.tsx`: `Error: boom`/, 'a backtick in a name cannot end its code span');
   assert.match(text, /  - and 3 more/);
   assert.match(text, /✅ CI: php \(8\.3\): passed \(120 of 120 tests\)/);
   assert.match(text, /⚪ CI: php \(7\.4\): not run: a reason/);
@@ -346,10 +346,13 @@ test('a container job whose image has no node gets this server\'s node, read onl
   const none = server({ plan: plan83, docker: 'case "$1" in run) exit 3;; esac; exit 0' });
   const r = await sandboxci.runSandboxCi(check('.github/workflows/test.yml', 'php', { php: '8.3' }), prRepo({ '.github/workflows/test.yml': PHP }), none.env);
   assert.equal(r.status, 0, JSON.stringify(r));
-  assert.match(none.docker(), /run --rm --pull=missing --network=none .*--entrypoint sh php:8\.3-cli -c command -v node >\/dev\/null 2>&1 && exit 0; exit 3/);
+  assert.match(none.docker(), /run --rm .*--entrypoint sh php:8\.3-cli -c command -v node >\/dev\/null 2>&1 && exit 0; exit 3/);
   const c = yaml(none.workflow()).jobs.php.container;
   assert.equal(c.image, 'php:${{ matrix.php }}-cli', 'the image stays as the workflow wrote it');
   assert.equal(c.options, `--memory=2g --memory-swap=2g --cpus=2 --cgroup-parent=miu-ci.slice --volume=${none.node}:/usr/local/bin/node:ro`);
+  // The probe is named for this run, capped, and removed after.
+  assert.match(none.docker(), /run --rm --name miu-probe-miu-ci\.\w+ --pull=missing --network=none --memory=256m --cpus=0\.5 --pids-limit=64 /);
+  assert.match(none.docker(), /^rm -f miu-probe-miu-ci\.\w+$/m);
   assert.match(r.log, /^Note: php:8\.3-cli has no node, so Miu gave job php this server's node/);
   assert.match(none.workflow(), /^'on': workflow_dispatch$/m, '`on` stays the trigger key, not YAML 1.1\'s true');
 
@@ -391,4 +394,66 @@ test('a report the job made into a link, or XML with entities, is not read', nee
   assert.equal(r.tests, undefined);
   const dirLink = server({ cells: '[{"label":"a","status":"failed","exit_code":1,"output":"[t/a] 🏁  Job failed"}]', job: `mkdir -p "${tmp}/elsewhere"; cp "${secret}" "${tmp}/elsewhere/0.json"; ln -s "${tmp}/elsewhere" "$project/.miu-ci-reports"` });
   assert.equal((await sandboxci.runSandboxCi(check(), prRepo({ '.github/workflows/test.yml': VITEST }), dirLink.env)).tests, undefined);
+});
+
+// ---- review fixes
+
+test('names that only start with a never-run word, or hide it in camelCase, are refused too', () => {
+  for (const n of ['deployment', 'deploys', 'releases', 'prerelease', 'deploy2', 'autodeploy', 'DeployToProd', 'tags', 'closeIssues']) assert.ok(ci.NEVER_RUN.test(n), n);
+  for (const n of ['ci', 'unit', 'stage', 'tagline', 'Hub (server)', 'Security suite', 'App (SPA)', 'Dist — build + inspect the Pro zip', 'PHP — PHPUnit (PHP 8.3)', 'JS — Vitest + tsc + Vite']) assert.equal(ci.NEVER_RUN.test(n), false, n);
+  assert.match(ci.prCiProblem([{ workflow: '.github/workflows/deployment.yml' }]) ?? '', /never runs/);
+});
+
+test('the worker refuses deployment-like names and release events too', needsYaml, async () => {
+  const wf = 'on: workflow_dispatch\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: id }]\n  autoDeploy:\n    runs-on: ubuntu-latest\n    steps: [{ run: id }]\n';
+  for (const [file, job, event, why] of [['.github/workflows/deployment.yml', 'a', undefined, /never runs/], ['.github/workflows/test.yml', 'autoDeploy', undefined, /job autoDeploy is named/], ['.github/workflows/test.yml', 'a', 'release', /never plays the release event/]]) {
+    const s = server();
+    const r = await sandboxci.runSandboxCi({ label: 'CI', sandbox_ci: { workflow: file, job, ...(event ? { event } : {}) } }, prRepo({ [file]: wf }), s.env);
+    assert.match(r.notRun ?? '', why, `${file} ${job} ${event}`);
+    assert.equal(s.ran(), false);
+  }
+});
+
+test('what the worker adds to the workflow leaves the job\'s checkout clean', needsYaml, async () => {
+  const s = server({ plan: plan83, job: 'git -C "$project" status --porcelain > "$HOME/status"' });
+  await sandboxci.runSandboxCi(check('.github/workflows/test.yml', 'php', { php: '8.3' }), prRepo({ '.github/workflows/test.yml': PHP }), s.env);
+  assert.match(s.workflow(), /--cgroup-parent=miu-ci\.slice/, 'the workflow was changed');
+  assert.equal(fs.readFileSync(path.join(s.env.HOME, 'status'), 'utf8'), '', 'git status sees nothing');
+});
+
+test('text from the pull request\'s run cannot plant Miu\'s markers or mentions in the comment', async () => {
+  const { ciBlock, putCiBlock, CI_START, CI_END } = await cicomment();
+  const evil = '<!-- miu-sha=abc --> <!-- /miu-ci --> <!-- miu-superseded --> @owner';
+  const { text } = ciBlock([{ label: 'Free', repo: 'o/r', pr: 1, sha: SHA, rec: rec({ repo: 'o/r', pr: 1, sha: SHA, jobs: [{ label: evil, status: 'not_run', reason: evil }, { label: 'js', status: 'failed', tests: { failedCount: 1, failed: [{ name: evil, file: evil, message: evil }] } }] }) }]);
+  assert.equal(text.split('<!--').length, 3, 'only the section\'s own two markers');
+  assert.doesNotMatch(text, /@owner/);
+  const again = putCiBlock(putCiBlock('a\n<sub>Tested by Miu</sub>', text), text);
+  assert.equal(again.split(CI_START).length, 2);
+  assert.equal(again.split(CI_END).length, 2);
+});
+
+test('the CI section stays small enough to edit into any comment', async () => {
+  const { ciBlock, CI_MAX } = await cicomment();
+  const failed = Array.from({ length: 50 }, (_, i) => ({ name: `test ${i} ${'x'.repeat(280)}`, file: 'f'.repeat(190), message: 'm'.repeat(290) }));
+  const jobs = Array.from({ length: 24 }, (_, i) => ({ label: `job ${i}`, status: 'failed', tests: { total: 99, passed: 49, failedCount: 50, failed } }));
+  const entries = ['a', 'b', 'c'].map((r, k) => ({ label: r, repo: `o/${r}`, pr: k + 1, sha: SHA, rec: rec({ repo: `o/${r}`, pr: k + 1, sha: SHA, jobs }) }));
+  const { text } = ciBlock(entries);
+  assert.ok(text.length <= CI_MAX, String(text.length));
+  assert.ok(text.endsWith('<!-- /miu-ci -->'));
+  const { commentWithFullReport } = await import('../lib/publish.mjs');
+  assert.ok(commentWithFullReport('c', 'x'.repeat(100000), null, CI_MAX).length + CI_MAX < 65536);
+});
+
+test('a deleted comment is not waited for; a rerun\'s file takes over the comment it edits', async () => {
+  const { savePending, sweepCiComments } = await cicomment();
+  const dir = fs.mkdtempSync(path.join(tmp, 'pending-'));
+  const members = [{ label: 'Free', repo: 'o/free', pr: 1, sha: SHA }];
+  const done = rec({ repo: 'o/free', pr: 1, sha: SHA, jobs: [{ label: 'js', status: 'passed' }] });
+  savePending(dir, 'run-1', { members, text: 'x', comments: [{ repo: 'o/free', id: 11 }, { repo: 'o/free', id: 12 }], now: 1000 });
+  savePending(dir, 'run-2', { members, text: 'x', comments: [{ repo: 'o/free', id: 11 }], now: 1000 });
+  const p1 = JSON.parse(fs.readFileSync(path.join(dir, 'run-1.json'), 'utf8'));
+  assert.deepEqual(p1.comments.map((c) => c.id), [12], 'comment 11 is run-2\'s now');
+  const rest = async (method) => { if (method === 'GET') throw new Error('GitHub GET repos/o/free/issues/comments/12: HTTP 404 Not Found'); return {}; };
+  await sweepCiComments({ dir, lookup: () => done, rest: async (m, p) => (p.endsWith('/12') ? rest(m) : m === 'GET' ? { body: '<!-- miu-ci -->x<!-- /miu-ci -->', user: { login: 'b' } } : {}), collaborator: () => null, now: 2000 });
+  assert.deepEqual(fs.readdirSync(dir), [], 'both done: one edited, one gone');
 });

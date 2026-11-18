@@ -46,6 +46,8 @@ shift 4
 
 [[ $workflow =~ ^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$ ]] || die "not a workflow path: $workflow"
 [[ $event =~ ^[a-z_]{1,64}$ ]] || die "not an event name: $event"
+# Events a release, a deploy or automation runs on: never played here.
+case $event in release|deployment|deployment_status|registry_package|pull_request_target|workflow_run|issues|issue_comment) die "refused: Miu never plays the $event event, which a release, a deploy or automation runs on" ;; esac
 [[ $seconds =~ ^[0-9]{1,5}$ ]] || die "not a timeout: $seconds"
 [[ $job =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || die "not a job id: $job"
 matrix_args=()
@@ -188,6 +190,7 @@ root=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci.XXXXXX")
 config=$(mktemp -d "${TMPDIR:-/tmp}/miu-ci-config.XXXXXX")
 cleanup() {
   revoke_token
+  bounded 60 docker rm -f "miu-probe-${root##*/}" >/dev/null 2>&1 || true
   # A job stopped at its time limit leaves its containers behind.
   for id in $(bounded 30 docker ps -aq --filter name=act- 2>/dev/null || true); do
     if bounded 30 docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$id" 2>/dev/null | grep -qF "${root##*/}"; then
@@ -282,7 +285,14 @@ if not isinstance(jobs, dict):
 # Never a deploy, a release or a notice, whatever Miu's account asks for (the
 # owner's list, the same as lib/ci.mjs NEVER_RUN): by the file's name, the
 # workflow's name, and below each job's id and name.
-NEVER = re.compile(r"(^|[^a-z0-9])(deploy|release|publish|website[- _]?sync|announce|slack|tag|close-issues)([^a-z0-9]|$)", re.I)
+# The words anywhere in a name (deployment, prerelease, autodeploy), camelCase
+# split first (DeployToProd); tag only as a word of its own.
+NEVER_WORDS = re.compile(r"deploy|release|publish|website[- _]?sync|announce|slack|close[- _]?issues|(^|[^a-z0-9])tags?([^a-z0-9]|$)", re.I)
+class _Never:
+    @staticmethod
+    def search(name):
+        return NEVER_WORDS.search(re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", name))
+NEVER = _Never
 if NEVER.search(re.sub(r"\.ya?ml$", "", os.path.basename(path), flags=re.I)) or (isinstance(doc.get("name"), str) and NEVER.search(doc["name"])):
     refuse("it is a deploy, release or notification workflow, which Miu never runs")
 # Sandbox fills each secrets.X inside ${{ }} of a step from the server's
@@ -395,9 +405,12 @@ echo '--container-daemon-socket=-' > "$config/act/actrc"
 # lets a pull request set only --health-* options and no volumes, so what
 # this permits is what this worker adds. An act without the option has no
 # such restriction.
-if bounded 30 act --help 2>/dev/null | grep -q -- '--container-options-policy'; then
+# Read whole first: grep -q under pipefail would end act early and read as "no such option".
+act_help=$(bounded 30 act --help 2>/dev/null || true)
+if [[ $act_help == *--container-options-policy* ]]; then
   echo '--container-options-policy=allow' >> "$config/act/actrc"
 fi
+unset act_help
 export XDG_CONFIG_HOME="$config"
 # Sandbox writes act's secret file to TMPDIR; here it is gone with the folder
 # even if Sandbox is stopped before it can delete it.
@@ -519,14 +532,19 @@ while todo:
     todo += [needs] if isinstance(needs, str) else [n for n in needs if isinstance(n, str)]
 IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}")
 MATRIX = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
+PROBE = "miu-probe-" + os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path))))
 def has_node(image):
-    # The image act will run anyway, with no network and nothing mounted.
+    # The image act will run anyway, with no network, nothing mounted, small
+    # caps, and a name of this run's, so that it is removed whatever happens
+    # (here, and in the worker's cleanup).
     try:
-        r = subprocess.run(["docker", "run", "--rm", "--pull=missing", "--network=none", "--memory=256m", "--cgroup-parent=miu-ci.slice",
+        r = subprocess.run(["docker", "run", "--rm", "--name", PROBE, "--pull=missing", "--network=none", "--memory=256m", "--cpus=0.5", "--pids-limit=64", "--cgroup-parent=miu-ci.slice",
                             "--entrypoint", "sh", image, "-c", "command -v node >/dev/null 2>&1 && exit 0; exit 3"],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
     except (OSError, subprocess.SubprocessError):
         return None
+    finally:
+        subprocess.run(["docker", "rm", "-f", PROBE], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
     # 3 is the image saying it has no node; anything else (no sh, no image) is not known.
     return {0: True, 3: False}.get(r.returncode)
 notes, changed = [], False
@@ -543,7 +561,8 @@ for j in seen:
     if isinstance(image, str) and IMAGE.fullmatch(image) and os.path.isfile(node_bin) and has_node(image) is False:
         add.append(f"--volume={node_bin}:/usr/local/bin/node:ro")
         notes.append(f"{image} has no node, so Miu gave job {j} this server's node for its JavaScript actions (GitHub mounts its own)")
-    c["options"] = " ".join([c["options"]] + add) if isinstance(c.get("options"), str) and c["options"].strip() else " ".join(add)
+    # Miu's options first: a dangling --health-cmd at the end of the workflow's cannot take one as its value.
+    c["options"] = " ".join(add + [c["options"]]) if isinstance(c.get("options"), str) and c["options"].strip() else " ".join(add)
     jobs[j]["container"] = c
     changed = True
 # The paths the job's run steps write test reports to.
@@ -574,7 +593,7 @@ if reports and isinstance(job.get("steps"), list):
         if k > 7:
             break
         lines.append(f'if [ -f "{src}" ]; then cp "{src}" "$d/{k}{".xml" if src.endswith(".xml") else ".json"}" || true; fi')
-    job["steps"].append({"name": "Miu: keep the test reports", "if": "always()", "run": "\n".join(lines) + "\nexit 0\n"})
+    job["steps"].append({"name": "Miu: keep the test reports", "if": "always()", "shell": "sh", "continue-on-error": True, "run": "\n".join(lines) + "\nexit 0\n"})
     changed = True
 if changed:
     with open(path + ".miu", "w", encoding="utf-8") as f:
@@ -583,6 +602,9 @@ if changed:
 for n in notes:
     print(f"miu-ci-note {n}")
 PREPARE
+# The job's checkout stays clean: git status and git diff in the job do not
+# see what this worker changed in the workflow.
+quiet_git update-index --skip-worktree -- "$workflow"
 
 # Never --runtime sandbox: that starts what the repository declares, Compose
 # files included, with this account's Docker access.
@@ -674,7 +696,12 @@ for name in sorted(os.listdir(dfd)):
         else:
             if b"<!ENTITY" in data or b"<!DOCTYPE" in data:
                 continue
-            for tc in ET.fromstring(data).iter("testcase"):
+            parser = ET.XMLParser()
+            def no_entities(*_):
+                raise ValueError("entities")
+            parser.parser.EntityDeclHandler = no_entities
+            parser.feed(data)
+            for tc in parser.close().iter("testcase"):
                 total += 1
                 counted = True
                 bad = tc.find("failure")
