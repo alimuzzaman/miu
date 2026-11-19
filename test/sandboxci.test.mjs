@@ -844,23 +844,68 @@ test('the run commit marks the shipped sibling\'s checkout skipped under act, an
   const [doc] = (await parseWorkflows([{ path: 'ci.yml', text: plain.text }])).map((w) => w.doc);
   assert.equal(doc.jobs.php.steps[1].if, '${{ !env.ACT }}');
   assert.deepEqual(reposNeeded(doc, 'php', 'Acme/pro'), { checkouts: [], fetches: [], secrets: [], composer: false, npm: false }, 'the rewritten step is one act leaves out');
-  // An if it has already is kept, with act's condition after it.
-  for (const cond of ["github.event_name == 'pull_request'", "\${{ github.event_name == 'pull_request' }}"]) {
+  // An if it has already gives way to act's exact condition: only act runs
+  // this commit, and the exact form is the one every secret check skips.
+  for (const cond of ["github.event_name == 'pull_request'", "\${{ github.event_name == 'pull_request' }}", "a == '\${{ b }}'", 'false']) {
     const had = WF.replace(STEP, `${STEP}        if: ${cond}\n`);
     const r = await skip(had);
-    assert.equal(r.text, had.replace(`if: ${cond}\n`, `if: "\${{ (github.event_name == 'pull_request') && !env.ACT }}"\n`));
+    assert.equal(r.text, had.replace(`if: ${cond}\n`, 'if: "\${{ !env.ACT }}"\n'));
   }
   // Another repository, another path, a job the run does not run: untouched.
   for (const r of [await skip(WF, ['php'], 'Acme/other'), await skip(WF, ['php'], 'Acme/free', ['elsewhere']), await skip(WF, ['lint'])]) assert.deepEqual(r, { path: 'ci.yml', text: null, steps: 0 });
   // A workflow that skips it under act already: unchanged.
   assert.deepEqual(await skip(WF.replace(STEP, `${STEP}        if: \${{ !env.ACT }}\n`)), { path: 'ci.yml', text: null, steps: 0 });
+  // One already skipped in another form beside one to change: only that one changes.
+  const two = `jobs:\n  php:\n    steps:\n      - if: '!env.ACT'\n        uses: actions/checkout@v4\n        with: { repository: Acme/free, path: free }\n  js:\n    steps:\n      - uses: actions/checkout@v4\n        with: { repository: Acme/free, path: free }\n`;
+  const both = await skip(two, ['php', 'js']);
+  assert.equal(both.steps, 1);
+  assert.equal(both.text, two.replace('    steps:\n      - uses:', '    steps:\n      - if: \${{ !env.ACT }}\n        uses:'));
   // A one-line step gets the condition inside its braces.
   const flow = await skip('jobs:\n  php:\n    steps:\n      - { uses: actions/checkout@v4, with: { repository: Acme/free, path: free } }\n');
   assert.equal(flow.text, 'jobs:\n  php:\n    steps:\n      - { if: "\${{ !env.ACT }}", uses: actions/checkout@v4, with: { repository: Acme/free, path: free } }\n');
   // What cannot be changed safely is a problem, never a step left to run.
   assert.match((await skip(WF.replace(STEP, `${STEP}        if: >-\n          github.actor != 'x'\n`))).problem, /not a one-line value/);
-  assert.match((await skip(WF.replace(STEP, `${STEP}        if: a == '\${{ b }}'\n`))).problem, /cannot add to/);
-  assert.match((await skip('jobs:\n  php:\n    steps:\n      - &co\n        uses: actions/checkout@v4\n        with: { repository: Acme/free, path: free }\n      - *co\n')).problem, /same YAML node/);
+  const shared = /shares its YAML with another place/;
+  assert.match((await skip('jobs:\n  php:\n    steps:\n      - &co\n        uses: actions/checkout@v4\n        with: { repository: Acme/free, path: free }\n      - *co\n')).problem, shared);
+  // A checkout shared with a job the run does not run would change that job too.
+  assert.match((await skip('jobs:\n  php:\n    steps:\n      - &co\n        uses: actions/checkout@v4\n        with: { repository: Acme/free, path: free }\n  release:\n    steps:\n      - *co\n')).problem, shared);
+  assert.match((await skip('jobs:\n  php:\n    steps: &s\n      - uses: actions/checkout@v4\n        with: { repository: Acme/free, path: free }\n  release:\n    steps: *s\n')).problem, shared);
+  // Keys a YAML merge brings in, at the step, in its with, or for the job's steps.
+  const merged = /YAML merge/;
+  const D = 'x-co: &co\n  uses: actions/checkout@v4\n  with: { repository: Acme/free, path: free }\nx-with: &w\n  repository: Acme/free\n  path: free\nx-job: &job\n  steps:\n    - uses: actions/checkout@v4\n      with: { repository: Acme/free, path: free }\n';
+  for (const text of [
+    `${D}jobs:\n  php:\n    steps:\n      - <<: *co\n        name: Free\n`,
+    `${D}jobs:\n  php:\n    steps:\n      - name: Free\n        uses: actions/checkout@v4\n        with:\n          <<: *w\n`,
+    `${D}jobs:\n  php:\n    <<: *job\n    runs-on: ubuntu-22.04\n`,
+    `${D}jobs:\n  <<: { php: { steps: [{ uses: actions/checkout@v4, with: { repository: Acme/free, path: free } }] } }\n`,
+  ]) {
+    const r = await skip(text);
+    assert.match(r.problem ?? '', merged, text);
+    assert.equal(r.text, undefined);
+  }
+});
+
+test('through the worker\'s own policy, a shipped checkout with a condition and the token fallback names no secret once marked', needsYaml, async () => {
+  const sandbox = sandboxHome();
+  const { env } = server({ home: sandbox.home });
+  const WF = "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Free\n        if: github.event_name == 'push'\n        uses: actions/checkout@v4\n        with:\n          repository: Acme/free\n          token: ${{ secrets.FREE_REPO_TOKEN || github.token }}\n          path: free\n      - run: id\n";
+  const [marked] = await actSkipShipped([{ path: '.github/workflows/test.yml', text: WF, jobs: ['a'] }], 'Acme/free', ['free']);
+  assert.equal(marked.steps, 1);
+  const send = (text) => {
+    const src = fs.mkdtempSync(path.join(tmp, 'mark-'));
+    fs.mkdirSync(path.join(src, '.github/workflows'), { recursive: true });
+    fs.writeFileSync(path.join(src, '.github/workflows/test.yml'), text);
+    const tar = spawnSync('tar', ['-c', '-C', src, '.']).stdout;
+    return spawnSync(WORKER, ['.github/workflows/test.yml', 'push', '60', 'a'], { input: Buffer.concat([Buffer.from('miu-ci-secrets 0\n'), tar]), env, encoding: 'utf8' });
+  };
+  const before = send(WF);
+  assert.notEqual(before.status, 0, 'unmarked, the step\'s secret is one the run may not name');
+  assert.match(before.stderr, /refused: test\.yml: it names CI secrets its base branch's job does not: FREE_REPO_TOKEN/);
+  const after = send(marked.text);
+  assert.equal(after.status, 0, after.stderr);
+  // Miu's own count of the run's secrets agrees.
+  const [doc] = (await parseWorkflows([{ path: 'x', text: marked.text }])).map((w) => w.doc);
+  assert.deepEqual(reposNeeded(doc, 'a', 'Acme/pro').secrets, []);
 });
 
 test('a pull request whose workflow checks the shipped sibling out without the act condition gets no token for it', needsYaml, async () => {
