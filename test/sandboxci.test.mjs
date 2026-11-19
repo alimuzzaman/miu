@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runSandboxCi, sandboxCiProblem, reposNeeded, manifestRepos, deployKeyRepos, lockWithoutDists, sweepMirrorCopies } from '../lib/sandboxci.mjs';
-import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling, runningJobs, forkOf, workflowsAt, createCi, parseWorkflows } from '../lib/ci.mjs';
+import { prCiProblem, jobsOf, ciRunCommit, siblingPaths, shipSibling, runningJobs, forkOf, workflowsAt, createCi, parseWorkflows, actSkipShipped } from '../lib/ci.mjs';
 
 const WORKER = fileURLToPath(new URL('../bin/miu-sandbox-ci', import.meta.url));
 const MIRROR = fileURLToPath(new URL('../bin/miu-ci-mirror', import.meta.url));
@@ -816,6 +816,71 @@ test('a download the workflow skips under act needs no token: Miu ships the sibl
   await runSandboxCi(proCheck, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', trustedRef: git(dir, 'rev-parse', 'HEAD').stdout.trim(), mint: app.mint, revoke: app.revoke });
   assert.ok(!app.calls.mint[0][1].includes('free'), JSON.stringify(app.calls.mint));
   assert.deepEqual(app.calls.mint[0][1], ['pro', 'tools', 'hub']);
+});
+
+test('a checkout of the sibling Miu ships needs no token, even without the act condition; another repo or path still does', () => {
+  const shipped = [{ repo: 'acme/FREE', path: 'free' }];
+  const doc = { jobs: { php: { steps: [
+    { uses: 'actions/checkout@v4' },
+    { name: 'Free', uses: 'actions/checkout@v4', with: { repository: 'Acme/free', token: '${{ secrets.FREE_REPO_TOKEN || github.token }}', path: 'free/' } },
+    { uses: 'actions/checkout@v4', with: { repository: 'Acme/free', token: '${{ secrets.OTHER_TOKEN || github.token }}', path: 'elsewhere' } },
+    { uses: 'actions/checkout@v4', with: { repository: 'Acme/tools', path: 'free' } },
+  ] } } };
+  const r = reposNeeded(doc, 'php', 'Acme/pro', shipped);
+  assert.deepEqual(r.checkouts.sort(), ['Acme/free', 'Acme/tools']);
+  assert.deepEqual(r.secrets, ['OTHER_TOKEN']);
+  doc.jobs.php.steps.splice(2, 2);
+  assert.deepEqual(reposNeeded(doc, 'php', 'Acme/pro', shipped), { checkouts: [], fetches: [], secrets: [], composer: false, npm: false });
+  assert.deepEqual(reposNeeded(doc, 'php', 'Acme/pro').checkouts, ['Acme/free'], 'without shipped it counts as before');
+});
+
+test('the run commit marks the shipped sibling\'s checkout skipped under act, and changes nothing else', needsYaml, async () => {
+  const STEP = '      - name: Check out Free (xspeed) as sibling\n        uses: actions/checkout@v4\n';
+  const WF = `on: pull_request\njobs:\n  php:\n    runs-on: ubuntu-22.04\n    steps:\n      - uses: actions/checkout@v4\n${STEP}        with:\n          repository: Acme/free\n          token: \${{ secrets.FREE_REPO_TOKEN || github.token }}\n          path: free  # beside Pro\n      - name: Position Free\n        run: mv free ../free\n`;
+  const skip = (text, jobs = ['php'], repo = 'acme/FREE', paths = ['free']) => actSkipShipped([{ path: 'ci.yml', text, jobs }], repo, paths).then(([r]) => r);
+  const plain = await skip(WF);
+  assert.equal(plain.steps, 1);
+  assert.equal(plain.text, WF.replace(STEP, `      - if: \${{ !env.ACT }}\n        name: Check out Free (xspeed) as sibling\n        uses: actions/checkout@v4\n`));
+  const [doc] = (await parseWorkflows([{ path: 'ci.yml', text: plain.text }])).map((w) => w.doc);
+  assert.equal(doc.jobs.php.steps[1].if, '${{ !env.ACT }}');
+  assert.deepEqual(reposNeeded(doc, 'php', 'Acme/pro'), { checkouts: [], fetches: [], secrets: [], composer: false, npm: false }, 'the rewritten step is one act leaves out');
+  // An if it has already is kept, with act's condition after it.
+  for (const cond of ["github.event_name == 'pull_request'", "\${{ github.event_name == 'pull_request' }}"]) {
+    const had = WF.replace(STEP, `${STEP}        if: ${cond}\n`);
+    const r = await skip(had);
+    assert.equal(r.text, had.replace(`if: ${cond}\n`, `if: "\${{ (github.event_name == 'pull_request') && !env.ACT }}"\n`));
+  }
+  // Another repository, another path, a job the run does not run: untouched.
+  for (const r of [await skip(WF, ['php'], 'Acme/other'), await skip(WF, ['php'], 'Acme/free', ['elsewhere']), await skip(WF, ['lint'])]) assert.deepEqual(r, { path: 'ci.yml', text: null, steps: 0 });
+  // A workflow that skips it under act already: unchanged.
+  assert.deepEqual(await skip(WF.replace(STEP, `${STEP}        if: \${{ !env.ACT }}\n`)), { path: 'ci.yml', text: null, steps: 0 });
+  // A one-line step gets the condition inside its braces.
+  const flow = await skip('jobs:\n  php:\n    steps:\n      - { uses: actions/checkout@v4, with: { repository: Acme/free, path: free } }\n');
+  assert.equal(flow.text, 'jobs:\n  php:\n    steps:\n      - { if: "\${{ !env.ACT }}", uses: actions/checkout@v4, with: { repository: Acme/free, path: free } }\n');
+  // What cannot be changed safely is a problem, never a step left to run.
+  assert.match((await skip(WF.replace(STEP, `${STEP}        if: >-\n          github.actor != 'x'\n`))).problem, /not a one-line value/);
+  assert.match((await skip(WF.replace(STEP, `${STEP}        if: a == '\${{ b }}'\n`))).problem, /cannot add to/);
+  assert.match((await skip('jobs:\n  php:\n    steps:\n      - &co\n        uses: actions/checkout@v4\n        with: { repository: Acme/free, path: free }\n      - *co\n')).problem, /same YAML node/);
+});
+
+test('a pull request whose workflow checks the shipped sibling out without the act condition gets no token for it', needsYaml, async () => {
+  const app = fakeApp();
+  const dir = repo({ '.github/workflows/test.yml': PRO });
+  await runSandboxCi(proCheck, dir, server({ home: sandboxHome().home }).env, { repo: 'Acme/pro', trustedRef: git(dir, 'rev-parse', 'HEAD').stdout.trim(), mint: app.mint, revoke: app.revoke, shipped: [{ repo: 'Acme/free', path: 'free' }] });
+  assert.deepEqual(app.calls.mint[0][1], ['pro', 'tools', 'hub']);
+});
+
+test('the run commit takes a changed workflow in place of the pull request\'s, with its mode, and keeps the rest', async () => {
+  const dir = repo({ '.github/workflows/b.yml': 'b\n' });
+  const sha = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+  const run = (args, env, input) => Promise.resolve(spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8', input, env: { ...process.env, ...(env ?? {}) } }).stdout.trim());
+  const out = await ciRunCommit(run, sha, 'm', [], [{ path: '.github/workflows/test.yml', text: 'changed\n' }]);
+  assert.equal(git(dir, 'show', `${out}:.github/workflows/test.yml`).stdout, 'changed\n');
+  assert.equal(git(dir, 'show', `${sha}:.github/workflows/test.yml`).stdout, OK, 'the pull request keeps its own');
+  const ls = (c) => git(dir, 'ls-tree', '-r', c).stdout.split('\n').filter((l) => !l.endsWith('\t.github/workflows/test.yml'));
+  assert.deepEqual(ls(out), ls(sha));
+  assert.match(git(dir, 'ls-tree', out, '.github/workflows/test.yml').stdout, /^100644 blob/);
+  await assert.rejects(ciRunCommit(run, sha, 'm', [], [{ path: '.github/workflows/none.yml', text: 'x' }]), /no none\.yml/);
 });
 
 test('the sibling is shipped where the trusted workflow checks it out, in place of the pull request\'s copy', async () => {

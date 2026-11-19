@@ -38,7 +38,7 @@ import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, 
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed } from '../lib/queuectl.mjs';
-import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem, forkOf, workflowsAt } from '../lib/ci.mjs';
+import { createCi, ciRunCommit, shipSibling, actSkipShipped, parseWorkflows, runningJobs, prCiProblem, forkOf, workflowsAt } from '../lib/ci.mjs';
 import { runSandboxCi, adoptSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
 import { createStacks, sudoRunner, WORKER as STACK_WORKER } from '../lib/prstackctl.mjs';
@@ -621,11 +621,30 @@ async function prepareNow(repo, pr, sha) {
   const baseWorkflows = await workflowsAt((args) => gitAsync(['-C', bare, ...args]), tip);
   // Without the sibling the run would use whatever the pull request has at that path: tried again later instead.
   const sibling = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw Object.assign(new Error(e.lasting ? e.message : `could not fetch the sibling repository's source: ${e.message}`), { lasting: e.lasting }); });
-  const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, `Miu CI: ${sha.slice(0, 12)}${sibling ? ` with ${sibling.from} beside it` : ''}`, sibling?.extra ?? []);
+  const changedFiles = sibling ? await skipShippedCheckouts(bare, sha, sibling.skip, workflows) : [];
+  const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, `Miu CI: ${sha.slice(0, 12)}${sibling ? ` with ${sibling.from} beside it` : ''}`, sibling?.extra ?? [], changedFiles);
   // Kept under a ref so a gc of the clone does not take it while it waits.
   const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
   await gitAsync(['-C', bare, 'update-ref', runRef, runSha]);
-  return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, baseWorkflows, workflowsFrom, siblingFrom: sibling?.from ?? null, base, changed };
+  const shipped = sibling ? sibling.skip.paths.map((p) => ({ repo: sibling.skip.repo, path: p })) : [];
+  return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, baseWorkflows, workflowsFrom, siblingFrom: sibling?.from ?? null, shipped, base, changed };
+}
+// The workflows of the run commit whose checkouts of the shipped sibling act
+// must skip (lib/ci.mjs actSkipShipped): [{ path, text }] of those it changed.
+// The pull request's branch keeps its own. Read whole here (workflowsAt trims
+// and cuts), so the rest of each file stays as it is. A checkout that cannot
+// be marked stops the run: act would run it without a token.
+async function skipShippedCheckouts(bare, sha, skip, workflows) {
+  const raw = (file) => new Promise((resolve, reject) => execFile('git', ['-C', bare, 'show', `${sha}:${file}`], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 }, (e, out) => (e ? reject(new Error(`could not read ${file}`)) : resolve(out))));
+  const files = [];
+  for (const [i, w] of workflows.entries()) {
+    const jobs = [...new Set(skip.jobs.filter((j) => j.file === i).map((j) => j.job))];
+    if (jobs.length) files.push({ path: w.path, text: await raw(w.path), jobs });
+  }
+  const out = await actSkipShipped(files, skip.repo, skip.paths);
+  const bad = out.find((f) => f.problem);
+  if (bad) throw Object.assign(new Error(`Miu ships ${skip.repo} at ${skip.paths.join(', ')}, but could not mark its checkout in ${bad.path} as skipped under act (${bad.problem}); not run, since act would run that checkout without a token`), { lasting: true });
+  return out.filter((f) => typeof f.text === 'string').map((f) => ({ path: f.path, text: f.text }));
 }
 // The profile's sibling (Free beside Pro), shipped in the run commit (lib/ci.mjs shipSibling).
 // Only the jobs this run runs count (runningJobs): a release workflow's own
@@ -646,7 +665,7 @@ const ci = createCi({
   dir: CI_DIR, prepare: ciPrepare, parallel: ciParallel, isPaused: () => queueState().paused, scrub: ciScrub,
   coveredBy: (repo) => profiles().find((p) => p.repo === repo)?.fast_checks ?? [],
   prCiFor: (repo) => profiles().find((p) => p.repo === repo)?.pr_ci,
-  runJob: (check, gitDir, sha, { onStart, repo, trustedRef, spool }) => runSandboxCi(check, gitDir, process.env, { ref: sha, onStart, repo, trustedRef, spool }),
+  runJob: (check, gitDir, sha, { onStart, repo, trustedRef, spool, shipped }) => runSandboxCi(check, gitDir, process.env, { ref: sha, onStart, repo, trustedRef, spool, shipped }),
   // A job the previous dashboard started goes on through a restart or a deploy.
   adoptJob: (check, job) => adoptSandboxCi(check, job),
   log: (m) => console.log(m),
