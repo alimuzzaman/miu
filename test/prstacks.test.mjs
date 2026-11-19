@@ -71,6 +71,12 @@ test('no add while another stack is still building its first head', () => {
   assert.equal(r.waits['a#9'], 'building');
 });
 
+test('a stack whose first build failed does not hold up the next one', () => {
+  const stacks = [live(1, { applied: false, failed: true }), { key: 'a#9', state: 'waiting', at: 1 }];
+  const r = plan({ stacks, open: openOf(stacks), memMb: 8000, now });
+  assert.equal(r.add, 'a#9');
+});
+
 test(`at ${CAP}, the oldest idle stack goes first and the new one waits for the room`, () => {
   const stacks = [...Array.from({ length: CAP }, (_, i) => live(i)), { key: 'n#1', state: 'waiting', at: 1 }];
   const r = plan({ stacks, open: openOf(stacks), memMb: 8000, now });
