@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'miu-pr-stack');
@@ -163,4 +163,94 @@ test('add: pr-hub-base is a full stack name; a WordPress-only base is refused', 
   const h = harness();
   assert.equal(h.run('add', 'pr-hub-base', 'full', 'free=dev', 'pro=dev', 'hub=dev').status, 0);
   assert.notEqual(h.run('add', 'pr-hub-base', 'wp', 'free=dev', 'pro=dev').status, 0);
+});
+
+// wp-session: Docker stands in for the stack's wp-setup container. It records
+// each call's argv and stdin, lists IDS for `ps`, and answers `exec` with ANSWER.
+function dockerHarness({ ids = 'c0ffee', answer = '{"ok":true}' } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-pr-stack-docker-'));
+  const log = path.join(dir, 'calls');
+  const docker = path.join(dir, 'docker');
+  fs.writeFileSync(docker, `#!${process.execPath}
+const fs = require('fs'); const a = process.argv.slice(2);
+let stdin = ''; if (a[0] === 'exec') { try { stdin = fs.readFileSync(0, 'utf8'); } catch {} }
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ a, stdin }) + '\\n');
+if (a[0] === 'ps') { if (process.env.IDS) console.log(process.env.IDS); process.exit(0); }
+// HOLD_MS: how long an exec takes, with its start and end logged, to see overlap.
+if (process.env.HOLD_MS) { fs.appendFileSync(${JSON.stringify(log)} + '.spans', 'start ' + Date.now() + '\\n'); const until = Date.now() + Number(process.env.HOLD_MS); while (Date.now() < until) {} fs.appendFileSync(${JSON.stringify(log)} + '.spans', 'end ' + Date.now() + '\\n'); }
+console.log(process.env.ANSWER);
+`, { mode: 0o755 });
+  const env = { ...process.env, MIU_PR_STACK_DOCKER: docker, MIU_PR_STACK_SB: '/nonexistent-sb', MIU_PR_STACK_LOCKS: path.join(dir, 'locks'), IDS: ids, ANSWER: answer };
+  const run = (args, input) => spawnSync('bash', [WORKER, ...args], { encoding: 'utf8', input, env });
+  const spawnRun = (args, input, extra = {}) => new Promise((resolve) => {
+    const c = spawn('bash', [WORKER, ...args], { env: { ...env, ...extra } });
+    let out = ''; c.stdout.on('data', (d) => { out += d; });
+    c.on('close', (code) => resolve({ code, out }));
+    c.stdin.end(input);
+  });
+  const spans = () => fs.readFileSync(`${log}.spans`, 'utf8').trim().split('\n').map((l) => l.split(' '));
+  const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : []);
+  return { run, calls, spawnRun, spans };
+}
+const TOKEN = 'Abcdefghij0123456789Abcdefghij0123456789Abc';
+
+test('wp-session: the token goes to the stack\'s wp-setup on stdin, never in argv, and the answer comes back as it is', () => {
+  const h = dockerHarness({ answer: '{"ok":true,"host":"wp-pr-hub-7.xspeedcdn.online"}' });
+  const r = h.run(['wp-session', 'pr-hub-7', 'xspeed-hub-7-run'], `${TOKEN}\n`);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), '{"ok":true,"host":"wp-pr-hub-7.xspeedcdn.online"}');
+  const [ps, ex] = h.calls();
+  assert.deepEqual(ps.a, ['ps', '-q', '--filter', 'label=com.docker.compose.project=sandbox-host-xspeed-hub-pr-hub-7-sandbox', '--filter', 'label=com.docker.compose.service=wp-setup']);
+  assert.deepEqual(ex.a.slice(0, 10), ['exec', '-i', '-u', '33:33', '-w', '/var/www/html', '-e', 'HOME=/tmp', '-e', 'MIU_RUN=xspeed-hub-7-run']);
+  assert.deepEqual(ex.a.slice(10, 15), ['c0ffee', 'wp', 'eval', '--skip-plugins', '--skip-themes']);
+  assert.match(ex.a[15], /session_tokens/);
+  assert.equal(ex.stdin, `${TOKEN}\n`);
+  assert.ok(!JSON.stringify(h.calls().map((c) => c.a)).includes(TOKEN), 'the token is in no argv');
+  assert.ok(!r.stdout.includes(TOKEN) && !r.stderr.includes(TOKEN));
+});
+
+test('wp-session-end: no stdin, the same container and run', () => {
+  const h = dockerHarness({ answer: '{"ok":true,"ended":1}' });
+  const r = h.run(['wp-session-end', 'pr-hub-base', 'run-1'], 'ignored\n');
+  assert.equal(r.status, 0, r.stderr);
+  const ex = h.calls()[1];
+  assert.equal(ex.stdin, '');
+  assert.ok(ex.a.includes('MIU_RUN=run-1'));
+  assert.match(ex.a.at(-1), /delete_user_meta|update_user_meta/);
+});
+
+test('wp-session refuses a bad stack, run or token, and says when there is no one container', () => {
+  const h = dockerHarness();
+  for (const [args, input] of [
+    [['wp-session', 'wp-pr-free-3', 'run'], `${TOKEN}\n`],
+    [['wp-session', 'pr-hub-7', '.hidden'], `${TOKEN}\n`],
+    [['wp-session', 'pr-hub-7', 'a/b'], `${TOKEN}\n`],
+    [['wp-session', 'pr-hub-7'], `${TOKEN}\n`],
+    [['wp-session', 'pr-hub-7', 'run'], 'short\n'],
+    [['wp-session', 'pr-hub-7', 'run'], `${TOKEN}|x\n`],
+    [['wp-session', 'pr-hub-7', 'run'], ''],
+  ]) {
+    const r = h.run(args, input);
+    assert.equal(r.status, 2, `${args.join(' ')}: ${r.stdout}${r.stderr}`);
+    assert.ok(!h.calls().some((c) => c.a[0] === 'exec'), 'nothing ran in the container');
+  }
+  const none = dockerHarness({ ids: '' }).run(['wp-session', 'pr-hub-7', 'run'], `${TOKEN}\n`);
+  assert.equal(none.status, 1);
+  assert.equal(none.stdout.trim(), '{"ok":false,"code":"wp_container_not_found"}');
+  const two = dockerHarness({ ids: 'a1\nb2' }).run(['wp-session-end', 'pr-hub-7', 'run'], '');
+  assert.equal(two.status, 1);
+  assert.equal(two.stdout.trim(), '{"ok":false,"code":"wp_container_ambiguous"}');
+});
+
+test('session changes on one stack run one at a time, so an end is never undone by a start beside it', async () => {
+  const h = dockerHarness({ answer: '{"ok":true}' });
+  const [a, b, c] = await Promise.all([
+    h.spawnRun(['wp-session', 'pr-hub-7', 'run-a'], `${TOKEN}\n`, { HOLD_MS: '400' }),
+    h.spawnRun(['wp-session-end', 'pr-hub-7', 'run-b'], '', { HOLD_MS: '400' }),
+    h.spawnRun(['wp-session', 'pr-hub-7', 'run-c'], `${TOKEN}\n`, { HOLD_MS: '400' }),
+  ]);
+  assert.deepEqual([a.code, b.code, c.code], [0, 0, 0]);
+  const s = h.spans();
+  assert.equal(s.length, 6);
+  for (let i = 0; i < s.length; i += 2) assert.deepEqual([s[i][0], s[i + 1][0]], ['start', 'end'], 'each exec ends before the next starts');
 });

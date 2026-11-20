@@ -198,3 +198,12 @@ names, and the command checks each one.
   never used. Admin and app sign in each on their own; when the address already
   has a factor and Miu holds no secret for it, the admin side fails as
   `staff_factor_without_secret`, naming the stack.
+- On the same stacks, the agent gets a wp-admin session on the stack's public
+  WordPress (`wp-<stack>`) as its `miu-qa` administrator, for claims the Hub
+  must reach a site for (lib/wpsession.mjs, `pr-stack wp-session`). Miu makes
+  the token and sends it to the stack on stdin; WordPress keeps only its hash
+  and answers with signatures, so no output or log holds a working cookie. The
+  storage state is in `private/` (0600), the token in `private/redact.list`,
+  which `bin/qa-evidence` masks in every file it writes (lib/redact.mjs), and
+  the run's end ends that run's session only. Sessions last 4 hours at most.
+  The Hub's URL guard is unchanged: QA sites stay refused.
