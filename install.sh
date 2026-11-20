@@ -216,8 +216,9 @@ exec /usr/bin/rex mcp
 EOF
   cat > "$LIB/qasite" <<EOF
 #!/bin/bash
-# qasite for the agent account, run as $MIU_USER: reset or log in to a QA site.
-case "\${1:-}:\${2:-}" in reset:pr|reset:dev|reset:fix|login:pr|login:dev|login:fix|info:) ;; *) echo "usage: qasite reset|login pr|dev|fix, or qasite info" >&2; exit 2 ;; esac
+# qasite for the agent account, run as $MIU_USER: reset or log in to a QA site,
+# or use the lane's server rig (lib/rig.mjs; it checks the rest of the arguments).
+case "\${1:-}:\${2:-}" in reset:pr|reset:dev|reset:fix|login:pr|login:dev|login:fix|info:|server:pr|server:dev|move:pr|move:dev|rig:start|rig:reload|rig:stop|rig:show|rig:default|rig:put|rig:rm) ;; *) echo "usage: qasite reset|login pr|dev|fix, qasite info, qasite server|move pr|dev ..., or qasite rig ..." >&2; exit 2 ;; esac
 export HOME=$MIU_HOME USER=$MIU_USER XDG_RUNTIME_DIR=/run/user/$MIU_UID PATH=$OPT/node/bin:/usr/bin:/bin QA_CACHE_DIR=$DATA/.cache MIU_PROFILES=$ETC/profiles
 cd $APP && exec node lib/warmsites.mjs "\$@"
 EOF
