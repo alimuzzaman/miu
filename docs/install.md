@@ -64,6 +64,8 @@ A job with `services:` (or one it needs) is the exception: act 0.2.x makes a net
 
 ### Which CI secrets each repository may use
 
+The Sandbox account (its agents and Sandbox jobs) can read run outputs without broader sudo: the installer adds `/etc/sudoers.d/miu-run-read`, which lets it run `/usr/local/lib/miu/run-read` as `miu` and nothing else. `sudo -u miu /usr/local/lib/miu/run-read ls <run>` lists a run's files with their sizes, one JSON object a line; `sudo -u miu /usr/local/lib/miu/run-read cat <run> <path>` prints one. It only reads. A run is a folder right under `/srv/miu-data/runs`, and a path counts only if it stays inside the run once every symbolic link is resolved. It refuses dotfiles and dot-folders (`.stacks`, `.ci`), `env/`, `private/` (a live run's Hub sessions), `*.totp`, any name with `key`, `token` or `secret` in it, anything that is not a regular file, a file with more than one link, and files over 50 MB. Captured evidence (`evidence/*.http`, HAR files, transcripts) is served as written, so whatever a run's scrubbing left in it can be read. Each release installs its own copy, like the CI worker.
+
 The CI script also checks root's own list, `/etc/miu/ci-secret-names`. A workflow may name a `ci_secrets` entry only when that list gives it to the pull request's repository and the base branch's job already names it. One line per repository, `#` for comments; repository names match in any case:
 
 ```text
@@ -150,7 +152,7 @@ journalctl -u miu -n 50
 
 ```sh
 sudo systemctl disable --now miu rexenv-headless
-sudo rm -rf /srv/miu /srv/miu-releases /srv/miu-data /opt/miu /etc/miu /usr/local/lib/miu /etc/sudoers.d/miu /etc/sudoers.d/miu-sandbox-ci /etc/apparmor.d/miu-codex-bwrap \
+sudo rm -rf /srv/miu /srv/miu-releases /srv/miu-data /opt/miu /etc/miu /usr/local/lib/miu /etc/sudoers.d/miu /etc/sudoers.d/miu-sandbox-ci /etc/sudoers.d/miu-run-read /etc/apparmor.d/miu-codex-bwrap \
   /etc/systemd/system/miu.service /etc/credstore.encrypted/miu-secrets-key /etc/caddy/conf.d/miu
 sudo userdel -r miu-agent; sudo userdel -r miu
 sudo apt-get remove rexenv

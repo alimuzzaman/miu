@@ -6,11 +6,12 @@
 // the seeded QA account into its account app (--app-out), at least one of them
 // (lib/hubsignin.mjs), and writes each session as a Playwright storage state, 0600. qa-run runs it and deletes both after
 // the run; the agent's browser loads them.
-// Prints one JSON line: { ok, stack, enrolled } or { ok: false, error }. No
-// link, code or cookie is ever printed.
+// Prints one JSON line: { ok, stack, enrolled, admin?, app? }, ok when at least
+// one side signed in, each side { ok } or { ok: false, code?, error }. Exit 0
+// when ok. No link, code, secret or cookie is ever printed.
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { signIn, signInApp, writeStorageState } from '../lib/hubsignin.mjs';
+import { signInStack } from '../lib/hubsignin.mjs';
 import { ZONE, NAME } from '../lib/prstacks.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -23,22 +24,12 @@ const say = (o) => { console.log(JSON.stringify(o)); process.exit(o.ok ? 0 : 1);
 if (!stack || !NAME.test(stack) || !/^pr-hub-(\d{1,6}|base)$/.test(stack)) say({ ok: false, error: 'a full PR stack name (pr-hub-<n> or pr-hub-base) is needed' });
 if (!incarnation || !Number.isInteger(port) || port < 1024 || port > 65535 || (!adminOut && !appOut)) say({ ok: false, error: 'usage: --stack --incarnation --mailpit-port [--admin-out] [--app-out]' });
 
-try {
-  const mailpit = `http://127.0.0.1:${port}/mail`;
-  let enrolled = false;
-  if (adminOut) {
-    const r = await signIn({
-      admin: `https://admin-${stack}.${ZONE}`, mailpit, stack, incarnation,
-      totpFile: path.join(runs, '.stacks', `${stack}.totp`),
-    });
-    writeStorageState(path.resolve(adminOut), r.cookie);
-    enrolled = r.enrolled;
-  }
-  if (appOut) {
-    const app = await signInApp({ hub: `https://hub-${stack}.${ZONE}`, mailpit });
-    writeStorageState(path.resolve(appOut), app.cookie);
-  }
-  say({ ok: true, stack, enrolled });
-} catch (e) {
-  say({ ok: false, stack, error: String(e.message).slice(0, 300) });
-}
+// Admin and app are signed in each on its own (lib/hubsignin.mjs signInStack):
+// one failing still writes the other, and each result is in the line printed.
+const out = await signInStack({
+  stack, incarnation, mailpit: `http://127.0.0.1:${port}/mail`,
+  admin: `https://admin-${stack}.${ZONE}`, hub: `https://hub-${stack}.${ZONE}`,
+  totpFile: path.join(runs, '.stacks', `${stack}.totp`),
+  adminOut: adminOut && path.resolve(adminOut), appOut: appOut && path.resolve(appOut),
+});
+say(out);

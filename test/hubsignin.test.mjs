@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { signIn, signInApp, totpCode, readTotp, writeStorageState, COOKIE, EMAIL, APP_COOKIE } from '../lib/hubsignin.mjs';
+import { signIn, signInApp, signInStack, totpCode, readTotp, writeStorageState, COOKIE, EMAIL, APP_COOKIE } from '../lib/hubsignin.mjs';
 
 // RFC 6238 appendix B, SHA-1, secret "12345678901234567890" (base32 below), 6 digits.
 test('totpCode matches the RFC 6238 vectors', () => {
@@ -14,7 +14,7 @@ test('totpCode matches the RFC 6238 vectors', () => {
 });
 
 // A fake Hub admin and Mailpit with the routes and checks lib/hubsignin.mjs relies on.
-function fakeHub({ hasFactor = false, appLinkHost = 'hub-pr-hub-9.xspeedcdn.online', appTwoFactor = false } = {}) {
+function fakeHub({ hasFactor = false, appLinkHost = 'hub-pr-hub-9.xspeedcdn.online', appTwoFactor = false, enrollAnswers = null } = {}) {
   let t = Date.UTC(2026, 10, 17, 6, 0, 0);
   const state = { tokens: new Set(), sessions: new Map(), mails: [], factor: hasFactor ? 'OTHERSECRETOTHERSECRETOTHERSECRE' : null, pending: null, lastStep: null, calls: [], seen: [] };
   const ok = (body, cookie) => {
@@ -69,6 +69,7 @@ function fakeHub({ hasFactor = false, appLinkHost = 'hub-pr-hub-9.xspeedcdn.onli
         state.pending = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
         return ok({ secret: state.pending, otpauth_uri: 'otpauth://x' });
       case '/admin/auth/enroll/totp':
+        if (enrollAnswers) return no(enrollAnswers, 'upstream');
         if (sess !== 'pending' || body.code !== totpCode(state.pending, step)) return no(400, 'code_invalid');
         state.factor = state.pending; state.lastStep = step;
         state.sessions.set('a1', 'active');
@@ -105,22 +106,54 @@ test('first sign-in enrolls an authenticator; the next one uses it, at a later s
   assert.ok(hub.state.calls.includes('POST /api/admin/auth/mfa/totp'));
 });
 
-test('a kept authenticator from an earlier stack of the same name is deleted, not used', async () => {
+test('a kept authenticator from an earlier stack of the same name is not used, nor deleted until a new one replaces it', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubsignin-'));
   const file = base(dir).totpFile;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify({ stack: 'pr-hub-9', incarnation: 'older/zzz', secret: 'JBSWY3DPEHPK3PXP', step: 1 }), { mode: 0o600 });
   assert.equal(readTotp(file, 'pr-hub-9', '2026-11-17T06:00:00Z/abc'), null);
-  assert.equal(fs.existsSync(file), false);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).incarnation, 'older/zzz', 'a wrong incarnation never deletes a secret');
   const hub = fakeHub();
   const r = await signIn(base(dir, hub));
   assert.equal(r.enrolled, true, 'a new stack enrolls afresh');
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).incarnation, '2026-11-17T06:00:00Z/abc', 'the new enrollment replaced it');
+});
+
+test('a confirmation the Hub did not answer keeps the secret pending, and the next sign-in settles it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubsignin-'));
+  const hub = fakeHub({ enrollAnswers: 502 });
+  await assert.rejects(signIn(base(dir, hub)), /enroll\/totp answered 502/);
+  assert.equal(JSON.parse(fs.readFileSync(base(dir).totpFile, 'utf8')).pending, true, 'kept: the Hub may have taken it');
+});
+
+test('admin and app sign in each on its own: an admin factor Miu cannot pass still leaves the app signed in', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubsignin-'));
+  const hub = fakeHub({ hasFactor: true });
+  const adminOut = path.join(dir, 'admin.json'), appOut = path.join(dir, 'app.json');
+  const out = await signInStack({ ...base(dir, hub), hub: 'https://hub-pr-hub-9.xspeedcdn.online', adminOut, appOut });
+  assert.equal(out.ok, true);
+  assert.equal(out.admin.ok, false);
+  assert.equal(out.admin.code, 'staff_factor_without_secret');
+  assert.match(out.admin.error, /already has an authenticator on pr-hub-9, but Miu holds no secret for it \(pr-hub-9\.totp is missing/);
+  assert.deepEqual(out.app, { ok: true });
+  assert.equal(fs.existsSync(adminOut), false);
+  assert.equal(JSON.parse(fs.readFileSync(appOut, 'utf8')).cookies[0].name, APP_COOKIE);
+  assert.doesNotMatch(JSON.stringify(out), /tok|apptok|JBSWY|OTHERSECRET|app1/);
+});
+
+test('both sides failing is not ok, and says why for each', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubsignin-'));
+  const hub = fakeHub({ hasFactor: true, appTwoFactor: true });
+  const out = await signInStack({ ...base(dir, hub), hub: 'https://hub-pr-hub-9.xspeedcdn.online', adminOut: path.join(dir, 'a.json'), appOut: path.join(dir, 'b.json') });
+  assert.equal(out.ok, false);
+  assert.match(out.error, /^admin: .*already has an authenticator.*; app: .*two-factor on/);
+  assert.equal(out.app.ok, false);
 });
 
 test('a stack whose QA address already has a factor Miu does not hold says so', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubsignin-'));
   const hub = fakeHub({ hasFactor: true });
-  await assert.rejects(signIn(base(dir, hub)), /already has a second factor/);
+  await assert.rejects(signIn(base(dir, hub)), (e) => e.code === 'staff_factor_without_secret' && /pr-hub-9/.test(e.message));
 });
 
 test('no link, code, secret or recovery code is in what signIn returns or throws', async () => {
@@ -167,4 +200,19 @@ test('an enrollment the Hub accepted but Miu never confirmed is recovered, not l
   const r = await signIn(base(dir, hub));
   assert.equal(r.enrolled, false);
   assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).pending, undefined);
+});
+
+test('a Hub error that is not a code, or a transport failure, never reaches the output as text', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubsignin-'));
+  const echo = async () => new Response(JSON.stringify({ error: 'bad code 123456 cookie=abc' }), { status: 400, headers: { 'content-type': 'application/json' } });
+  const a = await signInStack({ ...base(dir, { fetch: echo, now: () => 0, sleep: async () => {} }), hub: 'https://hub-pr-hub-9.xspeedcdn.online', adminOut: path.join(dir, 'a.json') });
+  assert.match(a.admin.error, /^hub sign-in: link answered 400$/);
+  const boom = async (url) => { throw new TypeError(`fetch failed for ${url}?token=SECRETTOKEN`); };
+  const b = await signInStack({ ...base(dir, { fetch: boom, now: () => 0, sleep: async () => {} }), hub: 'https://hub-pr-hub-9.xspeedcdn.online', adminOut: path.join(dir, 'a.json'), appOut: path.join(dir, 'b.json') });
+  assert.equal(b.admin.error, 'sign-in request failed (TypeError)');
+  assert.equal(b.app.error, 'sign-in request failed (TypeError)');
+  assert.doesNotMatch(JSON.stringify([a, b]), /123456|cookie=|SECRETTOKEN/);
+  const coded = async () => new Response(JSON.stringify({ error: 'rate_limited' }), { status: 429, headers: { 'content-type': 'application/json' } });
+  const c = await signInStack({ ...base(dir, { fetch: coded, now: () => 0, sleep: async () => {} }), adminOut: path.join(dir, 'a.json') });
+  assert.equal(c.admin.error, 'hub sign-in: link answered 429 rate_limited');
 });

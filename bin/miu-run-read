@@ -1,0 +1,187 @@
+#!/usr/bin/python3 -I
+# Read a Miu run's outputs, as Miu's account, without broader sudo. Installed
+# as /usr/local/lib/miu/run-read (bin/miu-release), root's; install.sh gives
+# the Sandbox account one sudo rule for it, as miu, any arguments: this file
+# is the guard.
+#
+#   run-read ls <run>             every file and folder it would read, one JSON
+#                                 object a line: {"type":"f","size":N,"path":..}
+#   run-read cat <run> <relpath>  one file's bytes, to stdout
+#
+# A run is a folder right under /srv/miu-data/runs whose name matches
+# ^[A-Za-z0-9._-]+$ and does not start with a dot. A path is read only when
+# it stays inside that run once every symbolic link is resolved, and no part
+# of it, as asked or as resolved, is refused: a dotfile or dot-folder (.stacks,
+# .ci, .env), env/, private/ (a live run's Hub sessions), a *.totp, or a name
+# with key, token or secret in it. Only regular files with one link and of at
+# most 50 MB are read. Nothing is written.
+import json
+import os
+import re
+import stat
+import sys
+
+RUNS = '/srv/miu-data/runs'
+# A test root only outside sudo, where it gives the caller nothing they lack.
+if 'SUDO_UID' not in os.environ and os.environ.get('MIU_RUN_READ_ROOT'):
+    RUNS = os.environ['MIU_RUN_READ_ROOT']
+MAX = 50 * 1024 * 1024
+RUN_NAME = re.compile(r'[A-Za-z0-9._-]+')
+REFUSED_DIRS = {'env', 'private'}
+REFUSED_WORDS = re.compile(r'key|token|secret', re.I)
+
+
+class Refused(Exception):
+    pass
+
+
+def refused_part(part):
+    if part.startswith('.'):
+        return 'a dotfile'
+    if part in REFUSED_DIRS:
+        return f'{part}/'
+    if part.lower().endswith('.totp'):
+        return 'a .totp file'
+    if REFUSED_WORDS.search(part):
+        return 'a key, token or secret'
+    return None
+
+
+def check_parts(rel):
+    for part in rel.split('/'):
+        why = refused_part(part)
+        if why:
+            raise Refused(f'refused: {why}')
+
+
+def run_dir(name):
+    if not RUN_NAME.fullmatch(name) or name.startswith('.'):
+        raise Refused('refused: not a run name')
+    root = os.path.realpath(RUNS)
+    d = os.path.realpath(os.path.join(root, name))
+    if os.path.dirname(d) != root or os.path.basename(d) != name:
+        raise Refused('refused: the run is not a folder of the runs directory')
+    if not os.path.isdir(d):
+        raise Refused('no such run')
+    return d
+
+
+def inside(d, p):
+    return p == d or p.startswith(d + os.sep)
+
+
+# Directories are walked by descriptor, each opened with O_NOFOLLOW from the
+# one above it, so a folder swapped for a link mid-walk is never entered. One
+# JSON object per line, so no name can forge a line or reach the terminal raw.
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
+MAX_ENTRIES = 100000
+
+
+def cmd_ls(name):
+    d = run_dir(name)
+    out = sys.stdout
+    seen = [0]
+
+    def emit(obj):
+        seen[0] += 1
+        if seen[0] > MAX_ENTRIES:
+            raise Refused(f'refused: over {MAX_ENTRIES} entries; ask for paths with cat')
+        out.write(json.dumps(obj) + '\n')
+
+    def walk(fd, rel, depth):
+        if depth > 32:
+            return
+        with os.scandir(fd) as it:
+            entries = sorted(it, key=lambda e: e.name)
+        for e in entries:
+            if refused_part(e.name):
+                continue
+            path = f'{rel}/{e.name}' if rel else e.name
+            try:
+                st = os.stat(e.name, dir_fd=fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    sub = os.open(e.name, DIR_FLAGS, dir_fd=fd)
+                except OSError:
+                    continue
+                try:
+                    emit({'type': 'd', 'path': path})
+                    walk(sub, path, depth + 1)
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+                emit({'type': 'f', 'size': st.st_size, 'path': path})
+
+    top = os.open(d, DIR_FLAGS)
+    try:
+        walk(top, '', 0)
+    finally:
+        os.close(top)
+
+
+def cmd_cat(name, rel):
+    d = run_dir(name)
+    if not rel or rel.startswith('/') or '\0' in rel:
+        raise Refused('refused: not a path inside the run')
+    rel = rel.rstrip('/')
+    parts = rel.split('/')
+    if any(p in ('', '.', '..') for p in parts):
+        raise Refused('refused: not a path inside the run')
+    check_parts(rel)
+    want = os.path.realpath(os.path.join(d, rel))
+    if not inside(d, want) or want == d:
+        raise Refused('refused: the path leaves the run')
+    check_parts(os.path.relpath(want, d))
+    try:
+        fd = os.open(want, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
+    except FileNotFoundError:
+        raise Refused('no such file')
+    except OSError as e:
+        raise Refused(f'refused: cannot open it ({e.strerror})')
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused('refused: not a regular file')
+        # A second name for a file could be anywhere, a refused one too.
+        if st.st_nlink != 1:
+            raise Refused('refused: a file with more than one link')
+        if st.st_size > MAX:
+            raise Refused('refused: over 50 MB')
+        # What was opened, not what was asked: a path changed after the check is caught here.
+        opened = os.path.realpath(f'/proc/self/fd/{fd}') if os.path.exists(f'/proc/self/fd/{fd}') else want
+        if not inside(d, opened):
+            raise Refused('refused: the path leaves the run')
+        check_parts(os.path.relpath(opened, d))
+        left = MAX
+        out = sys.stdout.buffer
+        while left > 0:
+            b = os.read(fd, min(1 << 20, left))
+            if not b:
+                break
+            out.write(b)
+            left -= len(b)
+        out.flush()
+    finally:
+        os.close(fd)
+
+
+def main(argv):
+    try:
+        if len(argv) == 2 and argv[0] == 'ls':
+            cmd_ls(argv[1])
+        elif len(argv) == 3 and argv[0] == 'cat':
+            cmd_cat(argv[1], argv[2])
+        else:
+            raise Refused('usage: run-read ls <run> | run-read cat <run> <relpath>')
+    except Refused as e:
+        sys.stderr.write(f'run-read: {e}\n')
+        return 2
+    except BrokenPipeError:
+        return 0
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

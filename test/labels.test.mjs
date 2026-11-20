@@ -43,8 +43,19 @@ test('renamed labels reach every importer of LABELS', () => {
   setLabelNames({ miuOk: 'Human next', retest: 'Again' });
   assert.equal(LABELS.miuOk, 'Human next');
   assert.ok(endLabels('ok', { criteria: [], issues: [] }, []).add.includes('Human next'));
-  assert.ok(finalLabels({ verdict: 'ok', results: {}, before: [], current: [], stale: true }).add.includes('Again'));
+  assert.ok(finalLabels({ verdict: 'ok', results: {}, before: [], stale: false }).add.includes('Human next'));
   setLabelNames({});
+});
+
+test('a run whose head moved keeps Tested, drops its results and asks for no test', () => {
+  setLabelNames({});
+  const f = finalLabels({ verdict: 'ok', results: { criteria: [], issues: [] }, before: [], stale: true });
+  assert.deepEqual(f.add, ['Miu Tested']);
+  for (const l of ['Test Ongoing', 'Ready for Human Testing', 'Miu Tested & Reported Issue']) assert.ok(f.remove.includes(l), l);
+  for (const l of [...LABELS.request, LABELS.retest]) {
+    assert.ok(!f.add.includes(l), `${l} is the owner's to add`);
+    assert.ok(!f.remove.includes(l), `${l} a person set stays`);
+  }
 });
 
 test('a person\'s result label is read as a QA report; Miu\'s own is not', () => {

@@ -209,3 +209,13 @@ test('the CI network helper goes in with the worker, behind a unit that holds it
   assert.doesNotMatch(log, /(?:^|\n)(?:stop|restart) miu-ci-net\.service/);
   assert.match(r.stderr, /CI network: up/);
 });
+
+test('the run reader goes in with the worker, behind $LIB/run-read', linux, () => {
+  const s = server();
+  fs.writeFileSync(path.join(s.src, 'bin/miu-run-read'), '#!/usr/bin/env bash\necho reader "$@"\n', { mode: 0o755 });
+  const one = s.commit('one');
+  const r = s.run('deploy', one);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readlinkSync(path.join(s.lib, 'run-read')), `versions/${one}/run-read`);
+  assert.match(spawnSync(path.join(s.lib, 'run-read'), ['ls', 'x'], { encoding: 'utf8' }).stdout, /^reader ls x/);
+});

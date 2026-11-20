@@ -135,14 +135,15 @@ test('a partner that arrives later re-declares the follow; one that closes goes 
   assert.ok(!s.calls.some((c) => c[0] === 'remove'), 'the Hub PR is still open: its stack stays');
 });
 
-test('the Hub authenticator file goes with its stack, and a new stack of that name never inherits one', async () => {
+test('the Hub authenticator file goes with its stack, and an add (a stack Sandbox may already run) keeps it', async () => {
   const s = setup();
   const file = totpPath(s.runsDir, 'pr-hub-88');
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, '{"left":"over"}', { mode: 0o600 });
+  fs.writeFileSync(file, '{"kept":"for its incarnation"}', { mode: 0o600 });
   s.st.want('WPDevelopers/xspeed-hub', 88, 'hub', hubPr(88));
   await s.st.scan({ open: new Map([['WPDevelopers/xspeed-hub#88', 'hsha88']]) });
-  assert.equal(fs.existsSync(file), false, 'deleted when the stack is created');
+  assert.ok(s.calls.some((c) => c[0] === 'add' && c[1] === 'pr-hub-88'));
+  assert.equal(fs.readFileSync(file, 'utf8'), '{"kept":"for its incarnation"}', 'an add keeps it: its incarnation, not the add, tells a new stack from this one');
   fs.writeFileSync(file, '{"stack":"pr-hub-88"}', { mode: 0o600 });
   await s.st.scan({ open: new Map() });
   assert.equal(s.st.view('WPDevelopers/xspeed-hub#88').state, 'removed');

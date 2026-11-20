@@ -320,6 +320,14 @@ $MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/pr-stack
 EOF
   visudo -cqf /etc/sudoers.d/miu-sandbox-ci.tmp || die "the Sandbox CI sudoers rule did not validate"
   chmod 0440 /etc/sudoers.d/miu-sandbox-ci.tmp && mv /etc/sudoers.d/miu-sandbox-ci.tmp /etc/sudoers.d/miu-sandbox-ci
+  # The Sandbox account (its agents and jobs) may read run outputs as $MIU_USER,
+  # through one read-only helper that refuses credentials (bin/miu-run-read).
+  cat > /etc/sudoers.d/miu-run-read.tmp <<EOF
+# $SANDBOX_USER may list and read Miu's run outputs, read-only, as $MIU_USER.
+$SANDBOX_USER ALL=($MIU_USER) NOPASSWD: $LIB/run-read
+EOF
+  visudo -cqf /etc/sudoers.d/miu-run-read.tmp || die "the run-read sudoers rule did not validate"
+  chmod 0440 /etc/sudoers.d/miu-run-read.tmp && mv /etc/sudoers.d/miu-run-read.tmp /etc/sudoers.d/miu-run-read
   # The server's CI secrets each repository's workflows may name
   # ($ETC/ci-secret-names: `owner/name NAME,NAME` lines). Every release's worker
   # reads it and refuses a run that names one not listed, so it is made before
