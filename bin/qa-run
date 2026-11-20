@@ -515,7 +515,8 @@ const hubUrl = (which) => {
   const dir = srcs[`hub-${which}`];
   return dir && fs.existsSync(path.join(dir, 'app/vite.config.ts')) ? `http://localhost:${hubPorts[`QA_HUB_APP_PORT_${which.toUpperCase()}`]}` : `http://localhost:${hubPorts[`QA_HUB_PORT_${which.toUpperCase()}`]}`;
 };
-const envVars = { ...process.env, QA_RUN_DIR: runDir, QA_CACHE_DIR: CACHE, ...hubPorts, QA_EVIDENCE_DIR: path.join(runDir, 'evidence') };
+// QA_REDACT_FILE: the run's session tokens, which bin/qa-evidence keeps out of evidence (lib/redact.mjs).
+const envVars = { ...process.env, QA_RUN_DIR: runDir, QA_CACHE_DIR: CACHE, ...hubPorts, QA_EVIDENCE_DIR: path.join(runDir, 'evidence'), QA_REDACT_FILE: path.join(runDir, 'private', 'redact.list') };
 let rexBefore = new Set();
 let qaSites = null;
 const rexSites = (r) => (Array.isArray(r) ? r : (r?.sites ?? [])).map((x) => ({ id: x.id, domain: x.domain }));
@@ -542,7 +543,7 @@ if (hubStack) {
     infra.push(...r.infra);
   }
   write('hubs.json', stackHubs ?? {});
-  log(`hub stacks: ${Object.entries(stackHubs ?? {}).map(([k, v]) => `${k} ${v.stack}${v.admin_state || v.admin_skipped ? '' : ' (admin not signed in)'}${v.app_state ? '' : ' (app not signed in)'}`).join(', ') || 'none ready'} in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+  log(`hub stacks: ${Object.entries(stackHubs ?? {}).map(([k, v]) => `${k} ${v.stack}${v.admin_state || v.admin_skipped ? '' : ' (admin not signed in)'}${v.app_state ? '' : ' (app not signed in)'}${v.wp_state ? '' : ' (wp-admin not signed in)'}`).join(', ') || 'none ready'} in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 }
 if (mode === 'full') {
   try {
@@ -738,7 +739,7 @@ async function waitAndExit(reasons) {
     }
   } catch { /* labels were never changed */ }
   stub?.close();
-  dropSessions(runDir);
+  { const left = dropSessions(runDir); if (left.length) log(`wp-admin sessions not ended on ${left.join(', ')} (tried again on exit; they expire within 4 hours)`); }
   if (mode === 'full') await rexCleanup().catch(() => {});
   spawnSync(APP_ENV, ['down'], { env: envVars, stdio: 'ignore' });
   for (const d of ['src', 'builds', 'stage']) rmAny(path.join(runDir, d));
@@ -1019,7 +1020,7 @@ if (dryRun) {
 }
 
 stub?.close();
-dropSessions(runDir);
+{ const left = dropSessions(runDir); if (left.length) log(`wp-admin sessions not ended on ${left.join(', ')} (tried again on exit; they expire within 4 hours)`); }
 if (!flag('--keep-env')) {
   if (mode === 'full') await rexCleanup();
   spawnSync(APP_ENV, ['down'], { env: envVars, stdio: 'ignore' });

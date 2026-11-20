@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { screenshots, validate, loadLedger } from '../lib/report.mjs';
+import { dropSessions } from '../lib/hubstack.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
 import { postRun } from '../lib/postrun.mjs';
 import { qaSignals, prHistory, setLabelNames as setSignalLabels } from '../lib/prsignals.mjs';
@@ -1494,8 +1495,10 @@ function cleanupRun(dir, why) {
   if (fs.existsSync(path.join(dir, 'cleanup.json'))) return;
   try { fs.writeFileSync(path.join(dir, 'cleanup.json'), JSON.stringify({ at: new Date().toISOString(), why })); } catch { /* disk full: try anyway */ }
   const m = runMeta(dir) ?? {};
-  // A killed run leaves its Hub sign-in files (lib/hubstack.mjs): they go first.
-  try { fs.rmSync(path.join(dir, 'private'), { recursive: true, force: true }); } catch (e) { console.error('run clean-up: private:', e.message); }
+  try {
+    const left = dropSessions(dir);
+    if (left.length) console.error('run clean-up: WordPress sessions expire within 4 hours on', left.join(', '));
+  } catch (e) { console.error('run clean-up: private:', e.message); }
   // qa-run's own clean-up does not run when it is killed. Delete the scratch
   // sites the agent made for this pull request (named qa<pr>...), and the Hub.
   const pr = m.pr ?? readJson(path.join(dir, 'context/pr.json'))?.number;

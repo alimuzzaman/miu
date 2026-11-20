@@ -12,6 +12,13 @@
 #   pr-stack status <stack>                        the follow's status, JSON
 #   pr-stack ports <stack>                         the stack's ports and incarnation, JSON
 #   pr-stack remove <stack>                        follow and stack, gone
+#   pr-stack wp-session <stack> <run>              a session for miu-qa on the stack's WordPress, JSON
+#   pr-stack wp-session-end <stack> <run>          that run's session, ended
+#
+# wp-session reads the session token Miu made on stdin (43 letters and
+# digits). WordPress stores only its hash and prints only the cookies'
+# signatures, so no output, argv or log of this or Sandbox holds a working
+# cookie: Miu puts the token and the signatures together itself.
 #
 # Fixed here, not by the caller: the org (WPDevelopers), the setup repo and
 # its branch (xspeed-dev-setup@main, whose stacks/follow-prepare.sh is the
@@ -28,8 +35,10 @@ OWNER=miu
 PREPARE_TIMEOUT=3600
 # Only a test can point these elsewhere: under sudo they are dropped, whatever
 # this server's sudoers keeps.
-[ -z "${SUDO_USER:-}" ] || unset MIU_PR_STACK_SB MIU_PR_STACK_FOLLOW_ROOT MIU_PR_STACK_MEMINFO
+[ -z "${SUDO_USER:-}" ] || unset MIU_PR_STACK_SB MIU_PR_STACK_FOLLOW_ROOT MIU_PR_STACK_MEMINFO MIU_PR_STACK_DOCKER MIU_PR_STACK_LOCKS
 sb=${MIU_PR_STACK_SB:-$HOME/sandbox/sb-src/sb}
+docker=${MIU_PR_STACK_DOCKER:-docker}
+locks=${MIU_PR_STACK_LOCKS:-$HOME/sandbox/runtime/miu-pr-stack}
 follow_root=${MIU_PR_STACK_FOLLOW_ROOT:-$HOME/sandbox/runtime/hosting/follow}
 meminfo=${MIU_PR_STACK_MEMINFO:-/proc/meminfo}
 export SANDBOX_AUTO_UPDATE=0
@@ -45,7 +54,66 @@ branch_ok() {
 # (Sandbox Fix 5). Every Sandbox call goes through here.
 here() { "$sb" host "$@" --here --json; }
 
-[ $# -ge 1 ] || die "usage: pr-stack mem | add <stack> <wp|full> free=<b> pro=<b> [hub=<b>] | status <stack> | ports <stack> | remove <stack>"
+# The run a WordPress session belongs to: a Miu run folder's name.
+run_ok() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$ ]]; }
+
+# The stack's wp-setup container: WP-CLI, the site's docroot and database, and
+# one per stack (it is not blue-green). `sb host exec` needs --remote, which
+# this server has none of for itself, so this goes to Docker directly, by the
+# labels Sandbox's compose project gives it.
+wp_container() {
+  local ids
+  ids=$("$docker" ps -q --filter "label=com.docker.compose.project=sandbox-host-xspeed-hub-$1-sandbox" --filter label=com.docker.compose.service=wp-setup)
+  [ -n "$ids" ] || { echo '{"ok":false,"code":"wp_container_not_found"}'; exit 1; }
+  [ "$(printf '%s\n' "$ids" | wc -l)" -eq 1 ] || { echo '{"ok":false,"code":"wp_container_ambiguous"}'; exit 1; }
+  printf '%s\n' "$ids"
+}
+
+# PHP run by `wp eval` in that container. MIU_RUN names the run; the token is
+# read from stdin. Sessions are WordPress's own (user meta session_tokens,
+# keyed by the token's sha256, as WP_User_Meta_Session_Tokens keeps them),
+# each tagged with its run, so ending one run's never ends another's.
+read -r -d '' WP_COMMON <<'PHP' || true
+error_reporting(0);
+$say = function ($o, $code = 0) { echo json_encode($o), "\n"; exit($code); };
+$run = (string) getenv('MIU_RUN');
+if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/', $run)) $say(['ok' => false, 'code' => 'bad_run'], 1);
+$u = get_user_by('login', 'miu-qa');
+if (!$u || !in_array('administrator', (array) $u->roles, true)) $say(['ok' => false, 'code' => 'wp_qa_user_missing'], 1);
+$all = get_user_meta($u->ID, 'session_tokens', true);
+if (!is_array($all)) $all = [];
+$now = time();
+foreach ($all as $k => $s) {
+  if (!is_array($s) || ($s['expiration'] ?? 0) < $now || (($s['miu_run'] ?? null) === $run)) unset($all[$k]);
+}
+PHP
+read -r -d '' WP_START <<'PHP' || true
+$t = trim((string) fgets(STDIN));
+if (!preg_match('/^[A-Za-z0-9]{43}$/', $t)) $say(['ok' => false, 'code' => 'bad_token'], 1);
+$exp = $now + 4 * 3600;
+$all[hash('sha256', $t)] = ['expiration' => $exp, 'login' => $now, 'ip' => '', 'ua' => 'miu', 'miu_run' => $run];
+update_user_meta($u->ID, 'session_tokens', $all);
+// Only the signature leaves: login|expiration|token|signature, token dropped.
+$sig = function ($scheme) use ($u, $exp, $t) { $p = explode('|', wp_generate_auth_cookie($u->ID, $exp, $scheme, $t)); return $p[3]; };
+$host = parse_url(get_option('siteurl'), PHP_URL_HOST);
+$say(['ok' => true, 'host' => $host, 'login' => $u->user_login, 'expires' => $exp, 'cookies' => [
+  ['name' => SECURE_AUTH_COOKIE, 'path' => ADMIN_COOKIE_PATH, 'sig' => $sig('secure_auth')],
+  ['name' => SECURE_AUTH_COOKIE, 'path' => PLUGINS_COOKIE_PATH, 'sig' => $sig('secure_auth')],
+  ['name' => AUTH_COOKIE, 'path' => ADMIN_COOKIE_PATH, 'sig' => $sig('auth')],
+  ['name' => LOGGED_IN_COOKIE, 'path' => COOKIEPATH, 'sig' => $sig('logged_in')],
+]]);
+PHP
+read -r -d '' WP_END <<'PHP' || true
+$before = get_user_meta($u->ID, 'session_tokens', true);
+$ended = is_array($before) ? count($before) - count($all) : 0;
+if ($all) update_user_meta($u->ID, 'session_tokens', $all); else delete_user_meta($u->ID, 'session_tokens');
+$say(['ok' => true, 'ended' => $ended]);
+PHP
+wp_eval() { # wp_eval <container> <run> <php>; stdin goes through
+  "$docker" exec -i -u 33:33 -w /var/www/html -e HOME=/tmp -e "MIU_RUN=$2" "$1" wp eval --skip-plugins --skip-themes "$3"
+}
+
+[ $# -ge 1 ] || die "usage: pr-stack mem | add <stack> <wp|full> free=<b> pro=<b> [hub=<b>] | status <stack> | ports <stack> | remove <stack> | wp-session <stack> <run> | wp-session-end <stack> <run>"
 verb=$1; shift
 case $verb in
   mem)
@@ -127,6 +195,23 @@ print(json.dumps({"ok": True, "slug": name, "created_at": s.get("created_at"), "
     if [ -e "$work" ]; then
       [ ! -L "$work" ] && [ -d "$work" ] || die "$work is not a plain folder; left as it is"
       rm -rf -- "$work"
+    fi
+    ;;
+  wp-session|wp-session-end)
+    [ $# -eq 2 ] && name_ok "$1" && [[ $1 != wp-* ]] && run_ok "$2" || die "usage: pr-stack $verb <full stack> <run>"
+    # One session change at a time per stack: each reads and writes miu-qa's
+    # whole session list, so two at once could bring back one just ended.
+    install -d -m 0700 "$locks"
+    exec 9>"$locks/wp-session-$1.lock"
+    flock -w 120 9 || { echo '{"ok":false,"code":"wp_session_busy"}'; exit 1; }
+    c=$(wp_container "$1") || { printf '%s\n' "$c"; exit 1; }
+    if [ "$verb" = wp-session ]; then
+      # One line, checked here too, and handed on without a copy in argv or a file.
+      IFS= read -r token || true
+      [[ $token =~ ^[A-Za-z0-9]{43}$ ]] || die "wp-session reads a 43-character token on stdin"
+      printf '%s\n' "$token" | wp_eval "$c" "$2" "$WP_COMMON"$'\n'"$WP_START"
+    else
+      wp_eval "$c" "$2" "$WP_COMMON"$'\n'"$WP_END" < /dev/null
     fi
     ;;
   *) die "unknown verb: $verb" ;;

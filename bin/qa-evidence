@@ -38,10 +38,31 @@ record() { # id kind label file exit extra_json
     }
     const row = { id, kind, label, file, exit: exit === "" ? null : Number(exit),
                   at: new Date().toISOString(), ...JSON.parse(extra || "{}") };
-    fs.appendFileSync(process.env.LEDGER, JSON.stringify(row) + "\n");
+    // The row is redacted before it is appended (a command line can hold a cookie).
+    import(process.env.QA_REDACT_LIB).then(({ redact, literalsFrom }) => {
+      fs.appendFileSync(process.env.LEDGER, redact(JSON.stringify(row), literalsFrom(process.env.QA_REDACT_FILE)) + "\n");
+    }).catch((e) => { console.error(`qa-evidence: the ledger row was not written: ${e.message}`); process.exit(4); });
   ' "$@"
 }
 export LEDGER
+export QA_REDACT_LIB="$HERE/../lib/redact.mjs"
+
+# Every file is captured in $STAGE, private to the run, goes through
+# lib/redact.mjs there (session cookies and the run's tokens in
+# $QA_REDACT_FILE), and only then moves into evidence/. A redaction that fails
+# publishes nothing: the capture fails, and its staged files are deleted.
+STAGE="$EVIDENCE_DIR/.staging"
+mkdir -p -m 0700 "$STAGE"
+publish() { # publish <name>...: redact the staged files, then move each into evidence/
+  local f staged=()
+  for f in "$@"; do staged+=("$STAGE/$f"); done
+  if ! node "$QA_REDACT_LIB" "${staged[@]}"; then
+    rm -f "${staged[@]}"
+    echo "qa-evidence: could not redact the capture, so it is not kept; take it again" >&2
+    exit 5
+  fi
+  for f in "$@"; do mv -f "$STAGE/$f" "$EVIDENCE_DIR/$f"; done
+}
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
@@ -53,7 +74,8 @@ case "$cmd" in
       printf '$ %s\n' "$*"
       "$@" 2>&1
       echo "[exit $?]"
-    } > "$EVIDENCE_DIR/$file"
+    } > "$STAGE/$file"
+    publish "$file"
     # The whole output is the evidence; the agent sees the start and the end,
     # because every line it reads is paid for again on every later turn.
     lines=$(wc -l < "$EVIDENCE_DIR/$file" | tr -d ' ')
@@ -67,9 +89,11 @@ case "$cmd" in
   http)
     label="$1"; shift
     id=$(next_id); file="$id.http"
-    curl -sS -D - --max-time 60 "$@" -o "$EVIDENCE_DIR/$id.body" > "$EVIDENCE_DIR/$file" 2>&1
+    curl -sS -D - --max-time 60 "$@" -o "$STAGE/$id.body" > "$STAGE/$file" 2>&1
     code=$?
-    { echo; echo "--- body (first 4000 bytes) ---"; head -c 4000 "$EVIDENCE_DIR/$id.body"; } >> "$EVIDENCE_DIR/$file"
+    touch "$STAGE/$id.body"
+    { echo; echo "--- body (first 4000 bytes) ---"; head -c 4000 "$STAGE/$id.body"; } >> "$STAGE/$file"
+    publish "$file" "$id.body"
     status=$(head -n1 "$EVIDENCE_DIR/$file" | awk '{print $2}')
     cat "$EVIDENCE_DIR/$file"
     record "$id" http "$label" "$file" "$code" "$(node -e 'console.log(JSON.stringify({status: process.argv[1] || null, args: process.argv.slice(2).join(" ")}))' "$status" "$@")"
@@ -85,8 +109,9 @@ case "$cmd" in
     label="${pos[0]}"; url="${pos[1]}"; size="${pos[2]:-1280x800}"; auth="${pos[3]:-}"
     marks_json=$(node -e 'console.log(JSON.stringify(process.argv.slice(1).map((m) => { const i = m.indexOf("|"); return i < 0 ? { selector: m, note: "" } : { selector: m.slice(0, i).trim(), note: m.slice(i + 1).trim() }; })))' "${marks[@]+"${marks[@]}"}")
     id=$(next_id); file="$id.png"
-    QA_MARKS="$marks_json" node "$HERE/../lib/shot.mjs" "$url" "$EVIDENCE_DIR/$file" "$size" "$auth" > "$EVIDENCE_DIR/$id.console.json"
+    QA_MARKS="$marks_json" node "$HERE/../lib/shot.mjs" "$url" "$EVIDENCE_DIR/$file" "$size" "$auth" > "$STAGE/$id.console.json"
     code=$?
+    publish "$id.console.json"
     cat "$EVIDENCE_DIR/$id.console.json"
     record "$id" shot "$label" "$file" "$code" "$(node -e 'console.log(JSON.stringify({url: process.argv[1], size: process.argv[2], console: process.argv[3], marks: JSON.parse(process.argv[4])}))' "$url" "$size" "$id.console.json" "$marks_json")"
     echo "$id"
@@ -94,8 +119,9 @@ case "$cmd" in
   clip)
     label="$1"; steps="$2"; size="${3:-1280x800}"; auth="${4:-}"
     id=$(next_id); file="$id.gif"
-    node "$HERE/../lib/clip.mjs" "$steps" "$EVIDENCE_DIR/$file" "$size" "$auth" > "$EVIDENCE_DIR/$id.console.json"
+    node "$HERE/../lib/clip.mjs" "$steps" "$EVIDENCE_DIR/$file" "$size" "$auth" > "$STAGE/$id.console.json"
     code=$?
+    publish "$id.console.json"
     cat "$EVIDENCE_DIR/$id.console.json"
     record "$id" clip "$label" "$file" "$code" "$(node -e 'console.log(JSON.stringify({steps: require("path").basename(process.argv[1]), size: process.argv[2], console: process.argv[3]}))' "$steps" "$size" "$id.console.json")"
     echo "$id"
@@ -103,7 +129,8 @@ case "$cmd" in
   note)
     label="$1"; src="$2"
     id=$(next_id); ext="${src##*.}"; file="$id.$ext"
-    cp "$src" "$EVIDENCE_DIR/$file" || exit 1
+    cp "$src" "$STAGE/$file" || exit 1
+    publish "$file"
     record "$id" file "$label" "$file" "" "{}"
     echo "$id"
     ;;
