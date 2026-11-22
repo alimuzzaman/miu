@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelOf, labelGone, takeNext, stackKeys, stackWaited, requeueWaited, stackHold, STACK_HOLD_MS } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelOf, labelGone, takeNext, stackKeys, stackWaited, requeueWaited, stackHold, stackComing, STACK_HOLD_MS } from '../lib/queuectl.mjs';
 
 const auto = { mode: 'auto', paused: false };
 const manual = { mode: 'manual', paused: false };
@@ -137,10 +137,11 @@ test('auto-queued entries waiting for a person get no stack', () => {
 });
 
 test('a run that waited for its test stack is found by the stack name it waited for', () => {
-  assert.equal(stackWaited(['The pr Hub stack pr-hub-276 is not ready: no test stack: Being removed: 48 hours after the verdict with no new commits.']), 'pr-hub-276');
-  assert.equal(stackWaited(['rexenv is not ready: x', 'The dev Hub stack pr-hub-base is not ready: building']), 'pr-hub-base');
-  assert.equal(stackWaited(['rexenv is not ready: x']), null);
-  assert.equal(stackWaited(undefined), null);
+  assert.deepEqual(stackWaited(['The pr Hub stack pr-hub-276 is not ready: no test stack: Being removed: 48 hours after the verdict with no new commits.']), ['pr-hub-276']);
+  assert.deepEqual(stackWaited(['rexenv is not ready: x', 'The dev Hub stack pr-hub-base is not ready: building']), ['pr-hub-base']);
+  assert.deepEqual(stackWaited(['The pr Hub stack pr-hub-276 is not ready: x', 'The dev Hub stack pr-hub-base is not ready: y']), ['pr-hub-276', 'pr-hub-base'], 'both sides');
+  assert.deepEqual(stackWaited(['rexenv is not ready: x']), []);
+  assert.deepEqual(stackWaited(undefined), []);
 });
 
 // 2026-11-22: #696 went into waiting on pr-hub-276 and exited; the dashboard
@@ -184,4 +185,51 @@ test('requeueing moves an entry already in line instead of adding a second', () 
   assert.deepEqual(queue.map((q) => q.pr), [1, 2]);
   assert.equal(queue[0].why, 'x');
   assert.equal(queue[0].held, false);
+});
+
+// Sol review 2026-11-22: a stack that never comes must not hold the line for
+// ever, by an hour granted again on each retry or by retries with no hold.
+test('the hour counts from the first wait: a run that waits again after it goes to the back', () => {
+  const t = 0;
+  const adding = () => ({ state: 'adding' });
+  const queue = [{ repo: 'a/b', pr: 2 }];
+  const first = requeueWaited(queue, { repo: 'a/b', pr: 1 }, ['pr-hub-1'], t, adding);
+  assert.equal(first.deferred, false);
+  assert.equal(stackHold(queue, adding, t + STACK_HOLD_MS), null, 'the hour is up');
+  // It starts again (the pump keeps waitedSince on the entry it starts from) and waits again.
+  const { stackWait, ...entry } = queue.shift();
+  const again = requeueWaited(queue, entry, ['pr-hub-1'], t + STACK_HOLD_MS + 1000, adding);
+  assert.equal(again.deferred, true);
+  assert.deepEqual(queue.map((q) => q.pr), [2, 1], 'the next PR starts');
+  assert.equal(queue[1].stackWait, undefined);
+  assert.equal(queue[1].waitedSince, undefined, 'its next turn may wait an hour again');
+});
+
+test('a run whose stack cannot come goes to the back instead of holding the line', () => {
+  for (const s of [null, { state: 'refused' }, { state: 'failed' }, { state: 'following', applied: false, failed: true }]) {
+    const queue = [{ repo: 'a/b', pr: 2 }];
+    const r = requeueWaited(queue, { repo: 'a/b', pr: 1 }, ['pr-hub-1'], 0, () => s);
+    assert.equal(r.deferred, true, JSON.stringify(s));
+    assert.deepEqual(queue.map((q) => q.pr), [2, 1]);
+    assert.equal(stackHold(queue, () => s, 1), null);
+  }
+});
+
+test('the hold lasts until every stack the run waited for is ready, at the head it was asked for', () => {
+  const st = { 'pr-hub-1': { state: 'following', applied: true, head: 'b', appliedHead: 'a' }, 'pr-hub-base': { state: 'adding' } };
+  const of = (n) => st[n] ?? null;
+  const queue = [];
+  requeueWaited(queue, { repo: 'a/b', pr: 1 }, ['pr-hub-1', 'pr-hub-base'], 0, of);
+  assert.match(stackHold(queue, of, 1), /pr-hub-1 and pr-hub-base/, 'an older commit applied is not ready');
+  st['pr-hub-1'].appliedHead = 'b';
+  assert.match(stackHold(queue, of, 2), /pr-hub-base/, 'the dev stack still builds');
+  st['pr-hub-base'] = { state: 'following', applied: true, head: null, appliedHead: null };
+  assert.equal(stackHold(queue, of, 3), null);
+  assert.equal(stackComing({ state: 'following', applied: true }), false);
+  assert.equal(stackComing({ state: 'removed' }), false);
+});
+
+test('an old mark with one name still holds', () => {
+  const queue = [{ repo: 'a/b', pr: 1, stackWait: { name: 'pr-hub-1', until: 10 } }];
+  assert.ok(stackHold(queue, () => ({ state: 'adding' }), 1));
 });

@@ -836,19 +836,37 @@ async function enqueuePair(repo, pr, why, by = 'auto', label = null) {
 // model's engine is not signed in (lib/connections.mjs); queueHeld says why.
 let queueHeld = null;
 let pumping = false;
-// Runs the queue started, by run name, until they end: one that ends waiting
-// for its test stack goes back first in line (lib/queuectl.mjs requeueWaited).
+// Runs the queue or a person started, by run name, until they end: one that
+// ends waiting for its test stack goes back first in line (lib/queuectl.mjs
+// requeueWaited). Each entry is also kept in its run folder, so a restart
+// between the start and the wait still finds it (loadStarted).
+const STARTED_FROM = 'queue-entry.json';
 const startedFrom = new Map();
+function rememberStart(name, entry) {
+  startedFrom.set(name, entry);
+  try { fs.writeFileSync(path.join(RUNS, name, STARTED_FROM), JSON.stringify(entry)); } catch (e) { console.error(`queue: could not keep ${name}'s entry: ${e.message}`); }
+}
+function loadStarted() {
+  let names = [];
+  try { names = fs.readdirSync(RUNS); } catch { return; }
+  for (const name of names) {
+    const entry = readJson(path.join(RUNS, name, STARTED_FROM));
+    if (entry?.repo && Number.isInteger(entry.pr)) startedFrom.set(name, entry);
+  }
+}
+loadStarted();
+const stackOf = (name) => stacks.list().find((s) => s.name === name && s.state !== 'removed') ?? null;
 function reclaimWaited() {
   for (const [name, entry] of startedFrom) {
     const dir = path.join(RUNS, name);
     if (runAlive(dir) && !fs.existsSync(path.join(dir, 'waiting.json'))) continue;
     startedFrom.delete(name);
-    const stack = stackWaited(readJson(path.join(dir, 'waiting.json'))?.reasons);
-    if (!stack) continue;
-    requeueWaited(queue, entry, stack);
+    fs.rmSync(path.join(dir, STARTED_FROM), { force: true });
+    const names = stackWaited(readJson(path.join(dir, 'waiting.json'))?.reasons);
+    if (!names.length) continue;
+    const { deferred } = requeueWaited(queue, entry, names, Date.now(), stackOf);
     saveQueue();
-    console.error(`queue: ${entry.repo}#${entry.pr} waited for test stack ${stack}; it keeps its turn`);
+    console.error(`queue: ${entry.repo}#${entry.pr} waited for test stack ${names.join(' and ')}; ${deferred ? 'it goes to the back of the line' : 'it keeps its turn'}`);
   }
 }
 async function pump() {
@@ -856,7 +874,7 @@ async function pump() {
   reclaimWaited();
   if (nextIndex(queue, queueState()) < 0) return;
   const marked = queue.some((q) => q.stackWait);
-  const holding = stackHold(queue, (name) => stacks.list().find((s) => s.name === name && s.state !== 'removed') ?? null);
+  const holding = stackHold(queue, stackOf);
   if (marked) saveQueue();
   if (holding) {
     if (queueHeld !== holding) console.error(`queue held: ${holding}`);
@@ -897,11 +915,14 @@ async function pump() {
   } finally { pumping = false; }
   if (!next) return;
   const cfg = getConfig();
-  const r = startRun({ repo: next.repo, pr: next.pr, model: cfg.model, dryRun: !cfg.post, full: next.full, force: next.force, note: next.note, slack: cfg.post && cfg.slack });
+  // A person's direct start keeps its own model and dry run (launch) when it
+  // waited and starts again; others take Settings at the time they start.
+  const launch = next.launch ?? { model: cfg.model, dryRun: !cfg.post, slack: cfg.post && cfg.slack };
+  const r = startRun({ repo: next.repo, pr: next.pr, ...launch, full: next.full, force: next.force, note: next.note });
   if (r.error) console.error(`Could not start ${next.repo}#${next.pr}: ${r.error}`);
   else {
     const { stackWait, ...entry } = next;
-    startedFrom.set(r.name, entry);
+    rememberStart(r.name, entry);
     // Its CI starts beside it, if it has not already.
     ciFor(next.repo, next.pr);
   }
@@ -1104,6 +1125,21 @@ function verdicts() {
   }
   return out;
 }
+// The PRs that want a test stack now (lib/queuectl.mjs stackKeys): the live
+// run, the members of its pair, and what a person queued. A run that has not
+// written context/pr.json yet counts by the repo and PR in its qa-run.json.
+function stackDemand() {
+  const live = liveRun();
+  const keys = [];
+  if (live) {
+    const own = readJson(path.join(RUNS, live, 'context/pr.json'))?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+    const meta = readJson(path.join(RUNS, live, 'qa-run.json'));
+    if (own) keys.push(`${own[1]}#${own[2]}`);
+    if (meta?.repo && meta?.pr) keys.push(`${meta.repo}#${meta.pr}`);
+    for (const x of readJson(path.join(RUNS, live, 'context/pair.json')) ?? []) keys.push(`${x.repo}#${x.number}`);
+  }
+  return stackKeys(queue, keys);
+}
 let stackBusy = false;
 async function stackScan() {
   if (!stacksOn() || stackBusy) return;
@@ -1112,11 +1148,7 @@ async function stackScan() {
     const { list, error } = await refreshPrs();
     const listed = !error && list.length > 0;
     const open = listed ? new Map(list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid])) : null;
-    const live = liveRun();
-    const ctx = live ? readJson(path.join(RUNS, live, 'context/pr.json')) : null;
-    const own = ctx?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
-    const liveKeys = new Set([own && `${own[1]}#${own[2]}`, ...(live ? (readJson(path.join(RUNS, live, 'context/pair.json')) ?? []).map((x) => `${x.repo}#${x.number}`) : [])].filter(Boolean));
-    const wanted = stackKeys(queue, liveKeys);
+    const wanted = stackDemand();
     for (const key of wanted) {
       const p = list.find((x) => `${x.repo}#${x.number}` === key);
       const role = p && roleOf(p.repo);
@@ -1129,8 +1161,10 @@ async function stackScan() {
     if (roles().hub && profileOf(roles().hub.repo)?.stack?.kind === 'full') stacks.wantBase();
     const v = verdicts();
     for (const s of stacks.list()) stacks.observe(s.key, { head: open?.get(s.key), verdictAt: v.get(s.key)?.at, verdictHead: v.get(s.key)?.sha });
-    // What a person queued keeps its stack too, not only the live run (wanted).
-    await stacks.scan({ open, liveKeys: wanted });
+    // What a person queued keeps its stack too, not only the live run. Read
+    // again just before each removal: a person can queue or start one while
+    // the scan waits on Sandbox.
+    await stacks.scan({ open, liveKeys: stackDemand });
   } catch (e) { console.error('stack scan:', e.message); } finally { stackBusy = false; }
 }
 setInterval(stackScan, 2 * 60 * 1000);
@@ -2056,9 +2090,21 @@ const server = http.createServer((req, res) => {
       }
       if (url.pathname === '/api/unqueue') { unqueue(data.repo, Number(data.pr)); return json({ ok: true }); }
       if (url.pathname === '/api/start') {
-        const r = startRun({ repo: data.repo, pr: Number(data.pr), model: data.model, dryRun: data.dryRun !== false });
-        // A person's start: if it waits for its test stack, it keeps its turn as their entry.
-        if (!r.error) startedFrom.set(r.name, { repo: data.repo, pr: Number(data.pr), why: 'started from the dashboard', by: 'person', held: false, full: false, force: false, note: '', at: Date.now() });
+        const pr = Number(data.pr);
+        const launch = { model: data.model, dryRun: data.dryRun !== false };
+        // A run keeping its turn for its test stack goes first: this one queues behind it, with its own model and dry run.
+        const holding = !liveRun() && stackHold(queue, stackOf);
+        if (holding) {
+          if (!repos().includes(data.repo) || !Number.isInteger(pr) || pr < 1) return json({ error: 'Unknown pull request' });
+          if (!isModel(data.model)) return json({ error: 'Unknown model' });
+          enqueue(data.repo, pr, 'started from the dashboard', { by: 'person' });
+          const q = queue.find((x) => x.repo === data.repo && x.pr === pr);
+          if (q) { q.launch = launch; saveQueue(); }
+          return json({ ok: true, queued: true, waits: holding });
+        }
+        const r = startRun({ repo: data.repo, pr, ...launch });
+        // A person's start: if it waits for its test stack, it keeps its turn as their entry, with its launch options.
+        if (!r.error) rememberStart(r.name, { repo: data.repo, pr, why: 'started from the dashboard', by: 'person', held: false, full: false, force: false, note: '', at: Date.now(), launch });
         return json(r);
       }
       const rv = url.pathname.match(/^\/api\/runs\/([^/]+)\/review$/);

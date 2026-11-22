@@ -206,3 +206,21 @@ test('a PR that gets paired later gives up its own stack, and its page shows the
   assert.ok(s.calls.some((c) => c[0] === 'remove' && c[1] === 'wp-pr-free-21'), 'its own stack goes');
   assert.equal(s.st.view('WPDevelopers/xspeed#21').name, 'pr-hub-88');
 });
+
+// Sol review 2026-11-22: the scan plans after waiting on Sandbox; a person can
+// queue or start a run in that time, and its stack must not go.
+test('a stack about to be evicted stays when demand read again just before the removal uses it', async () => {
+  const s = setup({ answers: { status: { code: 0, out: JSON.stringify({ ok: true, applied: { free: 'x', pro: 'y' } }) } } });
+  const open = new Map();
+  for (let i = 1; i <= CAP + 1; i++) {
+    s.st.want('WPDevelopers/xspeed', i, 'free', pr(i));
+    open.set(`WPDevelopers/xspeed#${i}`, `sha${i}`);
+  }
+  for (let i = 0; i < CAP; i++) { await s.st.scan({ open }); s.tick(6 * 60 * 1000); }
+  let reads = 0;
+  const demand = () => (reads++ === 0 ? new Set() : new Set(['WPDevelopers/xspeed#1']));
+  await s.st.scan({ open, liveKeys: demand });
+  assert.ok(reads >= 2, 'read again before the removal');
+  assert.ok(!s.calls.some((c) => c[0] === 'remove'), 'the stack now in use stays');
+  assert.ok(!s.calls.some((c) => c[0] === 'add' && c[1] === `wp-pr-free-${CAP + 1}`), 'and the add it made room for waits');
+});
