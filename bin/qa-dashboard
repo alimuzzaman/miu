@@ -1524,9 +1524,11 @@ const WAIVERS_FILE = path.join(RUNS, '.waivers.json');
 // The findings of this PR's runs, newest first, each with its waiver id.
 function prFindings(repo, pr) {
   const out = [];
+  // Only reports that went out: what the person saw (not a run still going).
   for (const r of runsByPr().get(`${repo}#${pr}`) ?? []) {
+    if (!r.postedAt) continue;
     const res = readJson(path.join(RUNS, r.name, 'results.json'));
-    for (const i of res?.issues ?? []) out.push({ waive_id: waive.issueId(i), waivable: waive.waivable(i), kind: i.kind ?? null, title: String(i.title ?? '').slice(0, 300), rule: i.rule ? String(i.rule).slice(0, 300) : null, severity: i.severity ?? null });
+    for (const i of res?.issues ?? []) out.push({ waive_id: waive.issueId(i), waivable: waive.waivable(i), kind: i.kind ?? null, title: String(i.title ?? '').slice(0, 300), rule: i.rule ? String(i.rule).slice(0, 300) : null, severity: waive.severityOf(i.severity) });
   }
   return out;
 }
