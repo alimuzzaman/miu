@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelOf, labelGone, takeNext, stackKeys, stackWaited, requeueWaited, stackHold, stackComing, STACK_HOLD_MS } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelOf, labelGone, takeNext, pairCandidates, pairCovered, stackKeys, stackWaited, requeueWaited, stackHold, stackComing, STACK_HOLD_MS } from '../lib/queuectl.mjs';
 
 const auto = { mode: 'auto', paused: false };
 const manual = { mode: 'manual', paused: false };
@@ -232,4 +232,47 @@ test('the hold lasts until every stack the run waited for is ready, at the head 
 test('an old mark with one name still holds', () => {
   const queue = [{ repo: 'a/b', pr: 1, stackWait: { name: 'pr-hub-1', until: 10 } }];
   assert.ok(stackHold(queue, () => ({ state: 'adding' }), 1));
+});
+
+// The CFE set, 2026-11-22: a person queued Hub #643, Free #896 and Pro #366;
+// the Hub run tested all three, and #896 then started again on the same heads.
+const cfeRun = { name: 'xspeed-hub-643-r3', key: 'o/hub#643', doneAt: 2000, members: [
+  { key: 'o/hub#643', sha: 'h3', verdict: 'ok' }, { key: 'o/free#896', sha: 'f3', verdict: 'ok' }, { key: 'o/pro#366', sha: 'p3', verdict: 'ok' }] };
+const atRun = { 'o/hub#643': 'h3', 'o/free#896': 'f3', 'o/pro#366': 'p3' };
+const headsAt = (over = {}) => (k) => ({ ...atRun, ...over })[k];
+
+test('a PR its pair\'s finished run tested at every head does not start again; the next one does', async () => {
+  const line = [
+    { repo: 'o/free', pr: 896, by: 'person', at: 1000 },
+    { repo: 'o/pro', pr: 366, by: 'person', at: 1000 },
+    { repo: 'o/other', pr: 5, by: 'person', at: 1000 },
+  ];
+  const covered = async (q) => pairCovered(q, headsAt(), [cfeRun]);
+  const took = await takeNext(line, st, { readPr: async () => null, asks, covered });
+  assert.equal(took.next.pr, 5);
+  assert.deepEqual(took.dropped.map((d) => [d.pr, d.dropWhy]), [[896, 'xspeed-hub-643-r3'], [366, 'xspeed-hub-643-r3']]);
+  assert.equal(line.length, 0);
+});
+
+test('a pair run does not cover a moved head or partner, a full, forced or noted re-run, its own PR, an inconclusive member, or a later entry', () => {
+  const q = { repo: 'o/free', pr: 896, at: 1000 };
+  assert.equal(pairCovered(q, headsAt(), [cfeRun]), 'xspeed-hub-643-r3');
+  assert.equal(pairCovered({ ...q, repo: 'O/Free' }, headsAt(), [cfeRun]), 'xspeed-hub-643-r3', 'repo names compare without case');
+  assert.equal(pairCovered(q, headsAt({ 'o/free#896': 'f4' }), [cfeRun]), null, 'new commits on the PR');
+  assert.equal(pairCovered(q, headsAt({ 'o/hub#643': 'h4' }), [cfeRun]), null, 'a partner moved: tested against its old commit');
+  assert.equal(pairCovered(q, headsAt({ 'o/pro#366': undefined }), [cfeRun]), null, 'a partner head unknown');
+  assert.equal(pairCovered({ ...q, full: true }, headsAt(), [cfeRun]), null);
+  assert.equal(pairCovered({ ...q, force: true }, headsAt(), [cfeRun]), null);
+  assert.equal(pairCovered({ ...q, note: 'check the expiry banner' }, headsAt(), [cfeRun]), null, 'a /miu note the run never read');
+  assert.equal(pairCovered({ ...q, at: 3000 }, headsAt(), [cfeRun]), null, 'queued after the pair run finished: a person wants it again');
+  assert.equal(pairCovered({ repo: 'o/hub', pr: 643, at: 1000 }, headsAt(), [cfeRun]), null, 'the run of the PR itself is not a pair cover');
+  const unsure = { ...cfeRun, members: cfeRun.members.map((m) => ({ ...m, verdict: 'inconclusive' })) };
+  assert.equal(pairCovered(q, headsAt(), [unsure]), null);
+  assert.deepEqual(pairCandidates({ ...q, at: 3000 }, [cfeRun]), [], 'no candidate, so no GitHub reads');
+});
+
+test('a failing pair check starts the entry, as an unreadable label does', async () => {
+  const line = [{ repo: 'o/free', pr: 896, by: 'person', at: 1000 }];
+  const took = await takeNext(line, st, { readPr: async () => null, asks, covered: async () => { throw new Error('GitHub down'); } });
+  assert.equal(took.next.pr, 896);
 });

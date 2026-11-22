@@ -20,6 +20,7 @@ import net from 'node:net';
 import { recordRefusal, refusalIn } from '../lib/authrefused.mjs';
 import { forPr, readStore, writeRunWaivers, memberMatcher } from '../lib/waivers.mjs';
 import { validate, computeVerdict, renderComment, renderFull, loadLedger, screenshots, forMember, openCells } from '../lib/report.mjs';
+import { retestBase, filesSeenBy, perFile } from '../lib/retestbase.mjs';
 import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, LABELS, setLabelNames, noteLocalImages } from '../lib/publish.mjs';
 import { runAgent } from '../lib/agent.mjs';
 import { engineOf, ENGINES } from '../lib/engines.mjs';
@@ -154,35 +155,14 @@ if (prior.length || humanQa.length) {
 // and context, which is not the PR's own change.
 // --full (or "/miu retest full") tests everything again.
 let retest = null;
-const perFile = (patch) => {
-  const m = new Map();
-  for (const part of patch.split(/^(?=diff --git )/m)) { const f = part.match(/^diff --git a\/(\S+) b\/(\S+)/); if (f) m.set(f[2], part.split('\n').filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---) /.test(l))); }
-  return m;
-};
-// A pair's other PRs count too: their files go in as "<repo>:<path>".
-const withPartners = (m, dir) => {
-  const pd = path.join(dir, 'context/pair');
-  for (const f of fs.existsSync(pd) ? fs.readdirSync(pd).filter((x) => x.endsWith('.patch')) : []) {
-    for (const [k, v] of perFile(fs.readFileSync(path.join(pd, f), 'utf8'))) m.set(`${f.replace(/-\d+\.patch$/, '')}:${k}`, v);
-  }
-  return m;
-};
-const pairSig = (dir) => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'context/pair.json'), 'utf8')).map((x) => `${x.repo}#${x.number}@${x.headRefOid}`).sort().join(','); } catch { return ''; } };
-const pairNow = pairList.map((x) => `${x.repo}#${x.number}@${x.headRefOid}`).sort().join(',');
+// A pair's other PRs count too: their files go in as "<repo>:<path>". The
+// earlier run may be a paired run of another PR this one was a member of
+// (lib/retestbase.mjs).
 if (!flag('--full')) {
-  const runsDir = path.dirname(runDir);
-  const prev = fs.readdirSync(runsDir).map((d) => path.join(runsDir, d)).filter((d) => d !== runDir).map((d) => {
-    try {
-      const p = JSON.parse(fs.readFileSync(path.join(d, 'context/pr.json'), 'utf8'));
-      const v = JSON.parse(fs.readFileSync(path.join(d, 'verdict.json'), 'utf8'));
-      // The same commit counts only when a PR of the pair moved since.
-      if (p.url !== prData.url || (p.headRefOid === sha && pairSig(d) === pairNow) || v.verdict === 'inconclusive' || v.verdict === 'no_result' || !fs.existsSync(path.join(d, 'results.json'))) return null;
-      return { dir: d, sha: p.headRefOid, round: v.round ?? 1, at: fs.statSync(path.join(d, 'verdict.json')).mtimeMs };
-    } catch { return null; }
-  }).filter(Boolean).sort((a, b) => b.at - a.at)[0];
+  const prev = retestBase(path.dirname(runDir), runDir, { key: selfKey, sha, pair: pairList });
   if (prev) {
-    const then = withPartners(perFile(fs.readFileSync(path.join(prev.dir, 'context/diff.patch'), 'utf8')), prev.dir);
-    const now = withPartners(perFile(fs.readFileSync(path.join(ctx, 'diff.patch'), 'utf8')), runDir);
+    const then = filesSeenBy(prev.dir, selfKey);
+    const now = filesSeenBy(runDir, selfKey);
     const same = (a = [], b = []) => a.length === b.length && a.every((l, k) => l === b[k]);
     const changedFiles = [...new Set([...then.keys(), ...now.keys()])].filter((f) => !same(then.get(f), now.get(f)));
     const delta = (f) => { const a = then.get(f) ?? [], b = now.get(f) ?? [], A = new Set(a), B = new Set(b); return b.filter((l) => !A.has(l)).length + a.filter((l) => !B.has(l)).length; };

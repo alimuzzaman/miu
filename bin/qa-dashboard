@@ -38,7 +38,7 @@ import * as waive from '../lib/waivers.mjs';
 import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelGone, takeNext, stackKeys, stackWaited, requeueWaited, stackHold } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelGone, takeNext, pairCandidates, pairCovered, stackKeys, stackWaited, requeueWaited, stackHold } from '../lib/queuectl.mjs';
 import { createCi, ciRunCommit, shipSiblings, parseWorkflows, runningGroups, prCiProblem, forkOf, workflowsAt, linkedPrs } from '../lib/ci.mjs';
 import { sweepCiComments } from '../lib/cicomment.mjs';
 import { runSandboxCi, adoptSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
@@ -870,6 +870,32 @@ function reclaimWaited() {
     console.error(`queue: ${entry.repo}#${entry.pr} waited for test stack ${names.join(' and ')}; ${deferred ? 'it goes to the back of the line' : 'it keeps its turn'}`);
   }
 }
+// Finished paired runs (verdict.json lists more than one member), for
+// pairCovered: a queued PR its pair's run already tested at its head does
+// not start again.
+function pairRuns() {
+  const out = [];
+  for (const name of fs.existsSync(RUNS) ? fs.readdirSync(RUNS) : []) {
+    const f = path.join(RUNS, name, 'verdict.json');
+    const v = readJson(f);
+    if (!(v?.members?.length > 1)) continue;
+    try { out.push({ name, key: v.members[0].key, doneAt: fs.statSync(f).mtimeMs, members: v.members }); } catch { /* gone meanwhile */ }
+  }
+  return out;
+}
+async function coveredByPair(q) {
+  const runs = pairCandidates(q, pairRuns());
+  if (!runs.length) return null;
+  // Every member's head now: a paired result is stale once any of them moved.
+  const heads = new Map();
+  for (const m of new Set(runs.flatMap((r) => r.members.map((x) => x.key)))) {
+    const [repo, n] = m.split('#');
+    heads.set(m, (await gh.prBasic(repo, Number(n))).headRefOid);
+  }
+  const by = pairCovered(q, (k) => heads.get(k), runs);
+  return by ? `already tested at ${String(heads.get(`${q.repo}#${q.pr}`) ?? '').slice(0, 7)} with its pair in the paired run ${by}` : null;
+}
+
 async function pump() {
   if (liveRun() || pumping) return;
   reclaimWaited();
@@ -910,7 +936,7 @@ async function pump() {
   let next = null;
   pumping = true;
   try {
-    const took = await takeNext(queue, queueState, { readPr: (repo, pr) => gh.prBasic(repo, pr), asks: [...L().request, L().retest], busy: () => !!liveRun(), log: (m) => console.error(m) });
+    const took = await takeNext(queue, queueState, { readPr: (repo, pr) => gh.prBasic(repo, pr), asks: [...L().request, L().retest], busy: () => !!liveRun(), covered: coveredByPair, log: (m) => console.error(m) });
     if (took.dropped.length || took.next) saveQueue();
     next = took.next;
   } finally { pumping = false; }
