@@ -16,7 +16,7 @@ function runDir(waivers) {
   fs.mkdirSync(path.join(dir, 'evidence'));
   const rows = ['ev-001', 'ev-002'].map((id) => { fs.writeFileSync(path.join(dir, 'evidence', `${id}.log`), 'x'); return JSON.stringify({ id, kind: 'cmd', label: 'x', file: `${id}.log`, exit: 0 }); });
   fs.writeFileSync(path.join(dir, 'evidence', 'index.jsonl'), rows.join('\n') + '\n');
-  if (waivers) fs.writeFileSync(path.join(dir, 'waivers.json'), JSON.stringify(waivers));
+  if (waivers) writeRunWaivers(dir, { members: [], waivers });
   return dir;
 }
 const passing = [{ id: 1, claim: 'x', visible: false, baseline: { status: 'reproduced', evidence: ['ev-001'] }, results: { A: { status: 'pass', evidence: ['ev-001'] } } }];
@@ -52,6 +52,8 @@ test('parsing: ids and a reason line; a missing reason or a bad id changes nothi
   assert.deepEqual(parseWaive('Thanks.\n\n/MIU Waive M3F9A, m3f9a\nreason:   approved  '), { op: 'waive', ids: ['m3f9a'], reason: 'approved' });
   assert.deepEqual(parseWaive('/miu waive m3f9a'), { op: 'waive', error: 'no reason line' });
   assert.deepEqual(parseWaive('/miu waive m3f9a\nReason:   '), { op: 'waive', error: 'no reason line' });
+  assert.deepEqual(parseWaive('/miu waive m3f9a\nReason:\n\n— Alim'), { op: 'waive', error: 'no reason line' });
+  assert.deepEqual(parseWaive('Reason: above the command\n/miu waive m3f9a'), { op: 'waive', error: 'no reason line' });
   assert.equal(parseWaive('/miu waive\nReason: x').error, 'no finding id');
   assert.match(parseWaive('/miu waive F1 m3f9a\nReason: x').error, /not a finding id: f1/);
   assert.deepEqual(parseWaive('/miu unwaive m3f9a'), { op: 'unwaive', ids: ['m3f9a'] });
@@ -69,8 +71,13 @@ test('the reason is shown as plain words: no HTML, markers, links or pings', () 
 
 test('a finding that names the test suites counts as CI', () => {
   assert.equal(waivable({ title: 'PHPUnit fails on the PR head' }), false);
-  assert.equal(waivable({ title: 'x', steps: ['see context/fast-checks.md'] }), false);
+  assert.equal(waivable({ title: 'x', claim_broken: 'the test suite passes (fast-checks.md)' }), false);
+  assert.equal(waivable({ title: 'The CI build fails on PHP 7.4' }), false);
   assert.equal(waivable({ title: 'Save fails' }), true);
+  // Steps and code paths are not read: a finding in includes/class-ci.php, or
+  // found while running the unit tests, is still a product finding.
+  assert.equal(waivable({ title: 'Export drops a column', code_ref: 'includes/class-ci.php:4', steps: ['ran the unit tests first'] }), true);
+  assert.equal(waivable({ title: 'The circle icon is clipped' }), true);
   assert.equal(waivable(business({ title: 'CI-looking words in a rule title: phpunit' })), true);
 });
 
@@ -187,6 +194,12 @@ test('the run file counts only as Miu wrote it: not a link, not left in results'
   writeRunWaivers(dir, { members: [], waivers: [waiverFor(b)] });
   assert.equal(loadRunWaivers(dir).waivers.length, 1);
   assert.equal((fs.statSync(path.join(dir, 'waivers.json')).mode & 0o777), 0o644);
+  // A legacy list, or a file others may write, is not read.
+  fs.chmodSync(path.join(dir, 'waivers.json'), 0o664);
+  assert.deepEqual(loadRunWaivers(dir), {});
+  fs.rmSync(path.join(dir, 'waivers.json'));
+  fs.writeFileSync(path.join(dir, 'waivers.json'), JSON.stringify([waiverFor(b)]), { mode: 0o644 });
+  assert.deepEqual(loadRunWaivers(dir), {});
   // A link in its place is not read.
   const other = path.join(dir, 'elsewhere.json');
   fs.writeFileSync(other, JSON.stringify({ waivers: [waiverFor(b)] }));

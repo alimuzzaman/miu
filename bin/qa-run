@@ -134,10 +134,12 @@ try { prior = await previousRuns(repo, pr); } catch { /* no access in a dry run 
 const lastRound = prior.filter((p) => p.sha !== sha).sort((a, b) => b.round - a.round)[0];
 const sameShaRun = prior.find((p) => p.sha === sha);
 const round = sameShaRun?.round ?? (lastRound ? lastRound.round + 1 : 1);
+const waivedIds = forPr(readStore(path.join(path.dirname(runDir), '.waivers.json')), repo, pr).map((w) => w.id);
 const humanQa = prData.comments.filter((c) => /FOUND (PARTIALLY )?(NOT )?OK/.test(c.body) && !c.body.includes(`<!-- ${project().marker}`)).slice(-2);
 if (prior.length || humanQa.length) {
   write('previous-rounds.md', [
-    ...prior.sort((a, b) => b.round - a.round).map((p) => `## Automated round ${p.round} at ${p.sha?.slice(0, 7)}\n\n${p.body}`),
+    // A waived finding is not open for the re-test (lib/waivers.mjs).
+    ...prior.sort((a, b) => b.round - a.round).map((p) => `## Automated round ${p.round} at ${p.sha?.slice(0, 7)}\n\n${waivedIds.reduce((t, id) => t.replaceAll(`\`waive: ${id}\``, `(waived as ${id}, not open)`), p.body ?? '')}`),
     ...humanQa.reverse().map((c) => `## Human QA comment by ${c.author.login} at ${c.createdAt}\n\n${c.body}`),
   ].join('\n\n---\n\n'));
 }
