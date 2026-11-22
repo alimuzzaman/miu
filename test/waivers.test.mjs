@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { issueId, parseWaive, mayCommand, applyCommand, forPr, readStore, writeStore, markWaived, ID_RE } from '../lib/waivers.mjs';
+import { issueId, parseWaive, mayCommand, applyCommand, forPr, readStore, writeStore, markWaived, ID_RE, FORMAT, plain, waivable, writeRunWaivers, loadRunWaivers } from '../lib/waivers.mjs';
+import { endLabels, LABELS } from '../lib/publish.mjs';
 import { validate, computeVerdict, renderComment, renderFull, loadLedger } from '../lib/report.mjs';
 import { findings } from '../lib/fix.mjs';
 
@@ -25,7 +26,7 @@ function judge(issues, waivers) {
   const v = validate(results(issues), loadLedger(dir), dir);
   return { ...v, dir, verdict: computeVerdict(v.results) };
 }
-const waiverFor = (issue, extra = {}) => ({ id: issueId(issue), by: 'alim', reason: 'owner-approved exception', url: 'https://github.com/acme/shop/pull/7#issuecomment-1', at: '2026-11-22T00:00:00Z', ...extra });
+const waiverFor = (issue, extra = {}) => ({ id: issueId(issue), by: 'alim', reason: 'owner-approved exception', url: 'https://github.com/acme/shop/pull/7#issuecomment-1', at: '2026-11-22T00:00:00Z', severity: issue.severity, ...extra });
 
 test('ids are short, stable across rounds and follow the rule for a business issue', () => {
   const id = issueId(business());
@@ -35,9 +36,11 @@ test('ids are short, stable across rounds and follow the rule for a business iss
   // Case, spacing, quotes and a trailing full stop are not a new rule.
   assert.equal(issueId(business({ rule: `  a guided switch never  replaces another plugin's drop-in.` })), id);
   assert.notEqual(issueId(business({ rule: 'Connect AI never names AI clients' })), id);
-  // Others: the kind and the claim it breaks, then the title.
+  // Others: the kind, the claim it breaks and the title, so another finding
+  // against the same claim is not covered by the first one's waiver.
   const bug = { severity: 'major', title: 'Save fails', claim_broken: 'Settings save on the first click' };
-  assert.equal(issueId({ ...bug, title: 'The save button does nothing' }), issueId(bug));
+  assert.equal(issueId({ ...bug, severity: 'minor' }), issueId(bug));
+  assert.notEqual(issueId({ ...bug, title: 'Saving causes a fatal error' }), issueId(bug));
   assert.notEqual(issueId({ ...bug, kind: 'ci' }), issueId(bug));
   assert.equal(issueId({ title: 'Save fails' }), issueId({ title: 'save fails.' }));
 });
@@ -52,6 +55,23 @@ test('parsing: ids and a reason line; a missing reason or a bad id changes nothi
   assert.equal(parseWaive('/miu waive\nReason: x').error, 'no finding id');
   assert.match(parseWaive('/miu waive F1 m3f9a\nReason: x').error, /not a finding id: f1/);
   assert.deepEqual(parseWaive('/miu unwaive m3f9a'), { op: 'unwaive', ids: ['m3f9a'] });
+  // Quoted, fenced or indented examples are not commands; Miu's own format
+  // reply never reads as one.
+  assert.equal(parseWaive(FORMAT), null);
+  assert.equal(parseWaive('Try:\n```\n/miu waive m3f9a\nReason: x\n```'), null);
+  assert.equal(parseWaive('> /miu waive m3f9a\n> Reason: x'), null);
+  assert.equal(parseWaive('    /miu waive m3f9a\n    Reason: x'), null);
+});
+
+test('the reason is shown as plain words: no HTML, markers, links or pings', () => {
+  assert.equal(plain('ok <!-- miu-sha=abc --> see [x](http://e) `c` @sam #12 | y'), 'ok !-- miu-sha=abc -- see x(http://e) c @\u200bsam #\u200b12 y');
+});
+
+test('a finding that names the test suites counts as CI', () => {
+  assert.equal(waivable({ title: 'PHPUnit fails on the PR head' }), false);
+  assert.equal(waivable({ title: 'x', steps: ['see context/fast-checks.md'] }), false);
+  assert.equal(waivable({ title: 'Save fails' }), true);
+  assert.equal(waivable(business({ title: 'CI-looking words in a rule title: phpunit' })), true);
 });
 
 test('authorization: only the owner, org members and collaborators may command', () => {
@@ -140,4 +160,57 @@ test('a waived finding is not sent to the fixer', () => {
   assert.deepEqual(findings(r), []);
   markWaived(r, []);
   assert.equal(findings(r).length, 1);
+});
+
+test('a waiver never covers the same finding grown more severe', () => {
+  const minor = business({ severity: 'minor' });
+  const { verdict, results: r } = judge([business({ severity: 'blocker' })], [waiverFor(minor)]);
+  assert.equal(verdict, 'not_ok');
+  assert.equal(r.issues[0].waived, undefined);
+  // Less severe than when waived is still covered.
+  assert.equal(judge([business({ severity: 'major' })], [waiverFor(business())]).verdict, 'ok');
+});
+
+test('paired runs: a waiver covers its own PR; a shared finding only when every PR waived it', () => {
+  const members = [{ key: 'acme/shop#7', repo: 'acme/shop', pr: 7, label: 'Free' }, { key: 'acme/shop-pro#3', repo: 'acme/shop-pro', pr: 3, label: 'Pro' }];
+  const mk = (pr) => business({ pr });
+  const w = (key) => ({ ...waiverFor(business()), key });
+  const run = (issues, waivers) => { const r = { issues }; markWaived(r, { members, waivers }); return r.issues.map((i) => !!i.waived); };
+  assert.deepEqual(run([mk('acme/shop#7'), mk('acme/shop-pro#3')], [w('acme/shop#7')]), [true, false]);
+  assert.deepEqual(run([mk(undefined)], [w('acme/shop#7')]), [false]);
+  assert.deepEqual(run([mk(undefined)], [w('acme/shop#7'), w('acme/shop-pro#3')]), [true]);
+});
+
+test('the run file counts only as Miu wrote it: not a link, not left in results', () => {
+  const b = business();
+  const dir = runDir();
+  writeRunWaivers(dir, { members: [], waivers: [waiverFor(b)] });
+  assert.equal(loadRunWaivers(dir).waivers.length, 1);
+  assert.equal((fs.statSync(path.join(dir, 'waivers.json')).mode & 0o777), 0o644);
+  // A link in its place is not read.
+  const other = path.join(dir, 'elsewhere.json');
+  fs.writeFileSync(other, JSON.stringify({ waivers: [waiverFor(b)] }));
+  fs.rmSync(path.join(dir, 'waivers.json'));
+  fs.symlinkSync(other, path.join(dir, 'waivers.json'));
+  assert.deepEqual(loadRunWaivers(dir), {});
+  // writeRunWaivers replaces the link instead of writing through it.
+  writeRunWaivers(dir, { members: [], waivers: [] });
+  assert.equal(fs.lstatSync(path.join(dir, 'waivers.json')).isSymbolicLink(), false);
+  assert.equal(JSON.parse(fs.readFileSync(other, 'utf8')).waivers.length, 1);
+  // An agent's waivers_unmatched in results.json does not survive.
+  const v = validate({ ...results([]), waivers_unmatched: ['m0000'] }, loadLedger(dir), dir);
+  assert.equal(v.results.waivers_unmatched, undefined);
+});
+
+test('a waived rule conflict does not get the Against Product label', () => {
+  const r = { criteria: [], issues: [{ ...business(), waived: { by: 'alim' } }] };
+  assert.equal(endLabels('ok', r, []).add.includes(LABELS.against), false);
+  r.issues[0].waived = undefined;
+  assert.equal(endLabels('ok', r, []).add.includes(LABELS.against), true);
+});
+
+test('the fixer matches a waived rule however the business row writes it', () => {
+  const b = business();
+  const r = { issues: [{ ...b, waive_id: issueId(b), waived: { by: 'alim' } }], business: [{ rule: `${RULE.toUpperCase()}.`, status: 'conflicts' }], criteria: [] };
+  assert.deepEqual(findings(r), []);
 });

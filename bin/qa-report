@@ -37,7 +37,7 @@ fs.writeFileSync(path.join(runDir, 'comment.md'), renderComment(results, verdict
 fs.writeFileSync(path.join(runDir, 'report.md'), renderFull(results, verdict, { problems, ledger, runDir }) + '\n');
 const counts = {
   criteria: results.criteria.length,
-  issues: Object.fromEntries(['blocker', 'major', 'minor', 'nit'].map((s) => [s, results.issues.filter((i) => i.severity === s && !i.unconfirmed).length])),
+  issues: Object.fromEntries(['blocker', 'major', 'minor', 'nit'].map((s) => [s, results.issues.filter((i) => i.severity === s && !i.unconfirmed && !i.waived).length])),
   evidence: ledger.size,
 };
 fs.writeFileSync(path.join(runDir, 'verdict.json'), JSON.stringify({ verdict, problems, counts }, null, 2) + '\n');

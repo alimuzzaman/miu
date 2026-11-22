@@ -96,7 +96,7 @@ Product rules are read from the base branch, so an exception the owner approved 
 Reason: owner-approved exception, DESIGN.md §24.28
 ```
 
-`/miu unwaive m3f9a` takes it back. Without a `Reason:` line nothing changes and Miu replies with the format. A waiver counts from the next round; the current report stays as it is. The id comes from the rule for a product-rule finding, otherwise from the kind and the claim it breaks (or its title), so a reworded finding is a new one. The waived finding is still tested and shown, under "Waived" with who waived it, the reason and a link to the comment, and it no longer lowers the verdict. CI failures (`"kind": "ci"`) are fixed in code and cannot be waived. Waivers are kept per PR in `runs/.waivers.json` (lib/waivers.mjs).
+`/miu unwaive m3f9a` takes it back. Without a `Reason:` line nothing changes and Miu replies with the format. A waiver counts from the next round; the current report stays as it is. The id comes from the rule for a product-rule finding, otherwise from the kind, the claim it breaks and the title, so a reworded finding is a new one. A waiver covers its own PR's findings (a finding a pair shares only when every PR waived it), and never the same finding grown more severe than when it was waived. The waived finding is still tested and shown, under "Waived" with who waived it, the reason and a link to the comment, and it no longer lowers the verdict. CI failures (`"kind": "ci"`, or a finding that names the repo's test suites) are fixed in code and cannot be waived. Post a new comment to change a waiver; an edited comment is not read again. Waivers are kept per PR in `runs/.waivers.json` (lib/waivers.mjs).
 
 ## 6. Rules the agent adds
 

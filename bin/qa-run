@@ -18,7 +18,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { recordRefusal, refusalIn } from '../lib/authrefused.mjs';
-import { forPr, readStore } from '../lib/waivers.mjs';
+import { forPr, readStore, writeRunWaivers, memberMatcher } from '../lib/waivers.mjs';
 import { validate, computeVerdict, renderComment, renderFull, loadLedger, screenshots, forMember, openCells } from '../lib/report.mjs';
 import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, LABELS, setLabelNames, noteLocalImages } from '../lib/publish.mjs';
 import { runAgent } from '../lib/agent.mjs';
@@ -312,10 +312,6 @@ if (flag('--plan')) { log(`plan: depth ${depth}${retest ? `, re-test since ${ret
 const instr = (id) => readInstruction(id, path.dirname(runDir));
 fs.writeFileSync(path.join(ctx, 'results-example.md'), instr('results-example'));
 log('triage', JSON.stringify(triage));
-// Findings people waived on this PR before the round (lib/waivers.mjs), taken
-// now: a waiver given while the round runs counts from the next one.
-const waivers = forPr(readStore(path.join(path.dirname(runDir), '.waivers.json')), repo, pr);
-if (waivers.length) { write('waivers.json', waivers); log(`waivers: ${waivers.map((w) => w.id).join(', ')}`); }
 
 // Two checks before any testing, both from a trial merge in the bare clone
 // (nothing is pushed, no tokens are spent):
@@ -382,6 +378,11 @@ const members = [
     return { key: keyOf(p), repo: p.repo, pr: p.number, sha: p.headRefOid, label: p.label, round: r };
   })),
 ];
+// Findings people waived on these PRs before the round (lib/waivers.mjs),
+// taken now: a waiver given while the round runs counts from the next one.
+const waiverStore = readStore(path.join(path.dirname(runDir), '.waivers.json'));
+const waivers = { members: members.map(({ key, repo: r, pr: n, label }) => ({ key, repo: r, pr: n, label })), waivers: members.flatMap((m) => forPr(waiverStore, m.repo, m.pr).map((w) => ({ ...w, key: m.key }))) };
+if (waivers.waivers.length) { write('waivers.json', waivers.waivers.map(({ id, key, kind, title, rule, severity, by, reason }) => ({ id, pr: key, kind, title, rule, severity, by, reason }))); log(`waivers: ${waivers.waivers.map((w) => `${w.key} ${w.id}`).join(', ')}`); }
 // Labels each PR had before, so an inconclusive or stopped run can put them back.
 const labelsBefore = {};
 if (!dryRun) await withAppToken(async (asApp) => {
@@ -892,7 +893,7 @@ steer.close(runDir);
 // ---------------------------------------------------------------- 6. report
 // What validate() applies, from the list taken at the start, written after the
 // agent so that nothing it left in the run folder counts as a waiver.
-try { rmAny(path.join(runDir, 'waivers.json')); fs.writeFileSync(path.join(runDir, 'waivers.json'), JSON.stringify(waivers, null, 2), { flag: 'wx' }); } catch (e) { log(`waivers not applied: ${e.message}`); try { rmAny(path.join(runDir, 'waivers.json')); } catch { /* reported above */ } }
+try { writeRunWaivers(runDir, waivers, { rm: rmAny }); } catch (e) { log(`waivers not applied: ${e.message}`); try { rmAny(path.join(runDir, 'waivers.json')); } catch { /* reported above */ } }
 const ledger = loadLedger(runDir);
 let raw;
 try { raw = JSON.parse(fs.readFileSync(path.join(runDir, 'results.json'), 'utf8')); } catch { raw = { criteria: [], environments: [], issues: [] }; }
@@ -936,14 +937,7 @@ const { results, problems } = validate(raw, ledger, runDir);
 // The verdict of the whole run (the full report). In a paired run each PR also
 // gets its own: its criteria and issues plus the shared ones (no "pr").
 const verdict = computeVerdict(results);
-const matchPr = (ref) => {
-  const str = String(ref ?? '').toLowerCase();
-  const n = Number(str.match(/#\s*(\d+)/)?.[1] ?? str.match(/(\d+)\s*$/)?.[1]);
-  const hits = members.filter((m) => m.pr === n);
-  if (hits.length <= 1) return hits[0]?.key ?? null;
-  // Plugin #5 and its add-on #5: the longer repo name first, since "plugin" is in "plugin-pro".
-  return hits.sort((x, y) => y.repo.length - x.repo.length).find((m) => str.includes(m.repo.split('/')[1]) || str.includes(m.label.toLowerCase()))?.key ?? null;
-};
+const matchPr = memberMatcher(members);
 if (pairList.length) results.pair_line = `**Paired test** ${members.map((m) => `${m.label} [#${m.pr}](https://github.com/${m.repo}/pull/${m.pr}) \`${m.sha.slice(0, 7)}\``).join(' + ')}, tested together in one run. Each PR's verdict covers its own claims and the shared ones.`;
 const memberResults = members.map((m) => {
   if (!pairList.length) return { ...m, results, verdict };
