@@ -148,3 +148,34 @@ test('a role "app" profile is a Hub (kind hub) unless it says otherwise', async 
   assert.deepEqual(profileOf('WPDevelopers/xspeed-hub').stack, { kind: 'full' });
   assert.equal(profileOf('WPDevelopers/xspeed').kind, 'wp-plugin');
 });
+
+// 2026-11-22: pr-hub-276 is the shared stack of xspeed-hub#276, xspeed#696 and
+// xspeed-pro#246. #276's verdict was over 48 hours old at the same head, and the
+// scan removed the stack while #696 ran on it and while #276 was a person's entry.
+test('a shared stack with an old verdict on its Hub key stays while a member is in use', () => {
+  const hub = 'WPDevelopers/xspeed-hub#276';
+  const s = {
+    key: hub, name: 'pr-hub-276', state: 'following', applied: true, head: 'bcf', createdAt: now - 80 * H,
+    members: [hub, 'WPDevelopers/xspeed#696', 'WPDevelopers/xspeed-pro#246'],
+    verdictAt: now - IDLE_MS - H, verdictHead: 'bcf',
+  };
+  const open = new Map([[hub, 'bcf'], ['WPDevelopers/xspeed#696', 'c83'], ['WPDevelopers/xspeed-pro#246', '242']]);
+  // Nobody uses it: idle, as before.
+  assert.deepEqual(plan({ stacks: [s], open, memMb: 8000, now }).remove, [{ key: hub, why: 'idle' }]);
+  // The live run is a member's (the Free PR), not the Hub key.
+  assert.deepEqual(plan({ stacks: [s], open, liveKeys: new Set(['WPDevelopers/xspeed#696']), memMb: 8000, now }).remove, []);
+  // A person queued a member; the scan passes what stackKeys wants.
+  assert.deepEqual(plan({ stacks: [s], open, liveKeys: new Set(['WPDevelopers/xspeed-pro#246']), memMb: 8000, now }).remove, []);
+  // A person queued the Hub PR itself.
+  assert.deepEqual(plan({ stacks: [s], open, liveKeys: new Set([hub]), memMb: 8000, now }).remove, []);
+});
+
+test('a stack whose member is in use is not evicted at the cap', () => {
+  const shared = { ...live(1, { key: 'WPDevelopers/xspeed-hub#9', lastPushAt: now - 99 * H }), members: ['WPDevelopers/xspeed-hub#9', 'WPDevelopers/xspeed#5'] };
+  const others = Array.from({ length: CAP - 1 }, (_, i) => live(i + 2));
+  const waiting = { key: 'WPDevelopers/xspeed#77', state: 'waiting', at: now };
+  const stacks = [shared, ...others, waiting];
+  const p = plan({ stacks, open: openOf(stacks), liveKeys: new Set(['WPDevelopers/xspeed#5']), memMb: 8000, now });
+  assert.equal(p.remove.length, 1);
+  assert.notEqual(p.remove[0].key, shared.key, 'the oldest stack is in use through its member, so another goes');
+});

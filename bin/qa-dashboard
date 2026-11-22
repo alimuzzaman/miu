@@ -37,7 +37,7 @@ import { needsReply, waitsReply } from '../lib/cmdreply.mjs';
 import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelGone, takeNext, stackKeys } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelGone, takeNext, stackKeys, stackWaited, requeueWaited, stackHold } from '../lib/queuectl.mjs';
 import { createCi, ciRunCommit, shipSiblings, parseWorkflows, runningGroups, prCiProblem, forkOf, workflowsAt, linkedPrs } from '../lib/ci.mjs';
 import { sweepCiComments } from '../lib/cicomment.mjs';
 import { runSandboxCi, adoptSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
@@ -836,8 +836,33 @@ async function enqueuePair(repo, pr, why, by = 'auto', label = null) {
 // model's engine is not signed in (lib/connections.mjs); queueHeld says why.
 let queueHeld = null;
 let pumping = false;
+// Runs the queue started, by run name, until they end: one that ends waiting
+// for its test stack goes back first in line (lib/queuectl.mjs requeueWaited).
+const startedFrom = new Map();
+function reclaimWaited() {
+  for (const [name, entry] of startedFrom) {
+    const dir = path.join(RUNS, name);
+    if (runAlive(dir) && !fs.existsSync(path.join(dir, 'waiting.json'))) continue;
+    startedFrom.delete(name);
+    const stack = stackWaited(readJson(path.join(dir, 'waiting.json'))?.reasons);
+    if (!stack) continue;
+    requeueWaited(queue, entry, stack);
+    saveQueue();
+    console.error(`queue: ${entry.repo}#${entry.pr} waited for test stack ${stack}; it keeps its turn`);
+  }
+}
 async function pump() {
-  if (nextIndex(queue, queueState()) < 0 || liveRun() || pumping) return;
+  if (liveRun() || pumping) return;
+  reclaimWaited();
+  if (nextIndex(queue, queueState()) < 0) return;
+  const marked = queue.some((q) => q.stackWait);
+  const holding = stackHold(queue, (name) => stacks.list().find((s) => s.name === name && s.state !== 'removed') ?? null);
+  if (marked) saveQueue();
+  if (holding) {
+    if (queueHeld !== holding) console.error(`queue held: ${holding}`);
+    queueHeld = holding;
+    return;
+  }
   pumping = true;
   try {
     const cfg = getConfig();
@@ -874,8 +899,12 @@ async function pump() {
   const cfg = getConfig();
   const r = startRun({ repo: next.repo, pr: next.pr, model: cfg.model, dryRun: !cfg.post, full: next.full, force: next.force, note: next.note, slack: cfg.post && cfg.slack });
   if (r.error) console.error(`Could not start ${next.repo}#${next.pr}: ${r.error}`);
-  // Its CI starts beside it, if it has not already.
-  else ciFor(next.repo, next.pr);
+  else {
+    const { stackWait, ...entry } = next;
+    startedFrom.set(r.name, entry);
+    // Its CI starts beside it, if it has not already.
+    ciFor(next.repo, next.pr);
+  }
 }
 
 // Take a pull request out of the line. One Miu or a label lined up stays out
@@ -1100,7 +1129,8 @@ async function stackScan() {
     if (roles().hub && profileOf(roles().hub.repo)?.stack?.kind === 'full') stacks.wantBase();
     const v = verdicts();
     for (const s of stacks.list()) stacks.observe(s.key, { head: open?.get(s.key), verdictAt: v.get(s.key)?.at, verdictHead: v.get(s.key)?.sha });
-    await stacks.scan({ open, liveKeys });
+    // What a person queued keeps its stack too, not only the live run (wanted).
+    await stacks.scan({ open, liveKeys: wanted });
   } catch (e) { console.error('stack scan:', e.message); } finally { stackBusy = false; }
 }
 setInterval(stackScan, 2 * 60 * 1000);
@@ -2025,7 +2055,12 @@ const server = http.createServer((req, res) => {
         return json(r ? ci.view(r) : { error: 'Miu does not know this pull request\'s head yet. Refresh the list and try again.' });
       }
       if (url.pathname === '/api/unqueue') { unqueue(data.repo, Number(data.pr)); return json({ ok: true }); }
-      if (url.pathname === '/api/start') return json(startRun({ repo: data.repo, pr: Number(data.pr), model: data.model, dryRun: data.dryRun !== false }));
+      if (url.pathname === '/api/start') {
+        const r = startRun({ repo: data.repo, pr: Number(data.pr), model: data.model, dryRun: data.dryRun !== false });
+        // A person's start: if it waits for its test stack, it keeps its turn as their entry.
+        if (!r.error) startedFrom.set(r.name, { repo: data.repo, pr: Number(data.pr), why: 'started from the dashboard', by: 'person', held: false, full: false, force: false, note: '', at: Date.now() });
+        return json(r);
+      }
       const rv = url.pathname.match(/^\/api\/runs\/([^/]+)\/review$/);
       if (rv && safeName(rv[1])) { setReview(rv[1], data, session?.login ?? localName).then(json, (e) => json({ error: e.message })); return; }
       const fx = url.pathname.match(/^\/api\/runs\/([^/]+)\/fix$/);

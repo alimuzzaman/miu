@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelOf, labelGone, takeNext, stackKeys } from '../lib/queuectl.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelOf, labelGone, takeNext, stackKeys, stackWaited, requeueWaited, stackHold, STACK_HOLD_MS } from '../lib/queuectl.mjs';
 
 const auto = { mode: 'auto', paused: false };
 const manual = { mode: 'manual', paused: false };
@@ -134,4 +134,54 @@ test('auto-queued entries waiting for a person get no stack', () => {
   const queue = Array.from({ length: 24 }, (_, i) => ({ repo: 'a/free', pr: 100 + i, by: 'auto', why: 'new commits' }));
   assert.equal(stackKeys(queue, []).size, 0, 'no live run, nothing a person asked for: no stacks');
   assert.deepEqual([...stackKeys(queue, ['a/free#100'])], ['a/free#100'], 'only the live run, even when it is also in the line');
+});
+
+test('a run that waited for its test stack is found by the stack name it waited for', () => {
+  assert.equal(stackWaited(['The pr Hub stack pr-hub-276 is not ready: no test stack: Being removed: 48 hours after the verdict with no new commits.']), 'pr-hub-276');
+  assert.equal(stackWaited(['rexenv is not ready: x', 'The dev Hub stack pr-hub-base is not ready: building']), 'pr-hub-base');
+  assert.equal(stackWaited(['rexenv is not ready: x']), null);
+  assert.equal(stackWaited(undefined), null);
+});
+
+// 2026-11-22: #696 went into waiting on pr-hub-276 and exited; the dashboard
+// took that as a free slot and started #276, a person's later entry.
+test('a waiting run keeps its turn: it goes first and nothing else starts while its stack comes', () => {
+  const t = Date.UTC(2026, 10, 22, 9, 25);
+  const queue = [{ repo: 'WPDevelopers/xspeed-hub', pr: 276, by: 'person' }];
+  requeueWaited(queue, { repo: 'WPDevelopers/xspeed', pr: 696, by: 'person' }, 'pr-hub-276', t);
+  assert.deepEqual(queue.map((q) => q.pr), [696, 276]);
+  assert.equal(nextIndex(queue, auto), 0, 'once it may start, the waited run starts first');
+  const stack = { name: 'pr-hub-276', state: 'adding' };
+  const of = (name) => (name === stack.name ? stack : null);
+  assert.match(stackHold(queue, of, t + 60_000), /696 keeps its turn/);
+  stack.state = 'following'; stack.applied = false;
+  assert.match(stackHold(queue, of, t + 120_000) ?? '', /keeps its turn/, 'still building');
+  // Its stack is wanted while it waits, even if Miu queued it by itself.
+  queue[0].by = 'auto';
+  assert.ok(stackKeys(queue).has('WPDevelopers/xspeed#696'));
+  stack.applied = true;
+  assert.equal(stackHold(queue, of, t + 180_000), null, 'ready: the hold ends');
+  assert.equal(queue[0].stackWait, undefined, 'and its mark goes');
+  assert.ok(!stackKeys(queue).has('WPDevelopers/xspeed#696'), 'an auto entry no longer pins a stack once its hold ends');
+});
+
+test('a hold ends when the stack cannot come, or after an hour', () => {
+  const t = Date.UTC(2026, 10, 22, 9, 25);
+  for (const s of [null, { state: 'refused' }, { state: 'failed' }, { state: 'following', applied: false, failed: true }]) {
+    const q = [];
+    requeueWaited(q, { repo: 'a/b', pr: 1 }, 'pr-hub-1', t);
+    assert.equal(stackHold(q, () => s, t + 1000), null, JSON.stringify(s));
+  }
+  const q = [];
+  requeueWaited(q, { repo: 'a/b', pr: 1 }, 'pr-hub-1', t);
+  assert.ok(stackHold(q, () => ({ state: 'adding' }), t + STACK_HOLD_MS - 1));
+  assert.equal(stackHold(q, () => ({ state: 'adding' }), t + STACK_HOLD_MS), null);
+});
+
+test('requeueing moves an entry already in line instead of adding a second', () => {
+  const queue = [{ repo: 'a/b', pr: 2 }, { repo: 'a/b', pr: 1, why: 'x', held: true }];
+  requeueWaited(queue, { repo: 'a/b', pr: 1 }, 'pr-hub-1', 0);
+  assert.deepEqual(queue.map((q) => q.pr), [1, 2]);
+  assert.equal(queue[0].why, 'x');
+  assert.equal(queue[0].held, false);
 });
