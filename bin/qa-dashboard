@@ -1406,7 +1406,7 @@ function prFindings(repo, pr) {
   const out = [];
   for (const r of runsByPr().get(`${repo}#${pr}`) ?? []) {
     const res = readJson(path.join(RUNS, r.name, 'results.json'));
-    for (const i of res?.issues ?? []) out.push({ waive_id: waive.issueId(i), kind: i.kind ?? null, title: i.title ?? '', rule: i.rule ?? null });
+    for (const i of res?.issues ?? []) out.push({ waive_id: waive.issueId(i), waivable: waive.waivable(i), kind: i.kind ?? null, title: String(i.title ?? '').slice(0, 300), rule: i.rule ? String(i.rule).slice(0, 300) : null, severity: i.severity ?? null });
   }
   return out;
 }
@@ -1416,15 +1416,13 @@ function waiveCommand(repo, pr, c, cmd) {
   if (cmd.error) return `Nothing changed: ${cmd.error}.\n\n${waive.FORMAT}`;
   const known = prFindings(repo, pr);
   const find = (id) => known.find((f) => f.waive_id === id);
-  const refused = cmd.op === 'waive' ? cmd.ids.filter((id) => !find(id) || !waive.waivable(find(id))) : [];
+  const refused = cmd.op === 'waive' ? cmd.ids.filter((id) => !find(id)?.waivable) : [];
   const ids = cmd.ids.filter((id) => !refused.includes(id));
-  const store = waive.readStore(WAIVERS_FILE);
   if (ids.length) {
-    let next = waive.applyCommand(store, repo, pr, { ...cmd, ids }, { by: c.user.login, url: c.html_url });
-    // What each id stands for, so the next round's agent knows which finding it is.
-    next[waive.prKey(repo, pr)] = (next[waive.prKey(repo, pr)] ?? []).map((w) => (w.title || !find(w.id) ? w : { ...w, kind: find(w.id).kind, title: find(w.id).title, rule: find(w.id).rule }));
-    if (!next[waive.prKey(repo, pr)].length) delete next[waive.prKey(repo, pr)];
-    waive.writeStore(WAIVERS_FILE, next);
+    // What each id stands for, newest round first, so the next round's agent
+    // knows the finding, and a waiver never covers it grown more severe.
+    const what = (id) => { const f = find(id); return f ? { kind: f.kind, title: f.title, rule: f.rule, severity: f.severity } : {}; };
+    waive.writeStore(WAIVERS_FILE, waive.applyCommand(waive.readStore(WAIVERS_FILE), repo, pr, { ...cmd, ids }, { by: c.user.login, url: c.html_url, what }));
     console.log(`${cmd.op} ${ids.join(' ')} on ${repo}#${pr} by ${c.user.login}`);
   }
   if (!refused.length) return null;
@@ -1440,6 +1438,8 @@ async function scanCommands() {
     let comments;
     try { comments = await gh.restAll(`repos/${repo}/issues/comments?since=${encodeURIComponent(st.since)}`, { max: 300 }); } catch { continue; }
     for (const c of comments) {
+      // Miu's own comments (reports, replies) are never commands.
+      if ((c.body ?? '').includes(`<!-- ${project().marker}`)) continue;
       const w = waive.parseWaive(c.body ?? '');
       const m = !w && (c.body ?? '').match(/^\s*\/miu\s+(retest|test)\b(.*)$/im);
       if ((!m && !w) || st.done.includes(c.id) || !/\/pull\/\d+/.test(c.html_url)) continue;
@@ -1450,7 +1450,7 @@ async function scanCommands() {
         // Recorded as done before anything is posted, so a crash never answers twice.
         fs.writeFileSync(CMD_FILE, JSON.stringify({ ...st, replied: [...new Set([...(readJson(CMD_FILE)?.replied ?? []), ...st.replied])] }, null, 2));
         let reply;
-        try { reply = waiveCommand(repo, pr, c, w); } catch (e) { console.error(`waive on ${repo}#${pr}:`, e.message); continue; }
+        try { reply = waiveCommand(repo, pr, c, w); } catch (e) { console.error(`waive on ${repo}#${pr}:`, e.message); reply = `Miu could not record this, so nothing changed (${String(e.code ?? 'error')}). Please post the command again in a new comment later.`; }
         if (reply) await gh.rest('POST', `repos/${repo}/issues/${pr}/comments`, { body: { body: `${reply}\n\n<!-- ${project().marker}-waive=${Number(c.id)} -->` } }).catch((e) => console.error(`reply on ${repo}#${pr}:`, e.message));
         else await gh.rest('POST', `repos/${repo}/issues/comments/${c.id}/reactions`, { body: { content: '+1' } }).catch(() => {});
         continue;
