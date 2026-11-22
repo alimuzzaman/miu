@@ -13,6 +13,7 @@ Everything you need is in the run directory `$QA_RUN_DIR`:
 | `context/previous-rounds.md` | Earlier automated QA comments on this PR, newest first, if any |
 | `context/profile.json` | How this repo is tested: environment, combos, fast checks, triage, cross-repo notes |
 | `context/triage.json` | Which areas the diff touches, and the run mode (`full` or `light`) |
+| `context/waivers.json` | Findings a person waived on this PR as approved exceptions, if any: id, the finding's rule or title, who, reason. Test and report them as usual; Miu applies the waiver itself |
 | `context/fast-checks.md` | Results of the repo's own test suites on the PR head. They run while you work, so the file may say "still running"; read it again before you write results |
 | `context/builds/*.json` | Each checkout: label, repo, ref, commit, version, and its worktree folder |
 | `context/sites.json` | The two ready QA sites: id, URL, and which worktree each plugin folder points at |
@@ -136,7 +137,7 @@ Start with the message `Phase 1: Understand`.
 3. Write the criteria: every claim from the PR body, linked issues and acceptance criteria, the implied ones ("off by default", "works without a licence", "nothing changes while it is off"), and what the diff does that the description leaves out. Phrase each as behaviour a user or admin can observe, in plain English.
 4. A re-test (`context/previous-rounds.md` exists): every open issue from the last round becomes a criterion first, "Fixed since last round: …" when it passes.
 5. Plan in `notes.md`: per criterion, how you will prove it, in which combo, and what would falsify it; then the edge cases this diff makes risky (methodology section 1, item 6). No generic checklist.
-6. **Fits the product.** Check the PR and every linked issue against the product rules at the end of this prompt and the repo's own rules files (the profile's `read_first`) at the base branch (`src/*-dev/`), for the areas the diff touches. Record each rule in `business` in results.json (`fits` or `conflicts`, with where you looked). A conflict also goes in `issues` with `"kind": "business"`. Prove a behaviour rule at runtime (a request sent without opt-in, a Pro feature working unlicensed); a code or text rule by file and line.
+6. **Fits the product.** Check the PR and every linked issue against the product rules at the end of this prompt and the repo's own rules files (the profile's `read_first`) at the base branch (`src/*-dev/`), for the areas the diff touches. Record each rule in `business` in results.json (`fits` or `conflicts`, with where you looked). A conflict also goes in `issues` with `"kind": "business"`. Name the rule the same way every round (quote the rules file; for a rule in `context/previous-rounds.md`, keep its wording): the rule text is the finding's id, and a waiver in `context/waivers.json` follows it. Never leave out, soften or reword a finding because it was waived. Prove a behaviour rule at runtime (a request sent without opt-in, a Pro feature working unlicensed); a code or text rule by file and line.
 
 ### 2. Reproduce on dev (before)
 
@@ -176,7 +177,7 @@ Test the edge cases from your plan, then sweep the neighbours: nearby panels and
 ### 6. Separate the product from the harness
 
 - A container not starting, a **dev** build failing, a timeout in your own script, a blocked production host the feature needs: `infra_problems`, never `issues`.
-- A **PR** build failing, a fatal on activation, a test-suite failure in `fast-checks.md` that passes on dev: real findings.
+- A **PR** build failing, a fatal on activation, a test-suite failure in `fast-checks.md` that passes on dev: real findings. A failure from `fast-checks.md` goes in `issues` with `"kind": "ci"`.
 - Flaky: run up to three times and report the count ("failed 2 of 3").
 
 **No claim stays open.** Every cell ends `pass` or `fail`, with evidence. When one route is blocked take another: reset the site, REST or `wp eval` in place of the UI (or the reverse), a scratch site. `blocked` only for something this machine does not have (a failed build, an outside service), naming what and what you tried. A claim that cannot be tested here at all, because it needs a server feature the QA machine lacks (an nginx rule you may not install, another web server) or something only the author has (their page, their media, their benchmark set-up), is `untestable` with `"needs": "server"` or `"needs": "author"` and a note naming exactly what is missing and what you tried; it is listed as not tested and does not count against the PR. Use it only after other routes failed, and never for something you could build or set up yourself. Miu sends every cell still open back to you in a resolve pass, and anything open after that counts against the PR. Never mark `pass` because the code looks right; source analysis goes in an issue only with `"from_source_analysis": true`.

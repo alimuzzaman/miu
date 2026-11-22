@@ -1306,7 +1306,7 @@ function renderSettings(force) {
     github: () => '<h2 class="shead">GitHub and notices</h2><p class="ssub">What Miu writes on the pull request, and who hears when a test ends.</p><div class="settings two">' +
     '<div class="sgroup"><h3>On GitHub</h3>' +
     srow({ cfg: 'post', on: cfg.post, title: 'Post the report and update labels', help: cfg.post ? 'A comment on the pull request, and ' + labelOf(cfg, 'ongoing') + ' moves to ' + labelOf(cfg, 'miuOk') + ' or ' + labelOf(cfg, 'miuBugs') + '.' : 'Results stay here; nothing is posted and no labels change.' }) +
-    srow({ cfg: 'commands', on: cfg.commands, title: 'Answer <code>/miu retest</code>', html: true, help: 'Team members can ask for a test in a pull request comment.' }) +
+    srow({ cfg: 'commands', on: cfg.commands, title: 'Answer <code>/miu retest</code> and <code>/miu waive</code>', html: true, help: 'Team members can ask for a test, or waive an approved exception, in a pull request comment.' }) +
     shotsRow() +
     collabRow() +
     '</div>' +

@@ -18,6 +18,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { recordRefusal, refusalIn } from '../lib/authrefused.mjs';
+import { forPr, readStore } from '../lib/waivers.mjs';
 import { validate, computeVerdict, renderComment, renderFull, loadLedger, screenshots, forMember, openCells } from '../lib/report.mjs';
 import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, LABELS, setLabelNames, noteLocalImages } from '../lib/publish.mjs';
 import { runAgent } from '../lib/agent.mjs';
@@ -311,6 +312,10 @@ if (flag('--plan')) { log(`plan: depth ${depth}${retest ? `, re-test since ${ret
 const instr = (id) => readInstruction(id, path.dirname(runDir));
 fs.writeFileSync(path.join(ctx, 'results-example.md'), instr('results-example'));
 log('triage', JSON.stringify(triage));
+// Findings people waived on this PR before the round (lib/waivers.mjs), taken
+// now: a waiver given while the round runs counts from the next one.
+const waivers = forPr(readStore(path.join(path.dirname(runDir), '.waivers.json')), repo, pr);
+if (waivers.length) { write('waivers.json', waivers); log(`waivers: ${waivers.map((w) => w.id).join(', ')}`); }
 
 // Two checks before any testing, both from a trial merge in the bare clone
 // (nothing is pushed, no tokens are spent):
@@ -885,6 +890,9 @@ await fastDone;
 steer.close(runDir);
 
 // ---------------------------------------------------------------- 6. report
+// What validate() applies, from the list taken at the start, written after the
+// agent so that nothing it left in the run folder counts as a waiver.
+try { rmAny(path.join(runDir, 'waivers.json')); fs.writeFileSync(path.join(runDir, 'waivers.json'), JSON.stringify(waivers, null, 2), { flag: 'wx' }); } catch (e) { log(`waivers not applied: ${e.message}`); try { rmAny(path.join(runDir, 'waivers.json')); } catch { /* reported above */ } }
 const ledger = loadLedger(runDir);
 let raw;
 try { raw = JSON.parse(fs.readFileSync(path.join(runDir, 'results.json'), 'utf8')); } catch { raw = { criteria: [], environments: [], issues: [] }; }
