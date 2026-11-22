@@ -87,6 +87,17 @@ A new push after a report starts a new round. The round:
 - re-runs the criteria the new commits touch
 - says "Round N" in the context line, and links the previous round
 
+## 5a. Waived findings
+
+Product rules are read from the base branch, so an exception the owner approved in the PR branch is a finding every round. A team member waives it from a PR comment, with the id the report prints next to the finding (`waive: m3f9a`):
+
+```
+/miu waive m3f9a m7c21
+Reason: owner-approved exception, DESIGN.md §24.28
+```
+
+`/miu unwaive m3f9a` takes it back. Without a `Reason:` line nothing changes and Miu replies with the format. A waiver counts from the next round; the current report stays as it is. The id comes from the rule for a product-rule finding, otherwise from the kind and the claim it breaks (or its title), so a reworded finding is a new one. The waived finding is still tested and shown, under "Waived" with who waived it, the reason and a link to the comment, and it no longer lowers the verdict. CI failures (`"kind": "ci"`) are fixed in code and cannot be waived. Waivers are kept per PR in `runs/.waivers.json` (lib/waivers.mjs).
+
 ## 6. Rules the agent adds
 
 The method above was built for a person working with an agent at their side. Running unattended needs a few more rules:
