@@ -28,6 +28,7 @@ A filled-in example of every field. Copy its shape; the values are from an old r
       "claim": "Copied files are served with a one-year immutable cache policy",
       "source": "pr_body",
       "visible": false,
+      "restates": "only on a criterion that restates a finding in context/waivers.json: its id, e.g. m3f9a",
       "results": { "A": { "status": "untestable", "needs": "server", "evidence": ["ev-020"], "note": "needs the plugin's nginx rule installed and nginx reloaded, which the QA site may not do; Apache is not available. Tried a reset, a fresh copy and an anonymous GET: 200 without the header (ev-020)" } }
     }
   ],
