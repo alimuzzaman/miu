@@ -110,12 +110,9 @@ test('a waived blocker no longer decides the verdict, and is still reported', ()
   assert.equal(verdict, 'ok');
   assert.equal(r.issues.length, 1);
   assert.equal(r.issues[0].waived.by, 'alim');
-  // A major one would have made it partial.
-  const m = business({ severity: 'major' });
-  assert.equal(judge([m], [waiverFor(m)]).verdict, 'ok');
-  // Other findings still count.
-  const other = { severity: 'major', title: 'Save fails', evidence: ['ev-001', 'ev-002'] };
-  assert.equal(judge([b, other], [waiverFor(b)]).verdict, 'partial');
+  // Other blockers still count.
+  const other = { severity: 'blocker', title: 'Save loses the post', evidence: ['ev-001', 'ev-002'] };
+  assert.equal(judge([b, other], [waiverFor(b)]).verdict, 'not_ok');
 });
 
 test('a CI failure is never waived', () => {
@@ -151,7 +148,8 @@ test('the comment and the full report list waived findings with who, why and a l
   assert.match(md, /waive an approved exception with `\/miu waive <id>`/);
   const full = renderFull(r, verdict, { problems, ledger: loadLedger(dir), runDir: dir });
   assert.match(full, /Waived \(1\), tested and not counted in the verdict/);
-  assert.match(full, /Verdict: FAIL, 0 blocker \+ 1 other/);
+  assert.match(full, /Verdict: PASS, no blockers/);
+  assert.match(full, /Passed with 1 major finding/);
   assert.ok(full.includes('waived by [alim](https://github.com/alim)'));
 });
 

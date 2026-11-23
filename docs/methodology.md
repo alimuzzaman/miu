@@ -20,15 +20,16 @@ This is how a QA engineer tests a pull request, written down from one person's r
 
 ## 2. Verdicts
 
-The PR comment opens with one of three headings, and nothing else:
+The PR comment opens with one of these headings, and nothing else:
 
 | Heading | Meaning |
 |---|---|
-| `## ✅ FOUND OK` | Every claim tested holds. Minor notes may follow, marked "not blockers". |
-| `## 🔁 FOUND PARTIALLY OK` | The core works, but at least one claim fails or a real issue was found. |
-| `## ❌ FOUND NOT OK` | A blocker: a core claim fails, data can be lost, or the site breaks. |
+| `## ✅ FOUND OK` | No release blocker. Majors, failed claims and claims not proven may follow, counted on the line under the heading ("No release blockers found. Passed with 2 major findings and 1 unverified criterion"), each with its evidence. |
+| `## ❌ FOUND NOT OK` | A confirmed blocker that is not waived: a core claim fails, data can be lost, a security hole, a fatal error, the site breaks. Or a confirmed failure of the repo's own checks (CI) at major or above; CI is never waived. |
+| `## ⚠️ NO RESULT` | No usable evidence: no claims, every claim set aside as untestable, or not one claim proven either way with nothing found. Not posted; the run goes again. |
+| `## ♻️ ALREADY FIXED ON DEV` | What the PR fixes no longer happens on dev, with the commit that fixed it. |
 
-The agent adds a fourth, which a person never needed: `## ⚠️ INCONCLUSIVE`. It is used when the test environment failed and too little could be verified to judge the PR. An environment failure is never reported as a defect in the PR, and never as a pass.
+Only a blocker fails a PR, so a critical failed claim is also recorded as a blocker issue; a failed cell alone does not fail it. `## 🔁 FOUND PARTIALLY OK` is no longer given; reports before 2026-11-23 may carry it. Labels and the commit status follow the heading: FOUND OK gets the same pass label and a green status whether or not majors are listed.
 
 ## 3. The PR comment
 
@@ -103,7 +104,7 @@ Reason: owner-approved exception, DESIGN.md §24.28
 The method above was built for a person working with an agent at their side. Running unattended needs a few more rules:
 
 - **No pass without evidence.** Every passed criterion points at a captured command log, response or screenshot from this run. The report tool downgrades a pass with no evidence to "not verified".
-- **The verdict.** A confirmed blocker is NOT OK. A failed claim, a claim not proven, or a confirmed major issue is PARTIALLY OK. Every claim proven, with only minor issues or none, is OK: minor issues are listed, they do not lower the verdict. A claim that cannot be tested here at all, because it needs a server feature the QA machine lacks or something only the author has, is listed as not tested with what it needs and does not lower the verdict; past a quarter of the claims, such claims count as not proven again. A visible claim proven without a screenshot keeps its result; the report notes the missing picture.
+- **The verdict.** A confirmed blocker that is not waived, or a confirmed CI failure at major or above, is NOT OK. Anything else with evidence is OK: majors, failed claims and claims not proven are listed and counted under the heading, they do not fail the PR. A claim that only restates a waived finding (`restates`) is shown and not counted. A claim that cannot be tested here at all, because it needs a server feature the QA machine lacks or something only the author has, is listed as not tested with what it needs; past a quarter of the claims, such claims count as not proven again. A visible claim proven without a screenshot keeps its result; the report notes the missing picture.
 - **Infrastructure is not the product.** A container that will not start, a timeout in the harness or a missing secret is an infrastructure result. It can make a run inconclusive. It cannot fail the PR.
 - **Automated findings are labelled.** The comment footer says the run was automated and not yet confirmed by a person. A person confirms by replying or by re-labelling the PR.
 - **Report only.** The agent never approves, merges, pushes to the PR branch, edits the PR, or touches a production or live server.

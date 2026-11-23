@@ -37,8 +37,8 @@ test('a pass with no evidence is downgraded and cannot make the run OK', () => {
   const { results, problems, verdict } = judge(base([{ id: 1, claim: 'x', results: { A: { status: 'pass' } } }]));
   assert.equal(results.criteria[0].results.A.status, 'unverified');
   assert.ok(problems.some((p) => p.includes('no captured evidence')));
-  // Not proven counts against the PR; there is no "inconclusive".
-  assert.equal(verdict, 'not_ok');
+  // Nothing proven either way and nothing found: no usable evidence.
+  assert.equal(verdict, 'no_result');
 });
 
 test('evidence ids that were never captured do not count', () => {
@@ -56,12 +56,14 @@ test('minor issues alone keep the verdict OK', () => {
   assert.equal(judge(r).verdict, 'ok');
 });
 
-test('a failed criterion is at least partially OK', () => {
+test('a failed criterion alone does not fail the PR; the comment counts it', () => {
   const r = base([
     { id: 1, claim: 'x', results: { A: { status: 'pass', evidence: ['ev-001'] } } },
     { id: 2, claim: 'y', results: { A: { status: 'fail', evidence: ['ev-001', 'ev-002'] } } },
   ]);
-  assert.equal(judge(r).verdict, 'partial');
+  const { results, verdict, problems } = judge(r);
+  assert.equal(verdict, 'ok');
+  assert.match(renderComment(results, verdict, { problems }), /^## ✅ FOUND OK\n\nNo release blockers found\. Passed with 1 failed criterion, listed below\./);
 });
 
 test('a confirmed blocker is NOT OK', () => {
@@ -78,13 +80,15 @@ test('a blocker with no evidence is shown as unconfirmed and does not block', ()
   assert.equal(verdict, 'ok');
 });
 
-test('claims the run could not settle count against the PR, never inconclusive', () => {
+test('claims the run could not settle are counted, they do not fail the PR', () => {
   const r = base([
     { id: 1, claim: 'x', results: { A: { status: 'pass', evidence: ['ev-001'] } } },
     { id: 2, claim: 'y', results: { A: { status: 'blocked' } } },
     { id: 3, claim: 'z', results: { A: { status: 'blocked' } } },
   ], [], { infra_problems: [{ what: 'MariaDB never became healthy', blocking: true }] });
-  assert.equal(judge(r).verdict, 'partial');
+  const { results, verdict, problems } = judge(r);
+  assert.equal(verdict, 'ok');
+  assert.match(renderComment(results, verdict, { problems }), /Passed with 2 unverified criteria/);
 });
 
 test('the comment uses the team headings and labels the run as automated', () => {
@@ -129,7 +133,8 @@ test('a claim that was not reproduced on dev cannot pass', () => {
   const { results, problems, verdict } = judge(r);
   assert.equal(results.criteria[0].results.A.status, 'unverified');
   assert.ok(problems.some((p) => p.includes('not reproduced on dev')));
-  assert.equal(verdict, 'not_ok');
+  // Its only claim is not proven, and nothing was found: no result.
+  assert.equal(verdict, 'no_result');
 });
 
 test('"not applicable" is no longer a baseline', () => {
@@ -161,10 +166,14 @@ test('every claim proven with only a minor issue is OK, screenshots or not', () 
   assert.equal(judge(r, dir).verdict, 'ok');
 });
 
-test('a major issue still makes it partially OK', () => {
+test('a major issue is listed with the pass, it does not fail the PR', () => {
   const r = base([{ id: 1, claim: 'x', results: { A: { status: 'pass', evidence: ['ev-001'] } } }],
     [{ severity: 'major', title: 'breaks for guests', evidence: ['ev-001', 'ev-002'] }]);
-  assert.equal(judge(r).verdict, 'partial');
+  const { results, verdict, problems } = judge(r);
+  assert.equal(verdict, 'ok');
+  const md = renderComment(results, verdict, { problems });
+  assert.match(md, /Passed with 1 major finding, listed below/);
+  assert.match(md, /\*\*breaks for guests\*\*/);
 });
 
 test('a failure seen once is not reported as a failure', () => {
@@ -221,8 +230,10 @@ test('a claim the QA machine cannot test is listed as not tested and does not ho
 test('an untestable claim with no reason, or too many of them, counts as not proven', () => {
   const pass = (id) => ({ id, claim: `c${id}`, baseline: { status: 'reproduced', evidence: ['ev-001'] }, visible: false, results: { A: { status: 'pass', evidence: ['ev-002'] } } });
   const vague = judge(base([pass(1), pass(2), pass(3), { id: 4, claim: 'x', visible: false, results: { A: { status: 'untestable', note: 'no' } } }]));
-  assert.equal(vague.verdict, 'partial');
+  assert.equal(vague.verdict, 'ok');
+  assert.equal(vague.results.criteria[3].results.A.status, 'blocked');
   const many = judge(base([pass(1), ...[2, 3].map((id) => ({ id, claim: `u${id}`, visible: false, results: { A: { status: 'untestable', needs: 'author', note: 'needs the author\'s Astra page and media' } } }))]));
-  assert.equal(many.verdict, 'partial');
+  assert.equal(many.verdict, 'ok');
+  assert.match(renderComment(many.results, many.verdict, { problems: many.problems }), /Passed with 2 unverified criteria/);
   assert.match(many.problems.join('\n'), /more than a run may set aside/);
 });
