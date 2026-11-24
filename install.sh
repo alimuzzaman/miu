@@ -216,8 +216,9 @@ exec /usr/bin/rex mcp
 EOF
   cat > "$LIB/qasite" <<EOF
 #!/bin/bash
-# qasite for the agent account, run as $MIU_USER: reset or log in to a QA site.
-case "\${1:-}:\${2:-}" in reset:pr|reset:dev|reset:fix|login:pr|login:dev|login:fix|info:) ;; *) echo "usage: qasite reset|login pr|dev|fix, or qasite info" >&2; exit 2 ;; esac
+# qasite for the agent account, run as $MIU_USER: reset or log in to a QA site,
+# or use the lane's server rig (lib/rig.mjs; it checks the rest of the arguments).
+case "\${1:-}:\${2:-}" in reset:pr|reset:dev|reset:fix|login:pr|login:dev|login:fix|info:|server:pr|server:dev|move:pr|move:dev|rig:start|rig:reload|rig:stop|rig:show|rig:default|rig:put|rig:rm) ;; *) echo "usage: qasite reset|login pr|dev|fix, qasite info, qasite server|move pr|dev ..., or qasite rig ..." >&2; exit 2 ;; esac
 export HOME=$MIU_HOME USER=$MIU_USER XDG_RUNTIME_DIR=/run/user/$MIU_UID PATH=$OPT/node/bin:/usr/bin:/bin QA_CACHE_DIR=$DATA/.cache MIU_PROFILES=$ETC/profiles
 cd $APP && exec node lib/warmsites.mjs "\$@"
 EOF
@@ -320,6 +321,14 @@ $MIU_USER ALL=($SANDBOX_USER) NOPASSWD: $LIB/pr-stack
 EOF
   visudo -cqf /etc/sudoers.d/miu-sandbox-ci.tmp || die "the Sandbox CI sudoers rule did not validate"
   chmod 0440 /etc/sudoers.d/miu-sandbox-ci.tmp && mv /etc/sudoers.d/miu-sandbox-ci.tmp /etc/sudoers.d/miu-sandbox-ci
+  # The Sandbox account (its agents and jobs) may read run outputs as $MIU_USER,
+  # through one read-only helper that refuses credentials (bin/miu-run-read).
+  cat > /etc/sudoers.d/miu-run-read.tmp <<EOF
+# $SANDBOX_USER may list and read Miu's run outputs, read-only, as $MIU_USER.
+$SANDBOX_USER ALL=($MIU_USER) NOPASSWD: $LIB/run-read
+EOF
+  visudo -cqf /etc/sudoers.d/miu-run-read.tmp || die "the run-read sudoers rule did not validate"
+  chmod 0440 /etc/sudoers.d/miu-run-read.tmp && mv /etc/sudoers.d/miu-run-read.tmp /etc/sudoers.d/miu-run-read
   # The server's CI secrets each repository's workflows may name
   # ($ETC/ci-secret-names: `owner/name NAME,NAME` lines). Every release's worker
   # reads it and refuses a run that names one not listed, so it is made before

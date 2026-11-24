@@ -38,8 +38,9 @@ import * as waive from '../lib/waivers.mjs';
 import { withAppToken, manifest, convertManifest, appStatus, owner as appOwner, readApp, APP_FILE } from '../lib/ghapp.mjs';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed } from '../lib/queuectl.mjs';
-import { createCi, ciRunCommit, shipSibling, parseWorkflows, runningJobs, prCiProblem, forkOf, workflowsAt } from '../lib/ci.mjs';
+import { modeOf, holdReason, nextIndex, pick, dismissal, labelDismissed, labelGone, takeNext, pairCandidates, pairCovered, stackKeys, stackWaited, requeueWaited, stackHold } from '../lib/queuectl.mjs';
+import { createCi, ciRunCommit, shipSiblings, parseWorkflows, runningGroups, prCiProblem, forkOf, workflowsAt, linkedPrs } from '../lib/ci.mjs';
+import { sweepCiComments } from '../lib/cicomment.mjs';
 import { runSandboxCi, adoptSandboxCi, sweepMirrorCopies } from '../lib/sandboxci.mjs';
 import { ensureRepo } from '../lib/worktrees.mjs';
 import { createStacks, sudoRunner, WORKER as STACK_WORKER } from '../lib/prstackctl.mjs';
@@ -138,6 +139,8 @@ function status(dir, name) {
     state, reached, verdict: state === 'running' ? null : verdict?.verdict ?? null, history,
     crashed: state === 'stopped' && !/stopped from the dashboard/.test(log),
     waiting: state === 'waiting' ? readJson(path.join(dir, 'waiting.json')) : null,
+    // Why the run did not test: which base, which commit, which files (qa-run, conflict.json).
+    conflict: state === 'conflict' ? readJson(path.join(dir, 'conflict.json')) : null,
     last: (log.trim().split('\n').pop() ?? '').replace(/^\[qa [\d:]+\] /, ''),
     // What the run is doing, in plain words, for the PR list (the raw log line
     // is on the run page).
@@ -240,7 +243,8 @@ function listRuns() {
       failed: sm ? sm.claims.filter((c) => c.state === 'fail').length : null,
       issues: sm ? sm.issues.length : null,
       last: st.state === 'running' ? st.last : null,
-      conflictKind: st.state === 'conflict' ? readJson(path.join(dir, 'conflict.json'))?.kind ?? 'conflict' : null,
+      conflictKind: st.state === 'conflict' ? st.conflict?.kind ?? 'conflict' : null,
+      conflictFiles: st.state === 'conflict' ? (st.conflict?.files ?? []).slice(0, 10) : null,
     };
   }).sort((a, b) => b.mtime - a.mtime);
 }
@@ -369,7 +373,12 @@ function detail(name) {
     // The CI of the commit this run tested (lib/ci.mjs), and where GitHub shows its own checks.
     // Its test stack (lib/prstackctl.mjs), when PR stacks are on.
     stack: (() => { const m = readJson(path.join(dir, 'context/pr.json'))?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); return m && stacksOn() ? stacks.view(`${m[1]}#${m[2]}`) : null; })(),
-    ci: (() => { const pr = readJson(path.join(dir, 'context/pr.json')); const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); return m ? { ...(ci.view(ci.get(m[1], Number(m[2]), pr.headRefOid)) ?? { state: 'not_started', repo: m[1], pr: Number(m[2]), sha: pr.headRefOid, jobs: [] }), checksUrl: `${pr.url}/checks`, paused: queueState().paused, parallel: ciParallel() } : null; })(),
+    ci: (() => { const pr = readJson(path.join(dir, 'context/pr.json')); const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/); return m ? { ...(ci.view(ci.get(m[1], Number(m[2]), pr.headRefOid)) ?? { state: 'not_started', repo: m[1], pr: Number(m[2]), sha: pr.headRefOid, jobs: [] }), checksUrl: `${pr.url}/checks`, paused: queueState().paused, parallel: ciParallel(),
+      // The paired pull requests' own CI, each at its current head (else its newest).
+      linked: linkedPrs(readJson(path.join(dir, 'context/pair.json')), repos()).map((x) => {
+        const head = prCache.list.find((p) => p.repo === x.repo && p.number === x.pr)?.headRefOid ?? x.sha;
+        return { label: `${x.label} #${x.pr}`, ...(ci.view(ci.get(x.repo, x.pr, head) ?? ci.latest(x.repo, x.pr)) ?? { state: 'not_started', repo: x.repo, pr: x.pr, sha: head, jobs: [] }) };
+      }) } : null; })(),
     notes: read(path.join(dir, 'notes.md')),
     prompt: read(path.join(dir, 'prompt.md')),
     comment: rewire(read(path.join(dir, 'comment.md'))),
@@ -621,24 +630,34 @@ async function prepareNow(repo, pr, sha) {
   const workflows = await workflowsAt((args) => gitAsync(['-C', bare, ...args]), sha);
   const baseWorkflows = await workflowsAt((args) => gitAsync(['-C', bare, ...args]), tip);
   // Without the sibling the run would use whatever the pull request has at that path: tried again later instead.
-  const sibling = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw Object.assign(new Error(e.lasting ? e.message : `could not fetch the sibling repository's source: ${e.message}`), { lasting: e.lasting }); });
-  const runSha = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, `Miu CI: ${sha.slice(0, 12)}${sibling ? ` with ${sibling.from} beside it` : ''}`, sibling?.extra ?? []);
-  // Kept under a ref so a gc of the clone does not take it while it waits.
-  const runRef = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}`;
-  await gitAsync(['-C', bare, 'update-ref', runRef, runSha]);
-  return { gitDir: bare, sha, runSha, runRef, trustedSha: tip, workflows, baseWorkflows, workflowsFrom, siblingFrom: sibling?.from ?? null, base, changed };
+  const variants = await siblingSource(repo, bare, p.headRefName, workflows, { base, changed }).catch((e) => { throw Object.assign(new Error(e.lasting ? e.message : `could not fetch the sibling repository's source: ${e.message}`), { lasting: e.lasting }); });
+  // One run commit for each sibling ref the jobs ask for (lib/ci.mjs shipSiblings); most runs have one.
+  const runShaFor = {}, runRefs = [];
+  let runSha = null;
+  for (const [k, v] of (variants ?? [{ tops: [], from: null, extra: [] }]).entries()) {
+    const made = await ciRunCommit((args, env, input) => gitAsync(['-C', bare, ...args], env, input), sha, `Miu CI: ${sha.slice(0, 12)}${v.from ? ` with ${v.from} beside it` : ''}`, v.extra);
+    // Kept under a ref so a gc of the clone does not take it while it waits.
+    const ref = `refs/miu-ci/run-${pr}-${sha.slice(0, 12)}${k ? `-${k}` : ''}`;
+    await gitAsync(['-C', bare, 'update-ref', ref, made]);
+    runRefs.push(ref);
+    runSha ??= made;
+    for (const t of v.tops) runShaFor[t] = made;
+  }
+  const siblingFrom = variants ? [...new Set(variants.map((v) => v.from).filter(Boolean))].join('; ') || null : null;
+  return { gitDir: bare, sha, runSha, runShaFor, runRef: runRefs[0], runRefs, trustedSha: tip, workflows, baseWorkflows, workflowsFrom, siblingFrom, base, changed };
 }
-// The profile's sibling (Free beside Pro), shipped in the run commit (lib/ci.mjs shipSibling).
-// Only the jobs this run runs count (runningJobs): a release workflow's own
-// checkout of the sibling, at another ref, is not this run's.
+// The profile's sibling (Free beside Pro), shipped in the run commit (lib/ci.mjs shipSiblings).
+// Only the jobs this run runs count (runningGroups): a release workflow's own
+// checkout of the sibling, at another ref, is not this run's. Jobs that check
+// it out at different refs get a run commit each.
 async function siblingSource(repo, bare, headRef, workflows, { base, changed }) {
   const profile = profiles().find((x) => x.repo === repo);
   const sib = profile?.sibling;
   // A bad pr_ci is reported by the CI line itself (createCi).
   if (!sib?.repo || !gh.validRepo(sib.repo) || prCiProblem(profile.pr_ci)) return null;
   const parsed = (await parseWorkflows(workflows)).map((w) => ({ path: w.path, doc: w.doc }));
-  const running = runningJobs(parsed, { list: profile.pr_ci, base, changed });
-  return shipSibling({ git: (args, env) => gitAsync(['-C', bare, ...args], env), siblingRepo: sib.repo, headRef, docs: parsed.map((w) => w.doc), names: parsed.map((w) => w.path), keep: (i, id) => running.has(`${i}:${id}`), auth: await gh.gitAuthEnv(sib.repo).catch(() => null) });
+  const groups = runningGroups(parsed, { list: profile.pr_ci, base, changed });
+  return shipSiblings({ git: (args, env) => gitAsync(['-C', bare, ...args], env), siblingRepo: sib.repo, headRef, docs: parsed.map((w) => w.doc), names: parsed.map((w) => w.path), groups, auth: await gh.gitAuthEnv(sib.repo).catch(() => null) });
 }
 fs.mkdirSync(RUNS, { recursive: true });
 // Deploy-key copies of runs that a stop cut short (lib/sandboxci.mjs).
@@ -660,6 +679,8 @@ function ciFor(repo, pr, { again = false, by = 'auto' } = {}) {
 // What gets CI: the run going now, and what in the queue may start (all of it
 // in auto mode, what a person picked in manual mode). Paused: nothing new.
 function ciScan() {
+  // Comments posted earlier still get their CI section while the queue is paused.
+  ciCommentsTick();
   if (queueState().paused) return;
   const st = queueState();
   for (const q of queue) if (!holdReason(q, st)) ciFor(q.repo, q.pr);
@@ -667,8 +688,27 @@ function ciScan() {
   const pr = live && readJson(path.join(RUNS, live, 'context/pr.json'));
   const m = pr?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
   if (m && pr.headRefOid) ci.ensure(m[1], Number(m[2]), pr.headRefOid);
+  // A paired run's other pull requests (Free, Pro, Hub: context/pair.json) get
+  // their own CI too, each on its own repo at its own current head.
+  for (const x of linkedPrs(live && readJson(path.join(RUNS, live, 'context/pair.json')), repos())) ciFor(x.repo, x.pr);
+  // Open pull requests whose CI an older worker made, one at a time while the line has room.
+  ci.refreshStale(prCache.list.filter((p) => repos().includes(p.repo)), { max: 1, room: ciParallel() });
   ci.tick();
 }
+
+// The CI section of result comments posted while CI was still going
+// (lib/cicomment.mjs): edited in place as CI finishes, never posted again.
+let ciCommentsAt = 0, ciCommentsBusy = false;
+function ciCommentsTick() {
+  if (ciCommentsBusy || Date.now() - ciCommentsAt < 30 * 1000) return;
+  ciCommentsAt = Date.now();
+  ciCommentsBusy = true;
+  sweepCiComments({ dir: path.join(RUNS, '.ci-comments'), lookup: ciLookup, rest: gh.rest, log: (msg) => console.log(`ci comment: ${msg}`) })
+    .catch((e) => console.error('ci comment:', e.message))
+    .finally(() => { ciCommentsBusy = false; });
+}
+// A pull request's CI record: at the commit, else its newest.
+const ciLookup = (repo, pr, sha) => ci.get(repo, pr, sha) ?? ci.latest(repo, pr);
 setInterval(() => { try { ciScan(); } catch (e) { console.error('ci:', e.message); } }, 10 * 1000);
 // Why automatic testing leaves a PR alone, or null: a draft, qa:skip, or the
 // rules in Settings (lib/prrules.mjs). The Test button and /miu ignore this.
@@ -760,14 +800,19 @@ function prView() {
 // full: test every claim again instead of only what changed since the last
 // round. note: what a reviewer asked for in a /miu comment. by: who asked
 // (lib/queuectl.mjs); in manual mode only a person's entry starts.
-function enqueue(repo, pr, why, { full = false, note = '', force = false, by = 'auto' } = {}) {
+// label: the request label that queued it; the entry then starts only while
+// the pull request still has one (pump, labelGone). asked: a /miu comment, an
+// explicit ask that no label decides.
+function enqueue(repo, pr, why, { full = false, note = '', force = false, by = 'auto', label = null, asked = false } = {}) {
   const have = queue.find((q) => q.repo === repo && q.pr === pr);
   if (have) {
     if (full) have.full = true; if (force) have.force = true; if (note) have.note = note;
     if (by === 'person') { have.by = 'person'; have.held = false; } else if (by === 'github' && have.by !== 'person') have.by = 'github';
+    // A person or a /miu comment asked for it: no label decides any more.
+    if (by === 'person' || asked) have.label = null; else if (label && !have.label && have.by !== 'person' && have.by !== 'auto') have.label = label;
     saveQueue(); pump(); return { ok: true, queued: true, waits: holdReason(have, queueState()) };
   }
-  const q = { repo, pr, why, by, held: false, full, force, note, at: Date.now() };
+  const q = { repo, pr, why, by, held: false, full, force, note, at: Date.now(), ...(label && by !== 'person' && !asked ? { label } : {}) };
   queue.push(q);
   saveQueue();
   pump();
@@ -776,7 +821,7 @@ function enqueue(repo, pr, why, { full = false, note = '', force = false, by = '
 
 // Queue a PR unless another PR of its pair is already queued or running: one
 // paired run tests them all.
-async function enqueuePair(repo, pr, why, by = 'auto') {
+async function enqueuePair(repo, pr, why, by = 'auto', label = null) {
   let keys = [];
   try { keys = Object.values(await partnersOf(repo, pr)).map((x) => `${x.repo}#${x.number}`); } catch (e) { console.error('pair lookup:', e.message); }
   const live = liveRun();
@@ -784,7 +829,7 @@ async function enqueuePair(repo, pr, why, by = 'auto') {
   const own = dir && readJson(path.join(dir, 'context/pr.json'))?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
   const liveKeys = dir ? [own && `${own[1]}#${own[2]}`, ...(readJson(path.join(dir, 'context/pair.json')) ?? []).map((x) => `${x.repo}#${x.number}`)].filter(Boolean) : [];
   if (keys.some((k) => queue.some((q) => `${q.repo}#${q.pr}` === k) || liveKeys.includes(k))) return { ok: true, queued: false, pairedWith: keys };
-  return enqueue(repo, pr, why, { by });
+  return enqueue(repo, pr, why, { by, label });
 }
 
 // Start the next queued run that may start (lib/queuectl.mjs) when nothing is running.
@@ -792,8 +837,77 @@ async function enqueuePair(repo, pr, why, by = 'auto') {
 // model's engine is not signed in (lib/connections.mjs); queueHeld says why.
 let queueHeld = null;
 let pumping = false;
+// Runs the queue or a person started, by run name, until they end: one that
+// ends waiting for its test stack goes back first in line (lib/queuectl.mjs
+// requeueWaited). Each entry is also kept in its run folder, so a restart
+// between the start and the wait still finds it (loadStarted).
+const STARTED_FROM = 'queue-entry.json';
+const startedFrom = new Map();
+function rememberStart(name, entry) {
+  startedFrom.set(name, entry);
+  try { fs.writeFileSync(path.join(RUNS, name, STARTED_FROM), JSON.stringify(entry)); } catch (e) { console.error(`queue: could not keep ${name}'s entry: ${e.message}`); }
+}
+function loadStarted() {
+  let names = [];
+  try { names = fs.readdirSync(RUNS); } catch { return; }
+  for (const name of names) {
+    const entry = readJson(path.join(RUNS, name, STARTED_FROM));
+    if (entry?.repo && Number.isInteger(entry.pr)) startedFrom.set(name, entry);
+  }
+}
+loadStarted();
+const stackOf = (name) => stacks.list().find((s) => s.name === name && s.state !== 'removed') ?? null;
+function reclaimWaited() {
+  for (const [name, entry] of startedFrom) {
+    const dir = path.join(RUNS, name);
+    if (runAlive(dir) && !fs.existsSync(path.join(dir, 'waiting.json'))) continue;
+    startedFrom.delete(name);
+    fs.rmSync(path.join(dir, STARTED_FROM), { force: true });
+    const names = stackWaited(readJson(path.join(dir, 'waiting.json'))?.reasons);
+    if (!names.length) continue;
+    const { deferred } = requeueWaited(queue, entry, names, Date.now(), stackOf);
+    saveQueue();
+    console.error(`queue: ${entry.repo}#${entry.pr} waited for test stack ${names.join(' and ')}; ${deferred ? 'it goes to the back of the line' : 'it keeps its turn'}`);
+  }
+}
+// Finished paired runs (verdict.json lists more than one member), for
+// pairCovered: a queued PR its pair's run already tested at its head does
+// not start again.
+function pairRuns() {
+  const out = [];
+  for (const name of fs.existsSync(RUNS) ? fs.readdirSync(RUNS) : []) {
+    const f = path.join(RUNS, name, 'verdict.json');
+    const v = readJson(f);
+    if (!(v?.members?.length > 1)) continue;
+    try { out.push({ name, key: v.members[0].key, doneAt: fs.statSync(f).mtimeMs, members: v.members }); } catch { /* gone meanwhile */ }
+  }
+  return out;
+}
+async function coveredByPair(q) {
+  const runs = pairCandidates(q, pairRuns());
+  if (!runs.length) return null;
+  // Every member's head now: a paired result is stale once any of them moved.
+  const heads = new Map();
+  for (const m of new Set(runs.flatMap((r) => r.members.map((x) => x.key)))) {
+    const [repo, n] = m.split('#');
+    heads.set(m, (await gh.prBasic(repo, Number(n))).headRefOid);
+  }
+  const by = pairCovered(q, (k) => heads.get(k), runs);
+  return by ? `already tested at ${String(heads.get(`${q.repo}#${q.pr}`) ?? '').slice(0, 7)} with its pair in the paired run ${by}` : null;
+}
+
 async function pump() {
-  if (nextIndex(queue, queueState()) < 0 || liveRun() || pumping) return;
+  if (liveRun() || pumping) return;
+  reclaimWaited();
+  if (nextIndex(queue, queueState()) < 0) return;
+  const marked = queue.some((q) => q.stackWait);
+  const holding = stackHold(queue, stackOf);
+  if (marked) saveQueue();
+  if (holding) {
+    if (queueHeld !== holding) console.error(`queue held: ${holding}`);
+    queueHeld = holding;
+    return;
+  }
   pumping = true;
   try {
     const cfg = getConfig();
@@ -817,15 +931,28 @@ async function pump() {
     }
     queueHeld = null;
   } catch (e) { console.error('queue check:', e.message); } finally { pumping = false; }
-  const at = nextIndex(queue, queueState());
-  if (at < 0 || liveRun()) return;
-  const [next] = queue.splice(at, 1);
-  saveQueue();
+  // An entry a request label queued starts only while the PR still asks: the
+  // label may have come off, or the PR closed, while it waited (takeNext).
+  let next = null;
+  pumping = true;
+  try {
+    const took = await takeNext(queue, queueState, { readPr: (repo, pr) => gh.prBasic(repo, pr), asks: [...L().request, L().retest], busy: () => !!liveRun(), covered: coveredByPair, log: (m) => console.error(m) });
+    if (took.dropped.length || took.next) saveQueue();
+    next = took.next;
+  } finally { pumping = false; }
+  if (!next) return;
   const cfg = getConfig();
-  const r = startRun({ repo: next.repo, pr: next.pr, model: cfg.model, dryRun: !cfg.post, full: next.full, force: next.force, note: next.note, slack: cfg.post && cfg.slack });
+  // A person's direct start keeps its own model and dry run (launch) when it
+  // waited and starts again; others take Settings at the time they start.
+  const launch = next.launch ?? { model: cfg.model, dryRun: !cfg.post, slack: cfg.post && cfg.slack };
+  const r = startRun({ repo: next.repo, pr: next.pr, ...launch, full: next.full, force: next.force, note: next.note });
   if (r.error) console.error(`Could not start ${next.repo}#${next.pr}: ${r.error}`);
-  // Its CI starts beside it, if it has not already.
-  else ciFor(next.repo, next.pr);
+  else {
+    const { stackWait, ...entry } = next;
+    rememberStart(r.name, entry);
+    // Its CI starts beside it, if it has not already.
+    ciFor(next.repo, next.pr);
+  }
 }
 
 // Take a pull request out of the line. One Miu or a label lined up stays out
@@ -938,6 +1065,10 @@ async function autoScan() {
       const open = new Set(list.map((p) => `${p.repo}#${p.number}`));
       const gone = queue.filter((q) => q.by !== 'person' && !open.has(`${q.repo}#${q.pr}`));
       if (gone.length) { for (const q of gone) queue.splice(queue.indexOf(q), 1); saveQueue(); }
+      // An entry a request label queued goes once the label is off the PR.
+      const byKey = new Map(list.map((p) => [`${p.repo}#${p.number}`, p]));
+      const unasked = queue.filter((q) => labelGone(q, byKey.get(`${q.repo}#${q.pr}`) && { state: 'OPEN', labels: byKey.get(`${q.repo}#${q.pr}`).labels }, [...L().request, L().retest]));
+      if (unasked.length) { for (const q of unasked) { queue.splice(queue.indexOf(q), 1); console.error(`queue: dropped ${q.repo}#${q.pr}: label removed while queued`); } saveQueue(); }
     }
     const runs = runsByPr();
     const heads = new Map(list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid]));
@@ -958,7 +1089,8 @@ async function autoScan() {
         if (empty >= 2) continue;
         // A person took it out of the line at this commit (unqueue).
         if (labelDismissed(cfg, `${p.repo}#${p.number}`, p.headRefOid)) continue;
-        if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${p.labels.find((l) => asks.includes(l))}`, 'github');
+        const asked = p.labels.find((l) => asks.includes(l));
+        if (!recent && !busy) await enqueuePair(p.repo, p.number, `labelled ${asked}`, 'github', asked);
         continue;
       }
       if (skipReason(p)) continue;
@@ -1003,7 +1135,7 @@ setTimeout(scan, 5000);
 setInterval(pump, 15 * 1000);
 
 // ---- PR test stacks ----------------------------------------------------------
-// Each PR in the queue (or being tested) gets a Sandbox stack that follows
+// The live run, its pair, and PRs a person queued get a Sandbox stack that follows
 // its branch (lib/prstacks.mjs decides, lib/prstackctl.mjs does it). Off
 // unless Settings has stacks.on and install.sh set up the worker.
 const stacksOn = () => getConfig().stacks?.on === true && !!process.env.MIU_SANDBOX_USER && fs.existsSync(STACK_WORKER);
@@ -1020,6 +1152,21 @@ function verdicts() {
   }
   return out;
 }
+// The PRs that want a test stack now (lib/queuectl.mjs stackKeys): the live
+// run, the members of its pair, and what a person queued. A run that has not
+// written context/pr.json yet counts by the repo and PR in its qa-run.json.
+function stackDemand() {
+  const live = liveRun();
+  const keys = [];
+  if (live) {
+    const own = readJson(path.join(RUNS, live, 'context/pr.json'))?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+    const meta = readJson(path.join(RUNS, live, 'qa-run.json'));
+    if (own) keys.push(`${own[1]}#${own[2]}`);
+    if (meta?.repo && meta?.pr) keys.push(`${meta.repo}#${meta.pr}`);
+    for (const x of readJson(path.join(RUNS, live, 'context/pair.json')) ?? []) keys.push(`${x.repo}#${x.number}`);
+  }
+  return stackKeys(queue, keys);
+}
 let stackBusy = false;
 async function stackScan() {
   if (!stacksOn() || stackBusy) return;
@@ -1028,11 +1175,7 @@ async function stackScan() {
     const { list, error } = await refreshPrs();
     const listed = !error && list.length > 0;
     const open = listed ? new Map(list.map((p) => [`${p.repo}#${p.number}`, p.headRefOid])) : null;
-    const live = liveRun();
-    const ctx = live ? readJson(path.join(RUNS, live, 'context/pr.json')) : null;
-    const own = ctx?.url?.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
-    const liveKeys = new Set([own && `${own[1]}#${own[2]}`, ...(live ? (readJson(path.join(RUNS, live, 'context/pair.json')) ?? []).map((x) => `${x.repo}#${x.number}`) : [])].filter(Boolean));
-    const wanted = new Set([...queue.map((q) => `${q.repo}#${q.pr}`), ...liveKeys]);
+    const wanted = stackDemand();
     for (const key of wanted) {
       const p = list.find((x) => `${x.repo}#${x.number}` === key);
       const role = p && roleOf(p.repo);
@@ -1045,7 +1188,10 @@ async function stackScan() {
     if (roles().hub && profileOf(roles().hub.repo)?.stack?.kind === 'full') stacks.wantBase();
     const v = verdicts();
     for (const s of stacks.list()) stacks.observe(s.key, { head: open?.get(s.key), verdictAt: v.get(s.key)?.at, verdictHead: v.get(s.key)?.sha });
-    await stacks.scan({ open, liveKeys });
+    // What a person queued keeps its stack too, not only the live run. Read
+    // again just before each removal: a person can queue or start one while
+    // the scan waits on Sandbox.
+    await stacks.scan({ open, liveKeys: stackDemand });
   } catch (e) { console.error('stack scan:', e.message); } finally { stackBusy = false; }
 }
 setInterval(stackScan, 2 * 60 * 1000);
@@ -1460,7 +1606,7 @@ async function scanCommands() {
       const rest = m[2].trim();
       const full = /^full\b/i.test(rest);
       const note = (full ? rest.replace(/^full\b/i, '') : rest).trim();
-      enqueue(repo, pr, `/miu from ${c.user.login}`, { full, note: note ? `${c.user.login}: ${note}` : '', by: 'github' });
+      enqueue(repo, pr, `/miu from ${c.user.login}`, { full, note: note ? `${c.user.login}: ${note}` : '', by: 'github', asked: true });
       await gh.rest('POST', `repos/${repo}/issues/comments/${c.id}/reactions`, { body: { content: 'eyes' } }).catch(() => {});
       console.log(`queued ${repo}#${pr} from /miu by ${c.user.login}${full ? ' (full)' : ''}`);
       // Manual mode: say it waits for a person, once per trigger (lib/cmdreply.mjs).
@@ -2018,7 +2164,24 @@ const server = http.createServer((req, res) => {
         return json(r ? ci.view(r) : { error: 'Miu does not know this pull request\'s head yet. Refresh the list and try again.' });
       }
       if (url.pathname === '/api/unqueue') { unqueue(data.repo, Number(data.pr)); return json({ ok: true }); }
-      if (url.pathname === '/api/start') return json(startRun({ repo: data.repo, pr: Number(data.pr), model: data.model, dryRun: data.dryRun !== false }));
+      if (url.pathname === '/api/start') {
+        const pr = Number(data.pr);
+        const launch = { model: data.model, dryRun: data.dryRun !== false };
+        // A run keeping its turn for its test stack goes first: this one queues behind it, with its own model and dry run.
+        const holding = !liveRun() && stackHold(queue, stackOf);
+        if (holding) {
+          if (!repos().includes(data.repo) || !Number.isInteger(pr) || pr < 1) return json({ error: 'Unknown pull request' });
+          if (!isModel(data.model)) return json({ error: 'Unknown model' });
+          enqueue(data.repo, pr, 'started from the dashboard', { by: 'person' });
+          const q = queue.find((x) => x.repo === data.repo && x.pr === pr);
+          if (q) { q.launch = launch; saveQueue(); }
+          return json({ ok: true, queued: true, waits: holding });
+        }
+        const r = startRun({ repo: data.repo, pr, ...launch });
+        // A person's start: if it waits for its test stack, it keeps its turn as their entry, with its launch options.
+        if (!r.error) rememberStart(r.name, { repo: data.repo, pr, why: 'started from the dashboard', by: 'person', held: false, full: false, force: false, note: '', at: Date.now(), launch });
+        return json(r);
+      }
       const rv = url.pathname.match(/^\/api\/runs\/([^/]+)\/review$/);
       if (rv && safeName(rv[1])) { setReview(rv[1], data, session?.login ?? localName).then(json, (e) => json({ error: e.message })); return; }
       const fx = url.pathname.match(/^\/api\/runs\/([^/]+)\/fix$/);

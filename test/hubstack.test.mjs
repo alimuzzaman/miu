@@ -67,7 +67,7 @@ test('a stack that is not ready blocks the run; a failed sign-in leaves the stat
   const { hubs, infra } = await prepareHubStacks({ run, signin, selfRole: 'hub', pr: 7, sha: 'new', runDir, runsDir: runDir, timeoutMs: 60_000, ...clock() });
   assert.ok(infra.some((i) => i.blocking && /pr Hub stack pr-hub-7 is not ready/.test(i.what)));
   assert.equal(hubs.dev.admin_state, null);
-  assert.ok(infra.some((i) => !i.blocking && /could not sign in to pr-hub-base: hub sign-in: link answered 429/.test(i.what)));
+  assert.ok(infra.some((i) => !i.blocking && /could not sign in to pr-hub-base admin: hub sign-in: link answered 429/.test(i.what)));
 });
 
 test('no stack coming: a refused plan or a missing follow ends the wait at once', async () => {
@@ -110,4 +110,21 @@ test('the staff console is signed in to only when the pull request touches it (t
     assert.match(hubs[side].admin_skipped, /does not touch the admin console/);
     assert.ok(fs.existsSync(hubs[side].app_state));
   }
+});
+
+test('admin failing and app signing in: the app state is used, and the admin failure is reported with its code', async () => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'miu-hubstack-'));
+  const run = async (args) => {
+    if (args[0] === 'status') return status(args[1] === 'pr-hub-base' ? { hub: 'd' } : { hub: 'h1' });
+    return { code: 0, out: JSON.stringify({ ok: true, created_at: 'x', copy_id: 'y', ports: { mailpit: 18100 } }) };
+  };
+  const signin = async (args) => ({ code: 0, out: JSON.stringify({ ok: true, stack: args[args.indexOf('--stack') + 1], enrolled: false,
+    admin: { ok: false, code: 'staff_factor_without_secret', error: 'hub sign-in: miu-qa@wpdeveloper.com already has an authenticator on pr-hub-7' }, app: { ok: true } }) });
+  const { hubs, infra } = await prepareHubStacks({ run, signin, selfRole: 'hub', pr: 7, sha: 'h1', runDir, runsDir: runDir, ...clock() });
+  for (const side of ['pr', 'dev']) {
+    assert.equal(hubs[side].admin_state, null);
+    assert.match(hubs[side].app_state, /hub-.*-app\.json$/);
+  }
+  assert.ok(infra.some((i) => !i.blocking && /could not sign in to pr-hub-7 admin \(staff_factor_without_secret\)/.test(i.what) && /admin console needs a manual sign-in/.test(i.impact)));
+  assert.ok(!infra.some((i) => / app/.test(i.what)), 'the app side signed in');
 });

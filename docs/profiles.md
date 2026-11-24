@@ -100,18 +100,36 @@ With a `sibling` in the profile (below), the CI run gets the sibling's source in
 
 A run that still reaches GitHub gets a token from the Miu App, as `GITHUB_TOKEN` (what `${{ github.token }}` reads) and as every secret the workflow uses beside `github.token` (`${{ secrets.X || github.token }}`). It reads only the repositories the job, and the jobs it needs, reach: `repository:` of `actions/checkout` (the pull request's own repository too, when named), `github.com/owner/name` URLs, `gh repo clone`, `gh api repos/...` and `gh -R` in `run:` steps, and, when a step runs Composer or npm, the GitHub repositories in `composer.json` `repositories` and in `package.json` dependencies. What it may read comes from the base branch's workflow and files, never the pull request's; a pull request that needs more is not run. A QA run's `sandbox_ci` fast check has no base branch to read, so its token reads only what the profile lists in `sandbox_ci.repos`. Only the App owner's repositories go in a token; a checkout of another owner's repository must be public. The token can only read code, lasts at most an hour and is revoked when the run ends, by Miu and by the worker. The pull request's code can read it. A run that reaches nothing gets no token. A repository the App is not installed on makes the job "not run (no access to owner/name)", as does a checkout whose repository is an expression. A dependency that the server reads with a deploy key ([install.md](install.md#a-repository-the-app-may-not-read-a-deploy-key)) needs no token: the job installs it from a copy of the server's mirror.
 
+A repo whose tests need a database service, such as the Hub, lists the jobs that have the service in the workflow. A job that needs write access, like a security suite that posts its report on the pull request, is shown as not run, with the reason:
+
+```json
+"pr_ci": [
+  { "workflow": ".github/workflows/ci.yml", "jobs": ["hub", "security", "app", "admin"] }
+]
+```
+
+A `pr_ci` that names a deploy, release or notification workflow or job (below) is refused when the profile is saved, and CI says why.
+
 With `pr_ci` set, only the listed workflows run; the default rule is off for the repo. `"pr_ci": []` runs no CI for pull requests. Leave `pr_ci` out to keep the default rule.
 
 Listed or not, Miu runs tests only. These are never run:
 
-- A workflow whose file name or `name` says deploy, release, publish, announce, sync, notify, Slack, comment, summary, close-issues or label.
+- A workflow whose file name or `name` says deploy, release, publish, website-sync, announce, sync, notify, Slack, comment, summary, tag, close-issues or label. The worker refuses deploy, release, publish, website-sync, announce, Slack, tag and close-issues itself, whatever Miu asks it to run.
 - A workflow triggered by `pull_request_target`, `workflow_run`, `release`, `deployment`, `issues`, `issue_comment` or `pull_request_review`, or by tag pushes.
 - A job with an `environment`, or with write `permissions` (its own, or the workflow's).
-- A job whose id or name has the word deploy, publish, announce, notify or Slack.
+- A job whose id or name has the word deploy, release, publish, website-sync, announce, notify, Slack, tag or close-issues, or that deploys to an `environment`. The worker refuses these too, for the job and every job it needs.
 - A job with a step that posts (`curl -X POST`, `--data`, `--json`, a Slack hook), pushes or publishes (`git push`, `gh pr`/`gh api`, `ssh`, `rsync`, `npm publish`, `npm run deploy`, `docker push`, `aws s3 sync`, `semantic-release` and the like; a `--dry-run` line is fine), or that uses a deploy, Slack, comment, `github-script`, Codecov, Coveralls, cloud-login, auto-commit or push action.
 - A job that needs any of the above.
 
 Such a job is shown with the reason. These checks are a backstop, not the guard: the workflow is the pull request's own and can be written to get past them. The guards are the worker's rules, the CI secrets a job may name (only those the base branch's same job names and root's `/etc/miu/ci-secret-names` gives the repository, [install.md](install.md#which-ci-secrets-each-repository-may-use)) and what Sandbox's `ci_secrets` holds. Keep deploy and publish credentials out of it.
+
+### Linked pull requests, the comment, container jobs
+
+When a run tests pull requests together (Free, Pro and Hub), each one gets its own CI, on its own repo at its own head, with its own profile's `pr_ci`. Each result comment has a CI section: for every pull request of the run, each job's result and the commit it ran on. A failed job lists its failing tests. A job that did not run says why. If CI is still running when the comment is posted, the comment says so, and Miu edits that comment's CI section when CI finishes (or after 4 hours). It never posts a second comment.
+
+The failing tests come from the job's own test report: a Vitest or Jest JSON report or JUnit XML, at a path the job gives to `--outputFile`, `--log-junit` or `--junitxml`. The worker adds a last step that copies them out of the job, because Sandbox keeps only the tail of a job's output. The run page's CI tab shows them, and the linked pull requests' CI as well.
+
+A job with a `container:` runs in that image. act runs JavaScript actions (`actions/checkout`, `actions/cache`) with the image's own node, where GitHub mounts its own. When the image has none, as with `php:8.3-cli`, the worker mounts this server's node read only at `/usr/local/bin/node`, and the log says so. Container jobs get the same memory and CPU caps as other jobs.
 
 ## A plugin and its add-on
 

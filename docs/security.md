@@ -193,4 +193,8 @@ names, and the command checks each one.
   (0600, deleted after the run); no link, code or recovery code is printed,
   logged or written. The stack's authenticator secret is kept in
   `runs/.stacks/<stack>.totp` (0600), bound to that stack's incarnation, and
-  deleted when the stack is made or removed.
+  deleted when the stack is removed. An add keeps it, since the stack (and the
+  factor on its Hub) may survive one, and a file from another incarnation is
+  never used. Admin and app sign in each on their own; when the address already
+  has a factor and Miu holds no secret for it, the admin side fails as
+  `staff_factor_without_secret`, naming the stack.

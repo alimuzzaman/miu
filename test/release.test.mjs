@@ -133,3 +133,89 @@ test('the first move failing half way: /srv/miu points at the old folder again a
   assert.ok(fs.existsSync(path.join(s.app, 'runs')));
   assert.match(fs.readFileSync(path.join(s.root, 'systemctl.log'), 'utf8'), /stop miu\.service[\s\S]*start miu\.service/);
 });
+
+test('a release that changes miu-release installs its copy, which does the rest of the deploy under the same lock', linux, () => {
+  const s = server();
+  // Not the script that started the deploy: it says it ran, and whether the lock is still held.
+  fs.writeFileSync(path.join(s.src, 'bin/miu-release'), `#!/usr/bin/env bash\necho "handed: $* $MIU_RELEASE_HANDOFF $(flock -n "$MIU_RELEASES/.lock" true && echo free || echo held)" > "${s.root}/handed"\n`, { mode: 0o755 });
+  const one = s.commit('one');
+  const r = s.run('deploy', one, '--no-restart');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readFileSync(path.join(s.lib, 'miu-release'), 'utf8'), fs.readFileSync(path.join(s.src, 'bin/miu-release'), 'utf8'));
+  assert.equal(fs.readFileSync(path.join(s.root, 'handed'), 'utf8'), `handed: deploy ${one} --no-restart 1 held\n`);
+  assert.ok(!fs.existsSync(s.app), 'the copy it handed on to does the switch, not this script');
+});
+
+test('a deploy handed on to a changed real copy finishes the deploy', linux, () => {
+  const s = server();
+  fs.copyFileSync(RELEASE, path.join(s.lib, 'miu-release'));
+  fs.writeFileSync(path.join(s.src, 'bin/miu-release'), `${fs.readFileSync(RELEASE, 'utf8')}# changed\n`, { mode: 0o755 });
+  const one = s.commit('one');
+  const r = s.run('deploy', one);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /goes on with the deploy/);
+  assert.match(fs.readFileSync(path.join(s.lib, 'miu-release'), 'utf8'), /# changed\n$/);
+  assert.equal(path.basename(fs.readlinkSync(s.app)), one);
+  assert.equal(fs.readlinkSync(path.join(s.lib, 'sandbox-ci')), `versions/${one}/sandbox-ci`);
+});
+
+test('MIU_RELEASE_HANDOFF without the lock it came with still waits for the lock', linux, async () => {
+  const s = server();
+  const one = s.commit('one');
+  fs.mkdirSync(path.join(s.root, 'releases'), { recursive: true });
+  const lockFile = path.join(s.root, 'releases/.lock');
+  fs.writeFileSync(lockFile, '');
+  const holder = spawn('flock', [lockFile, 'sleep', '3'], { stdio: 'ignore' });
+  await new Promise((res) => setTimeout(res, 300));
+  const t0 = Date.now();
+  const r = await new Promise((res) => {
+    const c = spawn('bash', [RELEASE, 'deploy', one], { env: { ...s.env, MIU_RELEASE_HANDOFF: '1' }, stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = ''; c.stderr.on('data', (d) => { err += d; });
+    c.on('close', (status) => res({ status, err }));
+  });
+  holder.kill();
+  assert.equal(r.status, 0, r.err);
+  assert.ok(Date.now() - t0 >= 2000, 'it waited for the deploy that held the lock');
+});
+
+test('a release with the same miu-release deploys without handing on', linux, () => {
+  const s = server();
+  fs.copyFileSync(RELEASE, path.join(s.src, 'bin/miu-release'));
+  fs.copyFileSync(RELEASE, path.join(s.lib, 'miu-release'));
+  const one = s.commit('one');
+  const r = s.run('deploy', one);
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /goes on with the deploy/);
+  assert.equal(path.basename(fs.readlinkSync(s.app)), one);
+});
+
+test('the CI network helper goes in with the worker, behind a unit that holds it after a reboot', linux, () => {
+  const s = server();
+  fs.writeFileSync(path.join(s.src, 'bin/miu-ci-net'), '#!/usr/bin/env bash\necho net "$@"\n', { mode: 0o755 });
+  const one = s.commit('one');
+  const r = s.run('deploy', one);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readlinkSync(path.join(s.lib, 'ci-net')), `versions/${one}/ci-net`);
+  assert.match(spawnSync(path.join(s.lib, 'ci-net'), ['up'], { encoding: 'utf8' }).stdout, /^net up/);
+  const unit = fs.readFileSync(path.join(s.root, 'units/miu-ci-net.service'), 'utf8');
+  assert.match(unit, new RegExp(`^ExecStart=${s.lib}/ci-net up$`, 'm'));
+  assert.match(unit, new RegExp(`^ExecReload=${s.lib}/ci-net up$`, 'm'), 'a deploy reloads it, so the rules are never taken down');
+  assert.match(unit, /^PartOf=docker\.service$/m);
+  assert.match(unit, new RegExp(`^ExecStop=${s.lib}/ci-net unstamp$`, 'm'), 'Docker stopping takes the stamp, never the rules a running job is held by');
+  assert.match(unit, /^WantedBy=multi-user\.target docker\.service$/m);
+  const log = fs.readFileSync(path.join(s.root, 'systemctl.log'), 'utf8');
+  assert.match(log, /enable -q miu-ci-net\.service/);
+  assert.match(log, /reload-or-restart miu-ci-net\.service/);
+  assert.doesNotMatch(log, /(?:^|\n)(?:stop|restart) miu-ci-net\.service/);
+  assert.match(r.stderr, /CI network: up/);
+});
+
+test('the run reader goes in with the worker, behind $LIB/run-read', linux, () => {
+  const s = server();
+  fs.writeFileSync(path.join(s.src, 'bin/miu-run-read'), '#!/usr/bin/env bash\necho reader "$@"\n', { mode: 0o755 });
+  const one = s.commit('one');
+  const r = s.run('deploy', one);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readlinkSync(path.join(s.lib, 'run-read')), `versions/${one}/run-read`);
+  assert.match(spawnSync(path.join(s.lib, 'run-read'), ['ls', 'x'], { encoding: 'utf8' }).stdout, /^reader ls x/);
+});

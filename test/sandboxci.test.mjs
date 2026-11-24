@@ -20,6 +20,10 @@ const script = (file, body) => fs.writeFileSync(file, `#!/usr/bin/env bash\n${bo
 // Root's /etc/miu/ci-secret-names on the server; here the test's own account stands in for root.
 const SELF = `${process.getuid()}:${process.getgid()}`;
 const namesList = (text, mode = 0o644) => { const f = path.join(fs.mkdtempSync(path.join(tmp, 'names-')), 'ci-secret-names'); fs.writeFileSync(f, text); fs.chmodSync(f, mode); return f; };
+// Root's stamp for the CI network (bin/miu-ci-net), naming the network the stand-in docker reports.
+const NET_ID = 'f00dfeed'.repeat(8);
+const netStamp = (id = NET_ID, mode = 0o644) => { const f = path.join(fs.mkdtempSync(path.join(tmp, 'net-')), 'ok'); fs.writeFileSync(f, `${id}\n`); fs.chmodSync(f, mode); return f; };
+const netDocker = (body) => `if [ "$1 $2 $3 $4" = "network inspect -f {{.Id}}" ]; then [ "$5" = miu-ci ] && echo ${NET_ID}; exit 0; fi\n${body}`;
 const git = (dir, ...args) => spawnSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' });
 
 // A pull request's checkout: one commit, plus a file that was never committed.
@@ -41,11 +45,11 @@ function server({ worker, home, docker = 'exit 0' }) {
   const bin = fs.mkdtempSync(path.join(tmp, 'bin-'));
   script(path.join(bin, 'sudo'), `printf '%s\\n' "$@" > "${bin}/sudo-argv"\necho "$*" >> "${bin}/sudo-all"\nshift 4\nexec "$@"`);
   script(path.join(bin, 'timeout'), 'shift 3\nexec "$@"');
-  script(path.join(bin, 'docker'), docker);
+  script(path.join(bin, 'docker'), netDocker(docker));
   script(path.join(bin, 'curl'), `cat >> "${bin}/curl-stdin"\nprintf '%s\\n' "$@" >> "${bin}/curl-argv"`);
   if (!hasYaml) script(path.join(bin, 'python3'), 'exit 0');
   return {
-    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-deploy-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no-apply.lock'), MIU_CI_RUNNER_UID: String(process.getuid()), MIU_CI_SECRET_NAMES: namesList('acme/r SLACK_WEBHOOK\n'), MIU_CI_SECRET_NAMES_OWNER: SELF },
+    env: { ...process.env, HOME: home ?? tmp, PATH: `${bin}:${process.env.PATH}`, MIU_SANDBOX_USER: 'ubuntu', MIU_SANDBOX_WORKER: worker ?? WORKER, TMPDIR: fs.mkdtempSync(path.join(tmp, 'run-')), MIU_CI_SLOTS_DIR: fs.mkdtempSync(path.join(tmp, 'slots-')), MIU_CI_FREE_MEM_GB: '20', MIU_CI_MIRRORS_CONF: path.join(tmp, 'no-deploy-keys'), MIU_CI_APPLY_LOCKS: path.join(tmp, 'no-apply.lock'), MIU_CI_RUNNER_UID: String(process.getuid()), MIU_CI_SECRET_NAMES: namesList('acme/r SLACK_WEBHOOK\n'), MIU_CI_SECRET_NAMES_OWNER: SELF, MIU_CI_NET_STAMP: netStamp(), MIU_CI_NET_STAMP_OWNER: String(process.getuid()) },
     sudoArgv: () => fs.readFileSync(path.join(bin, 'sudo-argv'), 'utf8').trim().split('\n'),
     sudoAll: () => fs.readFileSync(path.join(bin, 'sudo-all'), 'utf8').trim().split('\n'),
     curl: (f) => { try { return fs.readFileSync(path.join(bin, `curl-${f}`), 'utf8'); } catch { return ''; } },
@@ -67,7 +71,7 @@ function sandboxHome({ stdout = '{"ok":true,"cells":[{"label":"a","status":"pass
   const home = fs.mkdtempSync(path.join(tmp, 'home-'));
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
-  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\ncat > "${home}/stdin"\necho "$TMPDIR" > "${home}/tmpdir"\nproject="$6"\necho "$project" > "${home}/project"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | LC_ALL=C sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
+  script(sb, `if [ "$2" = plan ]; then echo '${plan}'; exit 0; fi\nif [ "$3" = --help ]; then exit 0; fi\nprintf '%s\\n' "$@" > "${home}/argv"\ncat > "${home}/stdin"\necho "$TMPDIR" > "${home}/tmpdir"\nproject="$6"\necho "$project" > "${home}/project"\nfind "$project" -path "$project/.git" -prune -o -type f -print | sed "s#^$project/##" | LC_ALL=C sort > "${home}/files"\ngit -C "$project" rev-parse --is-inside-work-tree > "${home}/git"\ncat "$XDG_CONFIG_HOME/act/actrc" > "${home}/actrc"\necho '${stdout}'`);
   return { home, read: (f) => fs.readFileSync(path.join(home, f), 'utf8').trim() };
 }
 
@@ -111,8 +115,41 @@ test('the worker runs the commit on this server and never asks for deploy steps'
 test('jobs do not get the Docker socket, and a committed .actrc is ignored', async () => {
   const sandbox = sandboxHome();
   await runSandboxCi(check, repo({ '.actrc': '--privileged\n' }), server({ home: sandbox.home }).env);
-  assert.equal(sandbox.read('actrc'), '--container-daemon-socket=-');
+  // An act that restricts container options without the socket is told the worker's own policy decides (bin/miu-sandbox-ci).
+  assert.match(sandbox.read('actrc'), /^--container-daemon-socket=-(\n--container-options-policy=allow)?\n--network=miu-ci\n--no-cache-server$/);
   assert.doesNotMatch(sandbox.read('files'), /actrc/);
+});
+
+test('a job runs on the CI network only while root\'s stamp names it, and is not run otherwise', needsYaml, async () => {
+  const cases = [
+    ['no stamp', { MIU_CI_NET_STAMP: path.join(tmp, 'no-such-stamp') }, /refused: the CI network miu-ci is not set up/],
+    ['a stamp for another network', { MIU_CI_NET_STAMP: netStamp('0'.repeat(64)) }, /its stamp names another network/],
+    ['a stamp others can write', { MIU_CI_NET_STAMP: netStamp(NET_ID, 0o666) }, /its stamp is not root's own/],
+    ['a stamp of another account', { MIU_CI_NET_STAMP_OWNER: String(process.getuid() + 1) }, /its stamp is not root's own/],
+  ];
+  for (const [name, env, why] of cases) {
+    const sandbox = sandboxHome();
+    const r = await runSandboxCi(check, repo(), { ...server({ home: sandbox.home }).env, ...env });
+    assert.match(r.notRun ?? '', why, `${name}: ${JSON.stringify(r)}`);
+    assert.equal(fs.existsSync(path.join(sandbox.home, 'argv')), false, `${name}: Sandbox was not called`);
+  }
+  // A docker that has no such network: the stamp names nothing there.
+  const sandbox = sandboxHome();
+  const s = server({ home: sandbox.home });
+  const bin = s.env.PATH.split(':')[0];
+  script(path.join(bin, 'docker'), 'exit 0');
+  const r = await runSandboxCi(check, repo(), s.env);
+  assert.match(r.notRun ?? '', /its stamp names another network/, JSON.stringify(r));
+});
+
+test('a job with services stays on the host network, said in a note, since act gives it a network of its own', needsYaml, async () => {
+  const sandbox = sandboxHome();
+  const wf = 'jobs:\n  a:\n    runs-on: ubuntu-latest\n    needs: db\n    steps: [{ run: id }]\n  db:\n    runs-on: ubuntu-latest\n    services:\n      pg:\n        image: postgres:16-alpine\n        ports: ["5433:5432"]\n    steps: [{ run: id }]\n';
+  // Without a stamp: a job with services does not need one.
+  const r = await runSandboxCi(check, repo({ '.github/workflows/test.yml': wf }), { ...server({ home: sandbox.home }).env, MIU_CI_NET_STAMP: path.join(tmp, 'no-such-stamp') });
+  assert.equal(r.status, 0, JSON.stringify(r));
+  assert.doesNotMatch(sandbox.read('actrc'), /--network|--no-cache-server/);
+  assert.match(r.log, /^Note: job db has services, so it ran on this server's own network, not on miu-ci/m);
 });
 
 test('every job container is capped and kept in miu-ci.slice', async () => {
@@ -246,7 +283,8 @@ inspect) if [ "$4" = mine ]; then cat "${sandbox.home}/project"; else echo /some
 rm) echo "$3" >> "${log}" ;;
 esac`;
   await runSandboxCi(check, repo(), server({ home: sandbox.home, docker }).env);
-  assert.equal(fs.readFileSync(log, 'utf8').trim(), 'mine');
+  // The run's own node probe (named for it) goes too, whether or not it ran.
+  assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n').filter((n) => !/^miu-probe-miu-ci\.\w+$/.test(n)), ['mine']);
 });
 
 test('the cleanup removes what root-run containers wrote, as root in the runner image', async () => {
@@ -597,11 +635,11 @@ test('only a job the base branch runs the same way lends a job its reach', async
   const got = [];
   const ci = createCi({
     dir: fs.mkdtempSync(path.join(tmp, 'line-')), parse: (files) => files.map((f) => ({ path: f.path, doc: JSON.parse(f.text) })),
-    prepare: async () => ({ gitDir: '/bare', sha: 'a'.repeat(40), runSha: 'b'.repeat(40), trustedSha: 'c'.repeat(40), workflows: [wf({ test: job, release: job })], baseWorkflows: [wf({ test: job }), { path: '.github/workflows/release.yml', text: JSON.stringify({ on: { push: { tags: ['*'] } }, jobs: { release: job } }) }] }),
+    prepare: async () => ({ gitDir: '/bare', sha: 'a'.repeat(40), runSha: 'b'.repeat(40), trustedSha: 'c'.repeat(40), workflows: [wf({ test: job, build: job })], baseWorkflows: [wf({ test: job }), { path: '.github/workflows/release.yml', text: JSON.stringify({ on: { push: { tags: ['*'] } }, jobs: { build: job } }) }] }),
     runJob: (c, d, s, o) => { got.push([c.sandbox_ci.job, o.trustedRef]); return new Promise(() => {}); },
   });
   ci.ensure('o/r', 1, 'a'.repeat(40)); await new Promise((r) => setTimeout(r, 50));
-  assert.deepEqual(Object.fromEntries(got), { test: 'c'.repeat(40), release: null });
+  assert.deepEqual(Object.fromEntries(got), { test: 'c'.repeat(40), build: null });
 });
 
 test('a pull request\'s workflow may name only the CI secrets its base branch\'s workflows name', needsYaml, async () => {
@@ -1068,6 +1106,7 @@ function keyedRun() {
   const sb = path.join(home, 'sandbox/sb-src/sb');
   fs.mkdirSync(path.dirname(sb), { recursive: true });
   script(sb, `if [ "$2" = plan ]; then echo '{"jobs":[{"id":"php","cells":[{"matrix":{}}]}]}'; exit 0; fi
+if [ "$3" = --help ]; then exit 0; fi
 project="$6"; cat > /dev/null
 cp "$project/.env" "${home}/env" 2>/dev/null || true
 cp "$project/composer.lock" "${home}/lock" 2>/dev/null || true

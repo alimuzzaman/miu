@@ -20,7 +20,8 @@ import net from 'node:net';
 import { recordRefusal, refusalIn } from '../lib/authrefused.mjs';
 import { forPr, readStore, writeRunWaivers, memberMatcher } from '../lib/waivers.mjs';
 import { validate, computeVerdict, renderComment, renderFull, loadLedger, screenshots, forMember, openCells } from '../lib/report.mjs';
-import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, LABELS, setLabelNames, noteLocalImages } from '../lib/publish.mjs';
+import { retestBase, filesSeenBy, perFile } from '../lib/retestbase.mjs';
+import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, partnerSettled, LABELS, setLabelNames, noteLocalImages } from '../lib/publish.mjs';
 import { runAgent } from '../lib/agent.mjs';
 import { engineOf, ENGINES } from '../lib/engines.mjs';
 import { authFor, applyAuth, scrub, secrets, readSecret } from '../lib/connections.mjs';
@@ -39,7 +40,10 @@ import { sudoRunner } from '../lib/prstackctl.mjs';
 import { withRex } from '../lib/rexmcp.mjs';
 import { fetchRef, checkoutSlot, checkoutCheckSlot, checkSiblings, freeDirFor, ensureDeps, checkEnv, CACHE } from '../lib/worktrees.mjs';
 import { runSandboxCi } from '../lib/sandboxci.mjs';
-import { ensureSites, mount, reset, setConstants, writeGuardHosts, GUARD } from '../lib/warmsites.mjs';
+import { readCiRecord } from '../lib/ci.mjs';
+import { ciBlock, ciEntries, savePending, commentId } from '../lib/cicomment.mjs';
+import { ensureSites, mount, reset, setConstants, writeGuardHosts, GUARD, SITES } from '../lib/warmsites.mjs';
+import { LANE, qasiteShim } from '../lib/lane.mjs';
 import { project, projectText, profileOf, roles, mainFile } from '../lib/project.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -151,35 +155,14 @@ if (prior.length || humanQa.length) {
 // and context, which is not the PR's own change.
 // --full (or "/miu retest full") tests everything again.
 let retest = null;
-const perFile = (patch) => {
-  const m = new Map();
-  for (const part of patch.split(/^(?=diff --git )/m)) { const f = part.match(/^diff --git a\/(\S+) b\/(\S+)/); if (f) m.set(f[2], part.split('\n').filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---) /.test(l))); }
-  return m;
-};
-// A pair's other PRs count too: their files go in as "<repo>:<path>".
-const withPartners = (m, dir) => {
-  const pd = path.join(dir, 'context/pair');
-  for (const f of fs.existsSync(pd) ? fs.readdirSync(pd).filter((x) => x.endsWith('.patch')) : []) {
-    for (const [k, v] of perFile(fs.readFileSync(path.join(pd, f), 'utf8'))) m.set(`${f.replace(/-\d+\.patch$/, '')}:${k}`, v);
-  }
-  return m;
-};
-const pairSig = (dir) => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'context/pair.json'), 'utf8')).map((x) => `${x.repo}#${x.number}@${x.headRefOid}`).sort().join(','); } catch { return ''; } };
-const pairNow = pairList.map((x) => `${x.repo}#${x.number}@${x.headRefOid}`).sort().join(',');
+// A pair's other PRs count too: their files go in as "<repo>:<path>". The
+// earlier run may be a paired run of another PR this one was a member of
+// (lib/retestbase.mjs).
 if (!flag('--full')) {
-  const runsDir = path.dirname(runDir);
-  const prev = fs.readdirSync(runsDir).map((d) => path.join(runsDir, d)).filter((d) => d !== runDir).map((d) => {
-    try {
-      const p = JSON.parse(fs.readFileSync(path.join(d, 'context/pr.json'), 'utf8'));
-      const v = JSON.parse(fs.readFileSync(path.join(d, 'verdict.json'), 'utf8'));
-      // The same commit counts only when a PR of the pair moved since.
-      if (p.url !== prData.url || (p.headRefOid === sha && pairSig(d) === pairNow) || v.verdict === 'inconclusive' || v.verdict === 'no_result' || !fs.existsSync(path.join(d, 'results.json'))) return null;
-      return { dir: d, sha: p.headRefOid, round: v.round ?? 1, at: fs.statSync(path.join(d, 'verdict.json')).mtimeMs };
-    } catch { return null; }
-  }).filter(Boolean).sort((a, b) => b.at - a.at)[0];
+  const prev = retestBase(path.dirname(runDir), runDir, { key: selfKey, sha, pair: pairList });
   if (prev) {
-    const then = withPartners(perFile(fs.readFileSync(path.join(prev.dir, 'context/diff.patch'), 'utf8')), prev.dir);
-    const now = withPartners(perFile(fs.readFileSync(path.join(ctx, 'diff.patch'), 'utf8')), runDir);
+    const then = filesSeenBy(prev.dir, selfKey);
+    const now = filesSeenBy(runDir, selfKey);
     const same = (a = [], b = []) => a.length === b.length && a.every((l, k) => l === b[k]);
     const changedFiles = [...new Set([...then.keys(), ...now.keys()])].filter((f) => !same(then.get(f), now.get(f)));
     const delta = (f) => { const a = then.get(f) ?? [], b = now.get(f) ?? [], A = new Set(a), B = new Set(b); return b.filter((l) => !A.has(l)).length + a.filter((l) => !B.has(l)).length; };
@@ -377,6 +360,14 @@ const members = [
     return { key: keyOf(p), repo: p.repo, pr: p.number, sha: p.headRefOid, label: p.label, round: r };
   })),
 ];
+// A settled partner (lib/publish.mjs partnerSettled) is tested as code only:
+// the run never writes a status, a label or a comment to it.
+for (const m of members.slice(1)) {
+  try { m.readOnly = partnerSettled(await getLabels(m.repo, m.pr)); }
+  catch (e) { m.readOnly = true; log(`labels not read on ${m.key}, so the run leaves it alone:`, e.message.split('\n')[0]); }
+  if (m.readOnly) log(`${m.key}: has a person's result or a test running, so this run tests its code and writes nothing to it`);
+}
+const writable = members.filter((m) => !m.readOnly);
 // Findings people waived on these PRs before the round (lib/waivers.mjs),
 // taken now: a waiver given while the round runs counts from the next one.
 const waiverStore = readStore(path.join(path.dirname(runDir), '.waivers.json'));
@@ -386,7 +377,7 @@ if (waivers.waivers.length) { write('waivers.json', waivers.waivers.map(({ id, k
 const labelsBefore = {};
 if (!dryRun) await withAppToken(async (asApp) => {
   log(`github: writing as ${asApp ? 'the Miu App' : 'the local gh login'}`);
-  for (const m of members) {
+  for (const m of writable) {
     try { await setStatus({ repo: m.repo, sha: m.sha, verdict: 'pending', url: runUrl }); } catch (e) { log(`status not set on ${m.key}:`, e.message.split('\n')[0]); }
     try {
       labelsBefore[m.key] = await getLabels(m.repo, m.pr);
@@ -395,7 +386,7 @@ if (!dryRun) await withAppToken(async (asApp) => {
     } catch (e) { log(`labels not changed on ${m.key}:`, e.message.split('\n')[0]); }
   }
   // The first entry keeps the old shape the dashboard's stop button reads.
-  fs.writeFileSync(path.join(runDir, 'labels-before.json'), JSON.stringify({ repo, pr, labels: labelsBefore[selfKey] ?? [], members: members.map((m) => ({ repo: m.repo, pr: m.pr, labels: labelsBefore[m.key] ?? [] })) }));
+  fs.writeFileSync(path.join(runDir, 'labels-before.json'), JSON.stringify({ repo, pr, labels: labelsBefore[selfKey] ?? [], members: writable.map((m) => ({ repo: m.repo, pr: m.pr, labels: labelsBefore[m.key] ?? [] })) }));
 }, log);
 
 // ---------------------------------------------------------------- 3. prepare
@@ -412,7 +403,8 @@ const depsEnv = { ...(await gh.composerAuthEnv(repo).catch(() => ({}))), ...proc
 const gitFallback = await gh.gitAuthEnv(repo, { fallback: true }).catch(() => null);
 const depsFallback = await gh.composerAuthEnv(repo, { fallback: true }).catch(() => null);
 
-// Worktrees are shared by every run, so only one run may use them at a time.
+// Worktrees are shared by every run in a lane, so only one run per lane may
+// use them at a time (lib/lane.mjs: another lane has its own).
 const lockFile = path.join(CACHE, 'run.lock');
 fs.mkdirSync(CACHE, { recursive: true });
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
@@ -426,6 +418,7 @@ if (!takeLock()) {
   if (!takeLock()) { console.error('Another QA run took the worktrees just now.'); process.exit(3); }
 }
 process.on('exit', () => { try { if (Number(fs.readFileSync(lockFile, 'utf8')) === process.pid) fs.rmSync(lockFile); } catch { /* gone */ } });
+if (LANE) log(`lane ${LANE}: worktrees in ${CACHE}, QA sites ${SITES.pr} and ${SITES.dev}`);
 
 const builds = [];
 const slotInfo = {};
@@ -590,7 +583,7 @@ if (mode === 'full') {
         if (needHub) qaSites[w].hub = hubUrl(w);
       }
       write('sites.json', qaSites);
-      log(`rexenv: sites ready in ${((Date.now() - t0) / 1000).toFixed(1)}s, qa-pr.rex runs ${Object.values(qaSites.pr.runs).join(' + ')}, qa-dev.rex runs ${Object.values(qaSites.dev.runs).join(' + ')}`);
+      log(`rexenv: sites ready in ${((Date.now() - t0) / 1000).toFixed(1)}s, ${SITES.pr} runs ${Object.values(qaSites.pr.runs).join(' + ')}, ${SITES.dev} runs ${Object.values(qaSites.dev.runs).join(' + ')}`);
     }
   } catch (e) {
     infra.push({ what: `rexenv is not ready: ${e.message}`, impact: 'no test site', blocking: true });
@@ -728,7 +721,7 @@ for (const [name, target] of [['qa-evidence', 'bin/qa-evidence'], ['hubenv', pat
   // qasite changes the QA sites, which belong to Miu's account: the agent
   // account reaches it only through its one sudo rule (lib/agentuser.mjs).
   const exe = AGENT_USER && name === 'qasite' ? AGENT_QASITE : path.join(ROOT, target);
-  fs.writeFileSync(path.join(binDir, name), `#!/usr/bin/env bash\nexec "${exe}" "$@"\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(binDir, name), name === 'qasite' ? qasiteShim(exe) : `#!/usr/bin/env bash\nexec "${exe}" "$@"\n`, { mode: 0o755 });
 }
 
 // Something the test needs is not there (a build, rexenv, a Hub, the AI
@@ -983,11 +976,17 @@ for (const m of memberResults) {
 }
 fs.writeFileSync(path.join(runDir, 'verdict.json'), JSON.stringify({
   verdict: own.verdict, round, problems, mode, reportUrl, model: raw.model,
-  ...(pairList.length ? { pair_verdict: verdict, members: memberResults.map(({ key, repo: r, pr: n, sha: h, label, round: rd, verdict: v, comment: c }) => ({ key, repo: r, pr: n, sha: h, label, round: rd, verdict: v, comment: c })) } : {}),
+  ...(pairList.length ? { pair_verdict: verdict, members: memberResults.map(({ key, repo: r, pr: n, sha: h, label, round: rd, verdict: v, comment: c, readOnly }) => ({ key, repo: r, pr: n, sha: h, label, round: rd, verdict: v, comment: c, ...(readOnly ? { read_only: true } : {}) })) } : {}),
 }, null, 2));
 log(`verdict ${own.verdict}${pairList.length ? ` (pair ${verdict}: ${memberResults.map((m) => `${m.label} #${m.pr} ${m.verdict}`).join(', ')})` : ''}, ${problems.length} downgrade(s), report ${reportUrl}`);
 
 // ---------------------------------------------------------------- 7. publish
+// The CI of every pull request of the run (lib/ci.mjs, run by the dashboard
+// beside this run), as each comment's CI section. Still going: the dashboard
+// edits the same comments when it is done (lib/cicomment.mjs).
+const CI_DIR = path.join(path.dirname(runDir), '.ci');
+const ciMembers = memberResults.map((m) => ({ label: m.label ?? m.repo.split('/')[1], repo: m.repo, pr: m.pr, sha: m.sha }));
+const ciNow = ciBlock(ciEntries(ciMembers, (r, n, h) => readCiRecord(CI_DIR, r, n, h)));
 if (!dryRun) await withAppToken(async (asApp) => {
   // Every PR of the run, each step on its own (lib/publish.mjs postMember): a
   // failure in one must not stop the others, and the labels always move off
@@ -995,9 +994,10 @@ if (!dryRun) await withAppToken(async (asApp) => {
   // nothing to judge (no criteria of its own or shared) gets its labels back.
   const posted = [];
   for (const m of memberResults) {
+    if (m.readOnly) { log(`${m.key}: settled partner, nothing posted`); continue; }
     // An image that did not reach Cloudinary is a note on GitHub, not a broken link.
     const gone = (f) => (!fs.existsSync(path.join(runDir, 'evidence', f)) ? 'it was not saved during the run' : cloudinaryUrl() ? 'the upload failed' : 'Cloudinary is not set up');
-    const r = await postMember({ repo: m.repo, pr: m.pr, sha: m.sha, round: m.round, comment: noteLocalImages(m.body, gone), fullMd: noteLocalImages(fullMd, gone), note, verdict: m.verdict, results: m.results, before: labelsBefore[m.key] ?? [], log });
+    const r = await postMember({ repo: m.repo, pr: m.pr, sha: m.sha, round: m.round, comment: noteLocalImages(m.body, gone), fullMd: noteLocalImages(fullMd, gone), note, verdict: m.verdict, results: m.results, before: labelsBefore[m.key] ?? [], ci: ciNow.text, log });
     if (r.failed) process.exitCode = 1;
     if (r.stale) log(`${m.key}: head moved to ${r.now.slice(0, 7)} during the run`);
     if (r.url) log(`posted ${r.url}`);
@@ -1005,6 +1005,10 @@ if (!dryRun) await withAppToken(async (asApp) => {
     posted.push({ key: m.key, repo: m.repo, pr: m.pr, url: r.url, verdict: m.verdict, stale: r.stale, tested: m.sha, now: r.now, labels: r.labels });
   }
   const mine = posted[0];
+  if (ciNow.pending) {
+    try { savePending(path.join(path.dirname(runDir), '.ci-comments'), path.basename(runDir), { members: ciMembers, text: ciNow.text, comments: posted.filter((x) => commentId(x.url)).map((x) => ({ repo: x.repo, id: commentId(x.url), fallback: !asApp })) }); log('ci: still running; the dashboard updates the comments\' CI section when it finishes'); }
+    catch (e) { log(`ci: the comments' CI section will not be updated: ${e.message}`); }
+  }
   if (mine.url) {
     fs.writeFileSync(path.join(runDir, 'posted.json'), JSON.stringify({ url: mine.url, at: new Date().toISOString(), as: asApp ? 'Miu App' : 'local gh login', verdict: own.verdict, stale: mine.stale, tested: sha, now: mine.now, report: note?.url ?? null, ...(pairList.length ? { members: posted } : {}) }, null, 2));
     if (flag('--slack')) { try { const r = await notify({ verdict: own.verdict, repo, pr, title: prData.title, round, url: mine.url, stale: mine.stale }); log(r.ok ? 'slack: notice sent' : `slack: ${r.skipped}`); } catch (e) { log(`slack failed: ${e.message}`); } }

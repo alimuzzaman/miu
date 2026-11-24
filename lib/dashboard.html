@@ -666,7 +666,21 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const md = (s) => window.marked ? marked.parse(s ?? '') : '<pre>' + esc(s) + '</pre>';
 const VERDICT = { ok: 'Found OK', partial: 'Found partially OK', not_ok: 'Found NOT OK', inconclusive: 'No result', no_result: 'No result', already_fixed: 'Already fixed on dev', bugs: 'Reported bugs' };
 const VERDICT_P = { ok: 'No release blocker. Majors, failed and unproven claims, if any, are listed with it.', partial: 'The core works, but a claim failed or an issue turned up.', not_ok: 'A blocker turned up.', inconclusive: 'The run wrote no claims (an old run, from before every verdict needed evidence). Test it again.', no_result: 'No usable evidence (no claims, or none proven either way), so there is no verdict. It runs again.', already_fixed: 'The bug is gone on dev already, and a change there fixed it. The author was asked to close this PR if nothing in it is still needed.' };
-const STATE = { running: 'Test running', done: 'Finished', waiting: 'Waiting', stalled: 'No activity for 20 minutes', stopped: 'Stopped', conflict: 'Not tested: merge conflict or already in dev' };
+const STATE = { running: 'Test running', done: 'Finished', waiting: 'Waiting', stalled: 'No activity for 20 minutes', stopped: 'Stopped', conflict: 'Not tested: merge conflict' };
+// A run's state in words. A conflict run is one of two things; say which.
+const stateOf = (r) => (r.state === 'conflict' && (r.conflictKind || r.conflict?.kind) === 'already_in_base' ? 'Not tested: already in ' + (r.conflict?.base || 'dev') : STATE[r.state] || r.state);
+// Why a run that ended without a verdict has none, from what the run recorded.
+function noVerdictText(st) {
+  const c = st.conflict;
+  if (st.state === 'conflict' && c?.kind === 'already_in_base') return 'Not tested. Everything in this pull request' + (c.sha ? ' (at ' + c.sha.slice(0, 7) + ')' : '') + ' is already in ' + (c.base || 'dev') + ', so merging it changes nothing. Use Test anyway in the pull request list to test it regardless.';
+  if (st.state === 'conflict') {
+    const f = c?.files || [];
+    return 'Not tested. Merging this pull request' + (c?.sha ? ' (at ' + c.sha.slice(0, 7) + ')' : '') + ' into ' + (c?.base || 'dev') + ' conflicts' + (f.length ? ' in ' + f.length + ' file' + (f.length > 1 ? 's' : '') + ': ' + f.slice(0, 10).join(', ') + (f.length > 10 ? ' and ' + (f.length - 10) + ' more' : '') : '') + '. Miu asked the author to resolve it, and tests again after the next push. Use Test anyway in the pull request list to test the branch as it is.';
+  }
+  if (st.state === 'stopped') return st.crashed ? 'The run stopped before it wrote a verdict (it ended on its own; the run log has the last step). Press Test to run it again.' : 'The run was stopped from the dashboard before it wrote a verdict.';
+  if (st.state === 'stalled') return 'The run has had no activity for 20 minutes and wrote no verdict. Press Test to run it again.';
+  return 'The run ended without a verdict. Press Test to run it again.';
+}
 // MIU (set by the server above this script): { owner, repos: [{ full, name, label, role }] }.
 const REPO = Object.fromEntries(MIU.repos.map((r) => [r.name, r.label]));
 const I = {
@@ -779,7 +793,7 @@ document.addEventListener('scroll', (e) => { if (e.target.id === 'side') syncSid
 function showPop(el) {
   const r = ui.runs.find((x) => x.name === el.dataset.pop);
   if (!r) return;
-  const pill = r.state === 'running' ? '<span class="pill running"><span class="spin" style="width:10px;height:10px"></span>Test running</span>' : '<span class="pill ' + esc(r.verdict || r.state) + '">' + esc(r.verdict ? VERDICT[r.verdict] : STATE[r.state]) + '</span>';
+  const pill = r.state === 'running' ? '<span class="pill running"><span class="spin" style="width:10px;height:10px"></span>Test running</span>' : '<span class="pill ' + esc(r.verdict || r.state) + '">' + esc(r.verdict ? VERDICT[r.verdict] : stateOf(r)) + '</span>';
   $('#pop').innerHTML = '<div class="h"><b>' + esc(r.title) + '</b><span>' + ago(r.mtime) + '</span></div>' + pill +
     '<div class="row">' + I.chat + esc(REPO[repoOf(r.repo)] || '') + ' #' + esc(r.number) + (r.model ? ', ' + esc(models(r.model)) : '') + '</div>' +
     (r.author ? '<div class="row">' + avatar(r.author, null, 'av-sm') + esc(r.author) + '</div>' : '') +
@@ -1662,12 +1676,12 @@ function prRow(p) {
     // One quiet menu for the line: start it, hold it, move it, or take it out.
     action = (p.waits === 'manual' || p.waits === 'held' ? '<button class="btn primary" data-startone="' + id + '" title="Start this test now, with its CI">Start</button>' : '') + queueMenu(id, pos, n, p.waits);
   }
-  else if (p.state === 'stale') { lab = '<span class="v stale">New commits</span><small>last test: ' + esc(run.verdict ? VERDICT[run.verdict] : STATE[run.state]) + '</small>'; action = (run.verdict && !['inconclusive', 'no_result'].includes(run.verdict) ? '<button class="btn" data-test="' + id + '" data-full="1" title="Test every claim again, not only what changed">Full test</button><button class="btn primary" data-test="' + id + '" title="Test what changed since the last round, plus regressions">Test changes</button>' : '<button class="btn primary" data-test="' + id + '">Test</button>'); }
+  else if (p.state === 'stale') { lab = '<span class="v stale">New commits</span><small>last test: ' + esc(run.verdict ? VERDICT[run.verdict] : stateOf(run)) + '</small>'; action = (run.verdict && !['inconclusive', 'no_result'].includes(run.verdict) ? '<button class="btn" data-test="' + id + '" data-full="1" title="Test every claim again, not only what changed">Full test</button><button class="btn primary" data-test="' + id + '" title="Test what changed since the last round, plus regressions">Test changes</button>' : '<button class="btn primary" data-test="' + id + '">Test</button>'); }
   else if (p.state === 'tested_by_person') { const r = p.qa.lastPerson; lab = '<span class="v ' + esc(r.verdict) + '">' + esc(r.kind === 'label' ? (r.verdict === 'ok' ? 'Ready for merge' : 'Reported bugs') : (VERDICT[r.verdict] || 'Tested')) + '</span><small>by ' + esc(r.by) + ', ' + ago(Date.parse(r.at)) + (r.url ? ' · <a href="' + esc(r.url) + '" target="_blank" rel="noopener" data-ext>report</a>' : r.kind === 'label' ? ' · label' : '') + '</small>'; action = '<button class="btn" data-test="' + id + '" title="Miu tests it as well">Test with Miu</button>'; }
   else if (p.state === 'retest') { lab = '<span class="v stale">Needs re-test</span><small>' + esc(p.why || '') + '</small>'; action = (run?.verdict && !['inconclusive', 'no_result'].includes(run.verdict) ? '<button class="btn" data-test="' + id + '" data-full="1" title="Test every claim again">Full test</button><button class="btn primary" data-test="' + id + '" title="Test what changed since the last round, plus regressions">Test changes</button>' : '<button class="btn primary" data-test="' + id + '">Test</button>'); }
   else if (p.state === 'person_testing') { lab = '<span class="v running">Being tested</span><small>' + esc(p.why || 'by a person') + '</small>'; action = '<button class="btn" data-test="' + id + '" data-force="1" title="Miu tests it as well">Test anyway</button>'; }
   else if (p.state === 'conflict' && p.run?.conflictKind === 'already_in_base') { lab = '<span class="v already_fixed">Already in dev</span><small>merging it changes nothing</small>'; action = '<button class="btn" data-test="' + id + '" data-force="1">Test anyway</button>'; }
-  else if (p.state === 'conflict') { lab = '<span class="v stale">Merge conflict</span><small>the author was asked to rebase</small>'; action = '<button class="btn" data-test="' + id + '" data-force="1" title="Test this commit even though it does not merge cleanly">Test anyway</button>'; }
+  else if (p.state === 'conflict') { const cf = p.run?.conflictFiles || []; lab = '<span class="v stale">Merge conflict</span><small>' + (cf.length ? 'in ' + esc(cf[0]) + (cf.length > 1 ? ' and ' + (cf.length - 1) + ' more' : '') + '; ' : '') + 'the author was asked to rebase</small>'; action = '<button class="btn" data-test="' + id + '" data-force="1" title="Test this commit even though it does not merge cleanly">Test anyway</button>'; }
   else if (p.state === 'in_pair') { lab = '<span class="v running">In ' + esc(p.why) + '\'s test</span><small>tested together, one run</small>'; action = ''; }
   else if (p.state === 'waiting') { lab = '<span class="v waiting">Waiting</span><small>' + esc(p.why || 'something the test needs is missing') + '</small>'; action = '<button class="btn" data-test="' + id + '" title="Try again now">Try again</button>'; }
   else if (p.state === 'skipped') { lab = '<span class="v skipped">' + esc(p.skip) + '</span><small>not tested on its own</small>'; action = '<button class="btn" data-test="' + id + '">Test anyway</button>'; }
@@ -1842,7 +1856,7 @@ function summaryTab(d) {
     // Waiting: the run did not start testing; say exactly what it waits for.
     if (st.state === 'waiting') return '<div class="verdict"><div class="big v waiting">Waiting</div><p>Miu did not start testing, because something the test needs is missing. Without it the claims could only end unproven. Nothing was posted and the labels went back. It runs again on its own within an hour, or press Test once it is fixed.</p><ul class="waitlist">' + (st.waiting?.reasons || []).map((r) => '<li>' + esc(r) + '</li>').join('') + '</ul>' + (() => { const pr = d.pr || {}; const prev = (ui.runs || []).find((r) => r.name !== d.name && r.number === pr.number && (pr.url || '').includes('/' + (r.repo || '').split('/')[1] + '/') && r.verdict); return prev ? '<p>The last result for this pull request: <a href="#' + esc(prev.name) + '">' + esc(VERDICT[prev.verdict] || prev.verdict) + '</a>.</p>' : ''; })() + '</div>';
     if (st.state === 'running') return '<div class="verdict"><div class="big v running">Test running</div><p>The result appears here when the test ends. So far ' + d.activity.filter((a) => a.kind === 'tool').length + ' commands, ' + d.evidence.length + ' pieces of evidence and ' + d.shots.length + ' screenshots.</p></div>';
-    return '<div class="verdict"><div class="big v ' + esc(st.verdict || st.state) + '">' + esc(st.verdict ? VERDICT[st.verdict] : STATE[st.state]) + '</div><p>' + esc(VERDICT_P[st.verdict] || 'The agent wrote no results.') + '</p></div>';
+    return '<div class="verdict"><div class="big v ' + esc(st.verdict || st.state) + '">' + esc(st.verdict ? VERDICT[st.verdict] : stateOf(st)) + '</div><p>' + esc(VERDICT_P[st.verdict] || noVerdictText(st)) + '</p></div>';
   }
   const pass = s.claims.filter((c) => c.state === 'pass').length, fail = s.claims.filter((c) => c.state === 'fail').length, open = s.claims.filter((c) => c.state === 'open').length;
   const cited = new Set([...s.claims.flatMap((c) => [...c.evidence, ...(c.before || [])]), ...s.issues.flatMap((i) => i.evidence)]);
@@ -1884,7 +1898,7 @@ function runPicker(d) {
   if (all.length < 2) return '';
   const n = all.length;
   const when = (t) => new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  const label = (r, i) => 'Run ' + (n - i) + ' of ' + n + ', ' + (r.state === 'running' ? 'running' : r.verdict ? VERDICT[r.verdict] : STATE[r.state] || r.state) + ', ' + when(r.mtime);
+  const label = (r, i) => 'Run ' + (n - i) + ' of ' + n + ', ' + (r.state === 'running' ? 'running' : r.verdict ? VERDICT[r.verdict] : stateOf(r)) + ', ' + when(r.mtime);
   // The dashboard's own dropdown (customSelect), like every other choice here.
   return '<span class="runpick">' + customSelect({ attrs: 'data-runpick', value: d.name, options: all.map((r, i) => ({ id: r.name, label: label(r, i), short: 'Run ' + (n - i) + ' of ' + n })), label: 'Runs of this pull request' }) + '</span>';
 }
@@ -1928,7 +1942,23 @@ function ciJob(c, j) {
   const note = j.status === 'queued' ? (c.paused ? 'the queue is paused' : j.place ? ord(j.place) + ' in the CI line' : 'in the CI line') + (j.waitReason ? '; ' + j.waitReason : '') : j.reason || '';
   return '<div class="cirow"><span class="cist ' + esc(j.status) + '">' + (j.status === 'running' ? '<span class="spin" style="width:10px;height:10px"></span>' : '') + esc(CI_STATUS[j.status] || j.status) + '</span>' +
     '<span class="cil"><b>' + esc(j.label) + '</b><small>' + esc(j.workflow + (j.job ? ', job ' + j.job : '')) + (note ? ' · ' + esc(note) : '') + '</small></span>' +
-    '<span class="cid">' + esc(t) + '</span><span class="cilog">' + (j.hasLog ? '<a href="/api/ci/log?key=' + encodeURIComponent(c.key) + '&n=' + j.n + '" target="_blank" rel="noopener" data-ext>Log</a>' : '') + '</span></div>';
+    '<span class="cid">' + esc(t) + '</span><span class="cilog">' + (j.hasLog ? '<a href="/api/ci/log?key=' + encodeURIComponent(c.key) + '&n=' + j.n + '" target="_blank" rel="noopener" data-ext>Log</a>' : '') + '</span></div>' + ciTests(j);
+}
+// The failing tests the worker read from the job's own test report (the log keeps only its tail).
+function ciTests(j) {
+  const t = j.tests;
+  if (!t || (!t.failed?.length && !t.total)) return '';
+  const count = t.failedCount ?? t.failed.length;
+  const head = (t.total ? (t.passed ?? 0) + ' of ' + t.total + ' tests passed' : '') + (count ? (t.total ? ', ' : '') + count + ' failed' : '');
+  return '<div class="h" style="margin:0 0 8px 12px">' + esc(head) + (t.failed?.length ? '<ul style="margin:4px 0 0 16px;padding:0">' + t.failed.map((f) => '<li><span class="mono">' + esc(f.name) + '</span>' + (f.file ? ' <small>' + esc(f.file) + '</small>' : '') + (f.message ? '<br><small>' + esc(f.message) + '</small>' : '') + '</li>').join('') + (count > t.failed.length ? '<li>and ' + (count - t.failed.length) + ' more</li>' : '') + '</ul>' : '') + '</div>';
+}
+// A paired pull request's CI (Free, Pro, Hub), each at its own head.
+function ciLinked(c, x) {
+  const s = x.summary;
+  const line = { not_started: 'CI has not started for this commit yet.', detecting: 'Reading the workflows…', none: 'No PR CI in this repo. ' + (x.reason || ''), not_run: 'CI did not run: ' + (x.reason || 'unknown reason') }[x.state]
+    || (s && s.state === 'no_jobs' ? 'No CI job runs here for this pull request.' : s ? s.passed + ' of ' + s.total + ' passed' + (s.failed ? ', ' + s.failed + ' failed' : '') + (s.running ? ', ' + s.running + ' running' : '') + (s.queued ? ', ' + s.queued + ' queued' : '') + (s.not_run ? ', ' + s.not_run + ' not run' : '') + '.' : '');
+  return '<div class="cihead" style="margin-top:16px"><span><b>' + esc(x.label) + ' at ' + esc((x.sha || '').slice(0, 7)) + '</b>, ' + esc(line) + '</span></div>' +
+    (x.jobs && x.jobs.length ? '<div class="cijobs">' + x.jobs.map((j) => ciJob({ ...x, paused: c.paused }, j)).join('') + '</div>' : '');
 }
 function ciTab(d) {
   const c = d.ci;
@@ -1945,6 +1975,7 @@ function ciTab(d) {
   return '<div class="cihead"><span><b>CI at ' + esc(at) + '</b>, ' + esc(line + from) + '</span><span class="sp"></span>' + again +
     (c.checksUrl ? '<a class="btn" href="' + esc(c.checksUrl) + '" target="_blank" rel="noopener" data-ext title="GitHub\'s own checks, read only">GitHub checks</a>' : '') + '</div>' +
     (c.jobs && c.jobs.length ? '<div class="cijobs">' + c.jobs.map((j) => ciJob(c, j)).join('') + '</div>' : '') +
+    (c.linked || []).map((x) => ciLinked(c, x)).join('') +
     '<p class="h" style="margin-top:10px">Jobs run in Miu\'s Sandbox CI containers on this server, up to ' + esc(c.parallel) + ' at once across all pull requests, never on GitHub Actions. A pull request from this repository runs the workflows on its own branch; one from a fork or from Dependabot is not run here. A job may name only the CI secrets its job on the base branch uses, and Miu never runs a job that deploys, publishes, comments or notifies.</p>' + fast;
 }
 
@@ -1985,7 +2016,7 @@ async function renderRun(force, cached) {
   const sd = $('[data-steer-text]');
   if (sd) ui.steerDraft = { name, v: sd.value, f: document.activeElement === sd, a: sd.selectionStart, b: sd.selectionEnd };
   const st = d.status, pr = d.pr || {};
-  const pill = st.state === 'running' ? '<span class="pill running"><span class="spin" style="width:10px;height:10px"></span>Test running</span>' : '<span class="pill ' + esc(st.verdict || st.state) + '">' + esc(st.verdict ? VERDICT[st.verdict] : STATE[st.state]) + '</span>';
+  const pill = st.state === 'running' ? '<span class="pill running"><span class="spin" style="width:10px;height:10px"></span>Test running</span>' : '<span class="pill ' + esc(st.verdict || st.state) + '">' + esc(st.verdict ? VERDICT[st.verdict] : stateOf(st)) + '</span>';
   const tabs = [['summary', 'Summary'], ['report', 'Report'], ['shots', 'Screenshots', d.shots.length], ['evidence', 'Evidence', d.evidence.length], ['history', 'History'], ['ci', 'CI'], ['run', 'Run']];
   const body = (ui.tab === 'summary' ? fixCard(d) + stackCard(d) : '') + ({ summary: summaryTab, report: reportTab, shots: shotsTab, evidence: evidenceTab, history: historyTab, ci: ciTab, run: runTab }[ui.tab] || summaryTab)(d);
   const idx = Math.max(-1, ...st.reached.map((id) => d.stages.findIndex((s) => s.id === id)));
@@ -2318,7 +2349,7 @@ async function renderPrPage() {
   $('#main').innerHTML = '<div class="topbar">' + menuBtn + showSideBtn() + '<span class="title">' + esc(h?.title || 'Pull request') + '</span><span class="sub">' + esc(REPO[short] || short) + ' #' + num + '</span><span class="sp"></span><a class="btn" href="' + esc(h?.url || '#') + '" target="_blank" rel="noopener">Open PR</a></div>' +
     '<div class="scroll"><div class="wrap">' +
     (p ? '<div class="prstate">' + prRow(p) + '</div>' : '') +
-    (runs.length ? '<h3 class="h">Miu runs<small>' + runs.length + '</small></h3><div class="runlist">' + runs.map((r) => '<a class="slow" href="#' + esc(r.name) + '"><span class="dot ' + esc(r.state === 'running' ? 'running' : (r.verdict || r.state)) + '"></span><span>' + esc(r.verdict ? VERDICT[r.verdict] : STATE[r.state] || r.state) + '</span><span class="sp"></span><span class="m">' + ago(r.mtime) + '</span></a>').join('') + '</div>' : '') +
+    (runs.length ? '<h3 class="h">Miu runs<small>' + runs.length + '</small></h3><div class="runlist">' + runs.map((r) => '<a class="slow" href="#' + esc(r.name) + '"><span class="dot ' + esc(r.state === 'running' ? 'running' : (r.verdict || r.state)) + '"></span><span>' + esc(r.verdict ? VERDICT[r.verdict] : stateOf(r)) + '</span><span class="sp"></span><span class="m">' + ago(r.mtime) + '</span></a>').join('') + '</div>' : '') +
     '<h3 class="h">History<small>comments, commits, labels and reviews, oldest first</small></h3>' + timelineHtml(h) + '</div></div>';
   if (scroll) $('.scroll').scrollTop = scroll;
 }
@@ -2350,7 +2381,7 @@ function notifyFinished(runs) {
   if (lastStates && store.get('qa-notify', false) && 'Notification' in window && Notification.permission === 'granted') {
     for (const r of runs) {
       if (lastStates.get(r.name) === 'running' && r.state !== 'running') {
-        const n = new Notification((r.verdict ? VERDICT[r.verdict] : STATE[r.state]) + ': ' + (REPO[repoOf(r.repo)] || '') + ' #' + r.number, { body: r.title, tag: r.name });
+        const n = new Notification((r.verdict ? VERDICT[r.verdict] : stateOf(r)) + ': ' + (REPO[repoOf(r.repo)] || '') + ' #' + r.number, { body: r.title, tag: r.name });
         n.onclick = () => { window.focus(); location.hash = r.name; };
       }
     }

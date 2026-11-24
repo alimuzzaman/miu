@@ -12,7 +12,9 @@
 # module and import it names is there), and only then switches /srv/miu to it
 # with one rename. The CI worker (bin/miu-sandbox-ci, bin/miu-ci-mirror) goes
 # to /usr/local/lib/miu/versions/<sha>, behind the same kind of switch. Then
-# miu.service restarts.
+# miu.service restarts. A release whose bin/miu-release differs from this one
+# replaces /usr/local/lib/miu/miu-release with it after the build, and that
+# copy does the rest of the deploy.
 #
 # A restart does not stop a test or a CI job: the unit stops its main process
 # only (KillMode=process), each run keeps the release folder it started from,
@@ -53,9 +55,14 @@ BUILD_TMP=""
 trap '[ -z "$BUILD_TMP" ] || rm -rf "$BUILD_TMP"' EXIT
 CONVERTED=0
 
-# One deploy at a time.
+# One deploy at a time. A deploy handed on to the release's own copy of this
+# script (below) keeps the lock it took: fd 8 goes with the exec, and flock on
+# it again returns at once. Anything else opens the lock and waits for it.
+# MIU_RELEASE_HANDOFF only stops a second hand-on; it never skips the lock.
+HANDED_ON=${MIU_RELEASE_HANDOFF:-}
+unset MIU_RELEASE_HANDOFF
 install -d -m 0755 "$RELEASES"
-exec 8>"$RELEASES/.lock"
+[ "$(readlink /proc/self/fd/8 2>/dev/null)" = "$(readlink -f "$RELEASES/.lock")" ] || exec 8>"$RELEASES/.lock"
 flock -w 600 8 || die "another deploy holds $RELEASES/.lock"
 
 # The release /srv/miu points at, by folder name; empty before the first deploy.
@@ -254,6 +261,7 @@ worker() {
   install "${OWN[@]}" -m 0755 "$src/bin/miu-sandbox-ci" "$LIB/versions/$name/sandbox-ci"
   [ ! -f "$src/bin/miu-ci-mirror" ] || install "${OWN[@]}" -m 0755 "$src/bin/miu-ci-mirror" "$LIB/versions/$name/ci-mirror"
   [ ! -f "$src/bin/miu-pr-stack" ] || install "${OWN[@]}" -m 0755 "$src/bin/miu-pr-stack" "$LIB/versions/$name/pr-stack"
+  [ ! -f "$src/bin/miu-run-read" ] || install "${OWN[@]}" -m 0755 "$src/bin/miu-run-read" "$LIB/versions/$name/run-read"
   if [ -f "$src/lib/github-known-hosts" ]; then
     install "${OWN[@]}" -m 0644 "$src/lib/github-known-hosts" "$LIB/.github-known-hosts.new"
     mv -f "$LIB/.github-known-hosts.new" "$LIB/github-known-hosts"
@@ -262,6 +270,9 @@ worker() {
   [ ! -f "$LIB/versions/$name/ci-mirror" ] || flip "$LIB/ci-mirror" "versions/$name/ci-mirror"
   # A release without the PR-stack helper leaves the installed one as it is.
   [ ! -f "$LIB/versions/$name/pr-stack" ] || flip "$LIB/pr-stack" "versions/$name/pr-stack"
+  # The read-only run reader (install.sh's /etc/sudoers.d/miu-run-read names $LIB/run-read).
+  [ ! -f "$LIB/versions/$name/run-read" ] || flip "$LIB/run-read" "versions/$name/run-read"
+  [ ! -f "$src/bin/miu-ci-net" ] || ci_net "$name" "$src"
   if grep -qF "$LIB/versions/*/sandbox-ci" "$SUDOERS_CI" 2>/dev/null; then
     touch "$LIB/versions/.per-release"
   else
@@ -271,6 +282,37 @@ worker() {
   # Root's list of the CI secrets each repository may name (install.sh makes it).
   { [ -f "$SECRET_NAMES" ] && [ ! -L "$SECRET_NAMES" ] && [ "$(stat -c %u:%g "$SECRET_NAMES" 2>/dev/null)" = 0:0 ]; } || say "No root-owned regular file $SECRET_NAMES: the worker lets no workflow name a CI secret. Run install.sh again to make it, then list each repository's names (docs/install.md)."
   say "CI worker: $LIB/sandbox-ci -> versions/$name"
+}
+
+# The network CI jobs run on and its firewall (bin/miu-ci-net), from a unit
+# that runs it again whenever Docker starts, so it holds after a reboot. The
+# worker runs no job until the network is up, so a failure here says so and
+# leaves CI refusing rather than running jobs on the host's network.
+CI_NET_UNIT=miu-ci-net.service
+ci_net() {
+  local name=$1 src=$2 unit=$UNIT_DIR/$CI_NET_UNIT
+  install "${OWN[@]}" -m 0755 "$src/bin/miu-ci-net" "$LIB/versions/$name/ci-net"
+  flip "$LIB/ci-net" "versions/$name/ci-net"
+  install -d -m 0755 "$UNIT_DIR"
+  cat > "$unit.tmp" <<UNIT
+[Unit]
+Description=Miu CI job network (miu-ci) and its firewall
+Requires=docker.service
+After=docker.service ufw.service tailscaled.service
+PartOf=docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$LIB/ci-net up
+ExecReload=$LIB/ci-net up
+ExecStop=$LIB/ci-net unstamp
+[Install]
+WantedBy=multi-user.target docker.service
+UNIT
+  if cmp -s "$unit.tmp" "$unit"; then rm -f "$unit.tmp"; else mv -f "$unit.tmp" "$unit"; systemctl daemon-reload; fi
+  systemctl enable -q "$CI_NET_UNIT" 2>/dev/null || true
+  if systemctl reload-or-restart "$CI_NET_UNIT"; then say "CI network: up ($CI_NET_UNIT)"
+  else say "CI network: $CI_NET_UNIT failed (journalctl -u $CI_NET_UNIT); CI refuses jobs until it is up"; fi
 }
 
 answers() { [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$URL" || true)" != 000 ]; }
@@ -341,6 +383,18 @@ case "$cmd" in
     ensure_repo
     sha=$(resolve "$want")
     build "$sha"
+    # The rest of the deploy (the worker, the CI network, the units) is this
+    # script's: a release that changes it installs its own copy as
+    # $LIB/miu-release, and that copy does the rest, so a deploy never runs
+    # an older script's steps for a newer release.
+    new=$RELEASES/$sha/bin/miu-release
+    if [ -z "$HANDED_ON" ] && [ -f "$new" ] && ! cmp -s "$new" "$LIB/miu-release"; then
+      install "${OWN[@]}" -m 0755 "$new" "$LIB/.miu-release.new"
+      mv -f "$LIB/.miu-release.new" "$LIB/miu-release"
+      say "This release changes miu-release: $LIB/miu-release is its copy now, and goes on with the deploy"
+      opts=(); [ "$restart_it" = 1 ] || opts=(--no-restart)
+      MIU_RELEASE_HANDOFF=1 exec "$LIB/miu-release" deploy "$sha" "${opts[@]}"
+    fi
     convert
     install -d -m 0755 "$DATA"
     for e in "${SHARED[@]}"; do [ -d "$DATA/$e" ] || ! id "$MIU_USER" >/dev/null 2>&1 || install -d -o "$MIU_USER" -g "$MIU_USER" -m 0750 "$DATA/$e"; done
