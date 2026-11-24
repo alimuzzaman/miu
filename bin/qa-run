@@ -21,7 +21,7 @@ import { recordRefusal, refusalIn } from '../lib/authrefused.mjs';
 import { forPr, readStore, writeRunWaivers, memberMatcher } from '../lib/waivers.mjs';
 import { validate, computeVerdict, renderComment, renderFull, loadLedger, screenshots, forMember, openCells } from '../lib/report.mjs';
 import { retestBase, filesSeenBy, perFile } from '../lib/retestbase.mjs';
-import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, LABELS, setLabelNames, noteLocalImages } from '../lib/publish.mjs';
+import { resolveImages, publishFullReport, previousRuns, setStatus, uploadImage, cloudinaryUrl, getLabels, setLabels, startLabels, postMember, partnerSettled, LABELS, setLabelNames, noteLocalImages } from '../lib/publish.mjs';
 import { runAgent } from '../lib/agent.mjs';
 import { engineOf, ENGINES } from '../lib/engines.mjs';
 import { authFor, applyAuth, scrub, secrets, readSecret } from '../lib/connections.mjs';
@@ -360,6 +360,14 @@ const members = [
     return { key: keyOf(p), repo: p.repo, pr: p.number, sha: p.headRefOid, label: p.label, round: r };
   })),
 ];
+// A settled partner (lib/publish.mjs partnerSettled) is tested as code only:
+// the run never writes a status, a label or a comment to it.
+for (const m of members.slice(1)) {
+  try { m.readOnly = partnerSettled(await getLabels(m.repo, m.pr)); }
+  catch (e) { m.readOnly = true; log(`labels not read on ${m.key}, so the run leaves it alone:`, e.message.split('\n')[0]); }
+  if (m.readOnly) log(`${m.key}: has a person's result or a test running, so this run tests its code and writes nothing to it`);
+}
+const writable = members.filter((m) => !m.readOnly);
 // Findings people waived on these PRs before the round (lib/waivers.mjs),
 // taken now: a waiver given while the round runs counts from the next one.
 const waiverStore = readStore(path.join(path.dirname(runDir), '.waivers.json'));
@@ -369,7 +377,7 @@ if (waivers.waivers.length) { write('waivers.json', waivers.waivers.map(({ id, k
 const labelsBefore = {};
 if (!dryRun) await withAppToken(async (asApp) => {
   log(`github: writing as ${asApp ? 'the Miu App' : 'the local gh login'}`);
-  for (const m of members) {
+  for (const m of writable) {
     try { await setStatus({ repo: m.repo, sha: m.sha, verdict: 'pending', url: runUrl }); } catch (e) { log(`status not set on ${m.key}:`, e.message.split('\n')[0]); }
     try {
       labelsBefore[m.key] = await getLabels(m.repo, m.pr);
@@ -378,7 +386,7 @@ if (!dryRun) await withAppToken(async (asApp) => {
     } catch (e) { log(`labels not changed on ${m.key}:`, e.message.split('\n')[0]); }
   }
   // The first entry keeps the old shape the dashboard's stop button reads.
-  fs.writeFileSync(path.join(runDir, 'labels-before.json'), JSON.stringify({ repo, pr, labels: labelsBefore[selfKey] ?? [], members: members.map((m) => ({ repo: m.repo, pr: m.pr, labels: labelsBefore[m.key] ?? [] })) }));
+  fs.writeFileSync(path.join(runDir, 'labels-before.json'), JSON.stringify({ repo, pr, labels: labelsBefore[selfKey] ?? [], members: writable.map((m) => ({ repo: m.repo, pr: m.pr, labels: labelsBefore[m.key] ?? [] })) }));
 }, log);
 
 // ---------------------------------------------------------------- 3. prepare
@@ -968,7 +976,7 @@ for (const m of memberResults) {
 }
 fs.writeFileSync(path.join(runDir, 'verdict.json'), JSON.stringify({
   verdict: own.verdict, round, problems, mode, reportUrl, model: raw.model,
-  ...(pairList.length ? { pair_verdict: verdict, members: memberResults.map(({ key, repo: r, pr: n, sha: h, label, round: rd, verdict: v, comment: c }) => ({ key, repo: r, pr: n, sha: h, label, round: rd, verdict: v, comment: c })) } : {}),
+  ...(pairList.length ? { pair_verdict: verdict, members: memberResults.map(({ key, repo: r, pr: n, sha: h, label, round: rd, verdict: v, comment: c, readOnly }) => ({ key, repo: r, pr: n, sha: h, label, round: rd, verdict: v, comment: c, ...(readOnly ? { read_only: true } : {}) })) } : {}),
 }, null, 2));
 log(`verdict ${own.verdict}${pairList.length ? ` (pair ${verdict}: ${memberResults.map((m) => `${m.label} #${m.pr} ${m.verdict}`).join(', ')})` : ''}, ${problems.length} downgrade(s), report ${reportUrl}`);
 
@@ -986,6 +994,7 @@ if (!dryRun) await withAppToken(async (asApp) => {
   // nothing to judge (no criteria of its own or shared) gets its labels back.
   const posted = [];
   for (const m of memberResults) {
+    if (m.readOnly) { log(`${m.key}: settled partner, nothing posted`); continue; }
     // An image that did not reach Cloudinary is a note on GitHub, not a broken link.
     const gone = (f) => (!fs.existsSync(path.join(runDir, 'evidence', f)) ? 'it was not saved during the run' : cloudinaryUrl() ? 'the upload failed' : 'Cloudinary is not set up');
     const r = await postMember({ repo: m.repo, pr: m.pr, sha: m.sha, round: m.round, comment: noteLocalImages(m.body, gone), fullMd: noteLocalImages(fullMd, gone), note, verdict: m.verdict, results: m.results, before: labelsBefore[m.key] ?? [], ci: ciNow.text, log });

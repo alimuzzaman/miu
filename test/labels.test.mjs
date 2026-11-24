@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { labelNames, cleanPatch, DEFAULT_LABELS } from '../lib/labels.mjs';
-import { LABELS, setLabelNames, startLabels, endLabels, finalLabels } from '../lib/publish.mjs';
+import { LABELS, setLabelNames, startLabels, endLabels, finalLabels, partnerSettled } from '../lib/publish.mjs';
 import { qaFrom, setLabelNames as setSignalLabels } from '../lib/prsignals.mjs';
 
 test('saved names override the defaults; broken ones fall back', () => {
@@ -66,4 +66,22 @@ test('a person\'s result label is read as a QA report; Miu\'s own is not', () =>
   assert.equal(qaFrom(node('Tested & Ready For Merge')).labelReport.verdict, 'ok');
   assert.equal(qaFrom(node('Ready for Human Testing')).labelReport, null);
   assert.equal(qaFrom(node('Miu Tested & Reported Issue')).labelReport, null);
+});
+
+test('a partner with a person\'s result or a test running is settled, so a run writes nothing to it', () => {
+  setLabelNames({});
+  assert.equal(partnerSettled(['Tested & Ready For Merge', 'critical-priority']), true);
+  assert.equal(partnerSettled(['Tested & Reported Issue']), true);
+  assert.equal(partnerSettled(['Tested & Reported Bugs']), true);
+  assert.equal(partnerSettled(['Test Ongoing']), true);
+  // Miu's own results and request labels leave it open to a paired run.
+  assert.equal(partnerSettled(['Miu Tested', 'Ready for Human Testing']), false);
+  assert.equal(partnerSettled(['Ready for Miu Testing']), false);
+  assert.equal(partnerSettled([]), false);
+  assert.equal(partnerSettled(undefined), false);
+  // A renamed person's label still counts.
+  setLabelNames({ humanOk: ['QA Passed'] });
+  assert.equal(partnerSettled(['QA Passed']), true);
+  assert.equal(partnerSettled(['Tested & Ready For Merge']), false);
+  setLabelNames({});
 });
